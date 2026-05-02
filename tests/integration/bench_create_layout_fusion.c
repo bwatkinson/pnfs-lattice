@@ -342,6 +342,16 @@ static int bench_bringup_session(struct bench_ctx *c)
 	uint32_t n;
 	uint32_t create_seqid;
 
+	/* compound_process() runs nfs4_result_destroy() BEFORE memset on
+	 * each slot (see src/mds/compound.c:1393).  That dispatcher
+	 * branches on r->opnum and free()s heap pointers in r->res.* when
+	 * opnum == OP_LAYOUTGET (50).  Stack-resident results carry random
+	 * bytes on first use; a stale 50 anywhere in the opnum field
+	 * causes free() to be called on a garbage pointer and the bench
+	 * SIGSEGVs in libc.  Mirror the rpc_server.c calloc'd thread-local
+	 * array by zeroing the stack array up front. */
+	memset(res, 0, sizeof(res));
+
 	/* EXCHANGE_ID */
 	bench_init_cd(c, &cd);
 
@@ -381,6 +391,10 @@ static int bench_create_parent(struct bench_ctx *c, uint32_t *slot_seq)
 	struct nfs4_op ops[4];
 	struct nfs4_result res[4];
 	uint32_t n;
+
+	/* See note in bench_bringup_session(): zero before first use so
+	 * compound_process()'s pre-destroy step does not free() garbage. */
+	memset(res, 0, sizeof(res));
 
 	bench_init_cd(c, &cd);
 
@@ -441,6 +455,11 @@ static int mode_fused_once(struct bench_ctx *c, uint32_t *slot_seq,
 	struct nfs4_result res[5];
 	uint32_t n;
 	enum nfs4_status lg_status;
+
+	/* See note in bench_bringup_session(): zero before first use so
+	 * compound_process()'s pre-destroy step does not free() garbage
+	 * on uninitialised opnum=OP_LAYOUTGET stack memory. */
+	memset(res, 0, sizeof(res));
 
 	bench_init_cd(c, &cd);
 
@@ -507,6 +526,11 @@ static int mode_unfused_once(struct bench_ctx *c, uint32_t *slot_seq,
 	uint64_t child_fileid;
 	enum nfs4_status lg_status;
 
+	/* See note in bench_bringup_session(): zero before first use so
+	 * compound_process()'s pre-destroy step does not free() garbage
+	 * on uninitialised opnum=OP_LAYOUTGET stack memory. */
+	memset(res, 0, sizeof(res));
+
 	/* Compound 1: OPEN(CREATE) only — no LAYOUTGET in this batch. */
 	bench_init_cd(c, &cd);
 
@@ -561,6 +585,10 @@ static int close_open(struct bench_ctx *c, uint32_t *slot_seq,
 	struct nfs4_op ops[3];
 	struct nfs4_result res[3];
 	uint32_t n;
+
+	/* See note in bench_bringup_session(): zero before first use so
+	 * compound_process()'s pre-destroy step does not free() garbage. */
+	memset(res, 0, sizeof(res));
 
 	bench_init_cd(c, &cd);
 

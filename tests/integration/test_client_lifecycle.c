@@ -752,9 +752,17 @@ static void test_share_conflict_lifecycle(void)
 	memcpy(session_id, res[0].res.create_session.session_id,
 	       SESSION_ID_SIZE);
 
-	/* Create and OPEN file with DENY_WRITE. */
+	/* Create and OPEN file with DENY_WRITE.
+	 *
+	 * RFC 8881 §8.2.2 + §9.1.4: same-owner re-OPEN merges share modes
+	 * rather than conflicting.  We therefore tag the two OPENs with
+	 * distinct open_owner byte strings so the second one represents
+	 * a different opener under the same NFS client and the file's
+	 * existing DENY_WRITE applies. */
 	{
 		struct nfs4_stateid sid_a;
+		static const uint8_t owner_a[] = { 'a', 'a', 'a', 'a' };
+		static const uint8_t owner_b[] = { 'b', 'b', 'b', 'b' };
 
 		compound_init(&cd);
 		cd.cat = db;
@@ -765,13 +773,16 @@ static void test_share_conflict_lifecycle(void)
 		ops[2] = mk_open_create("shared.dat", 0644,
 					OPEN4_SHARE_ACCESS_READ,
 					OPEN4_SHARE_DENY_WRITE);
+		memcpy(ops[2].arg.open.open_owner, owner_a, sizeof(owner_a));
+		ops[2].arg.open.open_owner_len = (uint32_t)sizeof(owner_a);
 
 		n = compound_process(&cd, ops, res, 3);
 		ASSERT_EQ(n, (uint32_t)3);
 		ASSERT_EQ(res[2].status, NFS4_OK);
 		sid_a = res[2].res.open.stateid;
 
-		/* Second OPEN for write — should fail with SHARE_DENIED. */
+		/* Second OPEN by a *different* opener for write — should fail
+		 * with SHARE_DENIED because owner A still holds DENY_WRITE. */
 		compound_init(&cd);
 		cd.cat = db;
 		cd.st = st;
@@ -781,6 +792,8 @@ static void test_share_conflict_lifecycle(void)
 		ops[2] = mk_open_existing("shared.dat",
 					  OPEN4_SHARE_ACCESS_WRITE,
 					  OPEN4_SHARE_DENY_NONE);
+		memcpy(ops[2].arg.open.open_owner, owner_b, sizeof(owner_b));
+		ops[2].arg.open.open_owner_len = (uint32_t)sizeof(owner_b);
 
 		n = compound_process(&cd, ops, res, 3);
 		ASSERT_EQ(n, (uint32_t)3);
@@ -800,7 +813,7 @@ static void test_share_conflict_lifecycle(void)
 		ASSERT_EQ(n, (uint32_t)4);
 		ASSERT_EQ(res[3].status, NFS4_OK);
 
-		/* Retry — should succeed now. */
+		/* Retry as owner B — should succeed now. */
 		compound_init(&cd);
 		cd.cat = db;
 		cd.st = st;
@@ -810,6 +823,8 @@ static void test_share_conflict_lifecycle(void)
 		ops[2] = mk_open_existing("shared.dat",
 					  OPEN4_SHARE_ACCESS_WRITE,
 					  OPEN4_SHARE_DENY_NONE);
+		memcpy(ops[2].arg.open.open_owner, owner_b, sizeof(owner_b));
+		ops[2].arg.open.open_owner_len = (uint32_t)sizeof(owner_b);
 
 		n = compound_process(&cd, ops, res, 3);
 		ASSERT_EQ(n, (uint32_t)3);

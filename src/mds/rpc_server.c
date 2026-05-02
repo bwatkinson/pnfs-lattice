@@ -387,6 +387,54 @@ static int send_record(struct rpc_conn *c, const uint8_t *data, uint32_t len)
 /** Reply buffer size — 256 KB is plenty for any single NFS compound. */
 #define REPLY_BUF_SIZE ((size_t)256 * 1024)
 
+/** Maximum size of an inbound COMPOUND request body, in bytes.
+ *
+ * Matches the maxrequestsize advertised in CREATE_SESSION (1 MiB,
+ * see encode_res_create_session in xdr_ops_core.c).  Records larger
+ * than this trigger a COMPOUND reply with NFS4ERR_REQ_TOO_BIG
+ * carried in a synthesised SEQUENCE result, per RFC 5661 §15.2 and
+ * RFC 8881 §2.10.6.4 (the COMPOUND reply MUST contain at least one
+ * resarray entry; an empty resarray crashes Linux and pynfs
+ * clients on resarray[0]). */
+#define MAX_COMPOUND_REQ_SIZE  ((uint32_t)(1024U * 1024U))
+
+/* Helper: emit a single-element resarray containing a SEQUENCE result
+ * with the given @inner status and the outer COMPOUND status set to
+ * @outer.  Used by every decode-failure path so the wire reply always
+ * carries resarray[0] = SEQUENCE_result(<error>) instead of an empty
+ * resarray that confuses every interoperable client.
+ *
+ * The session_id and slot_id fields are zero-filled because the
+ * SEQUENCE op was either not decoded (record too big / bad XDR) or
+ * was decoded into a struct we no longer have access to (too many
+ * ops following).  Per RFC 8881 §18.46.3, when SEQUENCE returns an
+ * error the discriminator selects the void arm so the body is a
+ * single status word — exactly what encode_one_result produces for
+ * a non-OK result. */
+static int send_compound_decode_failure(struct rpc_conn *c,
+                                        char *reply_buf,
+                                        uint32_t xid,
+                                        const char *tag,
+                                        enum nfs4_status outer,
+                                        enum nfs4_status inner)
+{
+    XDR enc;
+    struct nfs4_result seq_err;
+
+    memset(&seq_err, 0, sizeof(seq_err));
+    seq_err.opnum = OP_SEQUENCE;
+    seq_err.status = inner;
+
+    xdrmem_ncreate(&enc, reply_buf, REPLY_BUF_SIZE, XDR_ENCODE);
+    if (rpc_encode_accepted_reply(&enc, xid) != 0) {
+        return -1;
+    }
+    if (nfs4_encode_compound_res(&enc, outer, tag, &seq_err, 1) != 0) {
+        return -1;
+    }
+    return send_record(c, (uint8_t *)reply_buf, xdr_getpos(&enc));
+}
+
 
 /**
  * @brief Handle RPCSEC_GSS INIT or CONTINUE_INIT.
@@ -834,19 +882,39 @@ wrongsec:
                 XDR_DECODE);
         }
 
-        if (nfs4_decode_compound_args(&dec, tag, sizeof(tag), &minorver,
-                                      ops, NFS4_MAX_OPS, &op_count) != 0) {
-            if (rpc_encode_accepted_reply(&enc, xid) != 0) {
-                goto cleanup;
-            }
-            if (nfs4_encode_compound_res(&enc,
-                    NFS4ERR_INVAL, tag,
-                    NULL, 0) != 0) {
-                goto cleanup;
-            }
-            rc = send_record(c, (uint8_t *)reply_buf,
-                             xdr_getpos(&enc));
+        /*
+         * Pre-check the wire record size against the maxrequestsize we
+         * advertised in CREATE_SESSION.  pynfs SEQ6 (testRequestTooBig)
+         * relies on this returning NFS4ERR_REQ_TOO_BIG carried by a
+         * SEQUENCE result, not an empty resarray.  Doing this before
+         * the XDR decoder runs avoids spending CPU parsing a request
+         * we are about to reject. */
+        if (record_len > MAX_COMPOUND_REQ_SIZE) {
+            rc = send_compound_decode_failure(c, reply_buf, xid, "",
+                NFS4ERR_REQ_TOO_BIG, NFS4ERR_REQ_TOO_BIG);
             goto cleanup;
+        }
+
+        {
+            int dec_rc = nfs4_decode_compound_args(
+                &dec, tag, sizeof(tag), &minorver,
+                ops, NFS4_MAX_OPS, &op_count);
+            if (dec_rc != 0) {
+                /* Map decoder error code to RFC-mandated NFS4ERR_*
+                 * (RFC 5661 §15.2 / RFC 8881 §2.10.6.1.2):
+                 *   -2 = count > NFS4_MAX_OPS  -> TOO_MANY_OPS
+                 *   -1 = malformed wire bytes  -> BADXDR
+                 * In every case emit a single-element resarray with a
+                 * SEQUENCE result carrying the inner error code, so
+                 * Linux / pynfs clients can read resarray[0] without
+                 * crashing. */
+                enum nfs4_status err_status =
+                    (dec_rc == -2) ? NFS4ERR_TOO_MANY_OPS
+                                   : NFS4ERR_BADXDR;
+                rc = send_compound_decode_failure(c, reply_buf, xid,
+                    tag, err_status, err_status);
+                goto cleanup;
+            }
         }
 
         if (minorver < NFS4_MINOR_VERSION_MIN ||

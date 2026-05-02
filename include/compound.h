@@ -89,6 +89,15 @@ enum nfs4_status {
 	NFS4ERR_LAYOUTUNAVAILABLE = 10058,
 	NFS4ERR_WRONGSEC          = 10016,
 	NFS4ERR_NAMETOOLONG       = 10110,
+	/* RFC 5661 §15.1.1 — wire-format errors used by the COMPOUND
+	 * decode-failure path (rpc_server.c).  These MUST be carried in
+	 * a synthesised SEQUENCE result so the resarray is non-empty. */
+	NFS4ERR_BADXDR            = 10036,
+	NFS4ERR_REQ_TOO_BIG       = 10041,
+	NFS4ERR_TOO_MANY_OPS      = 10070,
+	/* RFC 8881 §15.1.1.4 / §18.46.3 — SEQUENCE must be the first op
+	 * in every COMPOUND that uses session-state.  pynfs SEQ2. */
+	NFS4ERR_SEQUENCE_POS      = 10064,
 	/* RFC 8881 §15.1.10.4 — directory delegation not available. */
 	NFS4ERR_DIRDELEG_UNAVAIL  = 10084,
 	/* NFSv4.2 status codes (RFC 7862) */

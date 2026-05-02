@@ -240,6 +240,41 @@ static bool share_conflict(const struct file_opens *fo,
     return false;
 }
 
+/* Same as share_conflict() but skips a single entry on the chain.
+ *
+ * Used by the same-owner re-OPEN path: the existing stateid IS already
+ * advertising its current (access,deny) on the chain, so checking the
+ * upgraded merged reservation against it would be a self-conflict
+ * (e.g. existing access=WRITE/deny=READ + new access=READ/deny=NONE
+ * merges to access=READ|WRITE/deny=READ, and the chain's existing
+ * deny=READ would alias the merged access=READ).  RFC 5661 §9.1.1
+ * defines share-conflict over distinct opens; same-owner upgrades are
+ * scoped per RFC 8881 §8.2.2 / §9.1.4. */
+static bool share_conflict_excluding(const struct file_opens *fo,
+                                     const struct nfs4_open_state *skip,
+                                     uint32_t new_access,
+                                     uint32_t new_deny)
+{
+    const struct nfs4_open_state *os;
+
+    if (fo == NULL) {
+        return false;
+    }
+
+    for (os = fo->head; os != NULL; os = os->file_next) {
+        if (os == skip) {
+            continue;
+        }
+        if ((new_access & os->share_deny) != 0) {
+            return true;
+        }
+        if ((os->share_access & new_deny) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* -----------------------------------------------------------------------
  * Internal: unlink open_state from stateid hash
  * ----------------------------------------------------------------------- */
@@ -461,7 +496,8 @@ int open_state_open(struct open_state_table *ot,
                     struct nfs4_stateid *out_stateid)
 {
     struct file_opens *fo;
-    struct nfs4_open_state *os;
+    struct nfs4_open_state *os = NULL;
+    struct nfs4_open_state *existing = NULL;
     uint32_t file_lock_idx;
     uint32_t stateid_lock_idx;
     uint32_t idx;
@@ -477,10 +513,107 @@ int open_state_open(struct open_state_table *ot,
         return -3;
 }
 
-    /* Allocate open state. */
+    file_lock_idx = lock_stripe(fileid);
+    pthread_mutex_lock(&ot->locks[file_lock_idx]);
+
+    /* RFC 8881 §8.2.2 + §9.1.4 + §18.16.4: a subsequent OPEN by the
+     * same {clientid, open_owner} for the same file MUST return the
+     * existing open stateid with seqid bumped and share_access /
+     * share_deny upgraded to the union of all OPENs by that owner.
+     * Allocating a fresh stateid each time (the previous behaviour)
+     * leaks server state and breaks pynfs OPEN2 (testOpenAgain),
+     * which expects seqid to advance from N to N+1. */
+    fo = find_file_opens(ot, fileid);
+    if (fo != NULL) {
+        for (existing = fo->head; existing != NULL;
+             existing = existing->file_next) {
+            if (existing->clientid != clientid) {
+                continue;
+            }
+            if (existing->open_owner_len != open_owner_len) {
+                continue;
+            }
+            if (open_owner_len == 0 ||
+                (open_owner != NULL &&
+                 memcmp(existing->open_owner, open_owner,
+                        open_owner_len) == 0)) {
+                break; /* match */
+            }
+        }
+    }
+
+    if (existing != NULL) {
+        uint32_t merged_access =
+            existing->share_access | share_access;
+        uint32_t merged_deny =
+            existing->share_deny | share_deny;
+
+        /* Re-validate share reservations against every OTHER open on
+         * the file using the upgraded (merged) modes.  Skipping
+         * "existing" itself avoids a self-conflict where its own
+         * deny bits would alias the merged access bits. */
+        if (share_conflict_excluding(fo, existing,
+                                     merged_access, merged_deny)) {
+            rc = -1; /* NFS4ERR_SHARE_DENIED */
+            goto out_unlock;
+        }
+
+        stateid_lock_idx =
+            stateid_lock_stripe(existing->stateid.other);
+        pthread_rwlock_wrlock(
+            &ot->stateid_locks[stateid_lock_idx]);
+
+        /* RFC 8881 §8.2.2: bump seqid by one; the value 0 is
+         * reserved, so 0xFFFFFFFF wraps to 1 (not 0). */
+        uint32_t next_seqid = existing->stateid.seqid + 1U;
+        if (next_seqid == 0U) {
+            next_seqid = 1U;
+        }
+        existing->stateid.seqid = next_seqid;
+        existing->share_access = merged_access;
+        existing->share_deny = merged_deny;
+
+        *out_stateid = existing->stateid;
+
+        pthread_rwlock_unlock(
+            &ot->stateid_locks[stateid_lock_idx]);
+
+        /* Persist updated row (same primary key as the original
+         * insert, so this is an in-place update). */
+        if (ot->cat != NULL && !ot->skip_ndb_persist) {
+            struct mds_coord_open_row row;
+            memset(&row, 0, sizeof(row));
+            memcpy(row.stateid_other, existing->stateid.other,
+                   NFS4_OTHER_SIZE);
+            row.seqid = existing->stateid.seqid;
+            row.clientid = clientid;
+            row.fileid = fileid;
+            row.share_access = merged_access;
+            row.share_deny = merged_deny;
+            if (open_owner != NULL && open_owner_len > 0) {
+                memcpy(row.open_owner, open_owner,
+                       open_owner_len);
+            }
+            row.open_owner_len = open_owner_len;
+            row.owner_mds_id = ot->mds_id;
+            row.owner_boot_epoch = ot->boot_epoch;
+            (void)mds_coord_open_put(ot->cat, &row);
+        }
+
+        pthread_mutex_unlock(&ot->locks[file_lock_idx]);
+        return 0;
+    }
+
+    /* No prior open by this {clientid, open_owner}: allocate fresh.
+     *
+     * Allocation under the file-stripe lock is acceptable because
+     * calloc on a small struct does not block on I/O and the
+     * per-fileid stripe is only contended by other ops on the
+     * same fileid. */
     os = calloc(1, sizeof(*os));
     if (os == NULL) {
-        return -2;  /* NFS4ERR_RESOURCE */
+        rc = -2; /* NFS4ERR_RESOURCE */
+        goto out_unlock;
     }
 
     os->stateid.seqid = 1;
@@ -493,13 +626,9 @@ int open_state_open(struct open_state_table *ot,
         memcpy(os->open_owner, open_owner, open_owner_len);
         os->open_owner_len = open_owner_len;
     }
-    file_lock_idx = lock_stripe(fileid);
     stateid_lock_idx = stateid_lock_stripe(os->stateid.other);
 
-    pthread_mutex_lock(&ot->locks[file_lock_idx]);
-
     /* Check share conflicts against all existing opens for this file. */
-    fo = find_file_opens(ot, fileid);
     if (share_conflict(fo, share_access, share_deny)) {
         rc = -1;  /* NFS4ERR_SHARE_DENIED */
         goto out_unlock_free;
@@ -529,7 +658,7 @@ int open_state_open(struct open_state_table *ot,
     if (ot->cat != NULL && !ot->skip_ndb_persist) {
         struct mds_coord_open_row row;
         memset(&row, 0, sizeof(row));
-        memcpy(row.stateid_other, os->stateid.other, 12);
+        memcpy(row.stateid_other, os->stateid.other, NFS4_OTHER_SIZE);
         row.seqid = os->stateid.seqid;
         row.clientid = clientid;
         row.fileid = fileid;
@@ -550,6 +679,10 @@ int open_state_open(struct open_state_table *ot,
 out_unlock_free:
     pthread_mutex_unlock(&ot->locks[file_lock_idx]);
     free(os);
+    return rc;
+
+out_unlock:
+    pthread_mutex_unlock(&ot->locks[file_lock_idx]);
     return rc;
 }
 

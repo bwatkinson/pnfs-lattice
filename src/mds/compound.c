@@ -730,6 +730,19 @@ static enum nfs4_status dispatch_op(struct compound_data *cd,
 				    struct nfs4_result *res)
 {
 	/*
+	 * RFC 8881 §18.46.3 + §15.1.1.4: SEQUENCE must be the very
+	 * first op of every session-aware COMPOUND.  Receiving it at
+	 * any later position is NFS4ERR_SEQUENCE_POS.  Without this
+	 * check the second SEQUENCE silently re-passes session state
+	 * checks and leaves cd->sequence_done unchanged — pynfs SEQ2
+	 * (testNotFirst).
+	 */
+	if (cd->minorversion >= 1 && op->opnum == OP_SEQUENCE &&
+	    cd->op_index > 0) {
+		return NFS4ERR_SEQUENCE_POS;
+	}
+
+	/*
 	 * RFC 8881 §2.10.6.2: all operations except session management
 	 * require a preceding SEQUENCE in the same COMPOUND.
 	 * When cd->st is NULL (test-compat mode), enforcement is skipped.

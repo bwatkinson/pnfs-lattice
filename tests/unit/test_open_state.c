@@ -565,6 +565,62 @@ static void test_api_different_open_owners(void)
 	open_state_table_destroy(ot);
 }
 
+/** Bug 2 regression — same-owner re-OPEN MUST bump seqid and merge share
+ * modes (RFC 8881 §8.2.2 + §9.1.4 + §18.16.4).
+ *
+ * Prior behaviour was to issue a fresh stateid each time, leaking server
+ * state and breaking pynfs OPEN2 (testOpenAgain), which validates that
+ * a second OPEN by the same {clientid, open_owner} on the same fileid
+ * returns the same "other" with seqid advanced from N to N+1. */
+static void test_api_reopen_same_owner_bumps_seqid(void)
+{
+	struct open_state_table *ot = NULL;
+	struct nfs4_stateid sid1, sid2, sid3;
+	static const uint8_t owner[] = "owner-X";
+	struct nfs4_open_state found;
+	int rc;
+
+	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
+
+	/* First OPEN: ACCESS_READ / DENY_NONE. */
+	rc = open_state_open(ot, 100, owner, sizeof(owner) - 1, 42,
+			     OPEN4_SHARE_ACCESS_READ,
+			     OPEN4_SHARE_DENY_NONE, &sid1);
+	ASSERT_EQ(rc, 0);
+	ASSERT_EQ(sid1.seqid, (uint32_t)1);
+
+	/* Same {clientid, open_owner, fileid} — RFC mandates we return the
+	 * existing stateid (same `other`) with seqid bumped. */
+	rc = open_state_open(ot, 100, owner, sizeof(owner) - 1, 42,
+			     OPEN4_SHARE_ACCESS_WRITE,
+			     OPEN4_SHARE_DENY_NONE, &sid2);
+	ASSERT_EQ(rc, 0);
+	ASSERT_EQ(sid2.seqid, (uint32_t)2);
+	ASSERT_EQ(memcmp(sid2.other, sid1.other, NFS4_OTHER_SIZE), 0);
+
+	/* share_access must be the union of both OPENs (READ | WRITE). */
+	rc = open_state_find(ot, &sid2, &found);
+	ASSERT_EQ(rc, 0);
+	ASSERT_EQ(found.share_access,
+		  (uint32_t)(OPEN4_SHARE_ACCESS_READ |
+			     OPEN4_SHARE_ACCESS_WRITE));
+
+	/* Third OPEN bumps seqid to 3, share_deny merges in DENY_WRITE. */
+	rc = open_state_open(ot, 100, owner, sizeof(owner) - 1, 42,
+			     OPEN4_SHARE_ACCESS_READ,
+			     OPEN4_SHARE_DENY_WRITE, &sid3);
+	ASSERT_EQ(rc, 0);
+	ASSERT_EQ(sid3.seqid, (uint32_t)3);
+	ASSERT_EQ(memcmp(sid3.other, sid1.other, NFS4_OTHER_SIZE), 0);
+
+	rc = open_state_find(ot, &sid3, &found);
+	ASSERT_EQ(rc, 0);
+	ASSERT_EQ(found.share_deny,
+		  (uint32_t)OPEN4_SHARE_DENY_WRITE);
+
+	open_state_table_destroy(ot);
+}
+
 /* -----------------------------------------------------------------------
  * Part 2: Compound integration tests
  * ----------------------------------------------------------------------- */
@@ -793,7 +849,14 @@ static void test_compound_open_guarded_exist(void)
 	free(path);
 }
 
-/** Share conflict via compound — deny_write blocks write access. */
+/** Share conflict via compound — deny_write blocks write access.
+ *
+ * RFC 8881 §8.2.2 / §9.1.4: a same-owner re-OPEN merges share modes
+ * rather than conflicting.  The two compounds below carry the same
+ * test-default clientid (0) and an empty open_owner, so to exercise
+ * the share-conflict path between *distinct* openers we patch the
+ * OPEN args with non-overlapping open_owner byte strings before
+ * dispatch. */
 static void test_compound_share_conflict(void)
 {
 	struct mds_catalogue *db = NULL;
@@ -803,12 +866,14 @@ static void test_compound_share_conflict(void)
 	struct nfs4_result res[4];
 	uint32_t n;
 	char *path;
+	static const uint8_t owner_a[] = { 'A', 'A', 'A', 'A' };
+	static const uint8_t owner_b[] = { 'B', 'B', 'B', 'B' };
 
 	path = make_temp_db_path();
 	db = open_test_catalogue(); VERIFY(db != NULL);
 	ASSERT_EQ(open_state_table_init(TEST_MDS_ID, &ot), 0);
 
-	/* First open: read, deny_write. */
+	/* First open: read, deny_write, owner A. */
 	compound_init(&cd);
 	cd.cat = db;
 	cd.ot = ot;
@@ -817,11 +882,15 @@ static void test_compound_share_conflict(void)
 	ops[2] = mk_open_create("shared.txt", 0644,
 				OPEN4_SHARE_ACCESS_READ,
 				OPEN4_SHARE_DENY_WRITE);
+	memcpy(ops[2].arg.open.open_owner, owner_a, sizeof(owner_a));
+	ops[2].arg.open.open_owner_len = (uint32_t)sizeof(owner_a);
 	n = compound_process(&cd, ops, res, 3);
 	ASSERT_EQ(n, (uint32_t)3);
 	ASSERT_EQ(res[2].status, NFS4_OK);
 
-	/* Second open: write, deny_none — should conflict. */
+	/* Second open: write, deny_none, owner B — distinct opener,
+	 * so the file's existing DENY_WRITE applies and this MUST
+	 * return NFS4ERR_SHARE_DENIED. */
 	compound_init(&cd);
 	cd.cat = db;
 	cd.ot = ot;
@@ -830,6 +899,8 @@ static void test_compound_share_conflict(void)
 	ops[2] = mk_open_existing("shared.txt",
 				  OPEN4_SHARE_ACCESS_WRITE,
 				  OPEN4_SHARE_DENY_NONE);
+	memcpy(ops[2].arg.open.open_owner, owner_b, sizeof(owner_b));
+	ops[2].arg.open.open_owner_len = (uint32_t)sizeof(owner_b);
 	n = compound_process(&cd, ops, res, 3);
 	ASSERT_EQ(n, (uint32_t)3);
 	ASSERT_EQ(res[2].status, NFS4ERR_SHARE_DENIED);
@@ -1059,6 +1130,7 @@ int main(void)
 	RUN_TEST(test_api_find);
 	RUN_TEST(test_api_close_wrong_owner);
 	RUN_TEST(test_api_different_open_owners);
+	RUN_TEST(test_api_reopen_same_owner_bumps_seqid);
 
 	/* Part 2: Compound integration tests */
 	RUN_TEST(test_compound_open_create_close);

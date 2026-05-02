@@ -1217,8 +1217,15 @@ int nfs4_decode_compound_args(XDR *xdrs,
     if (!xdr_uint32_t(xdrs, &count)) {
         return -1;
 }
+    /*
+     * Distinct return code so the caller can translate this to the
+     * RFC-mandated NFS4ERR_TOO_MANY_OPS rather than a generic XDR
+     * failure (RFC 5661 §15.2 / RFC 8881 §2.10.6.1.2).  Without this,
+     * the COMPOUND reply ends up with an empty resarray and Linux /
+     * pynfs clients crash on resarray[0].
+     */
     if (count > max_ops) {
-        return -1;
+        return -2;
 }
 
     for (i = 0; i < count; i++) {

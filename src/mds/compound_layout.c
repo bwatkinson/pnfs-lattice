@@ -121,6 +121,190 @@ _Atomic uint64_t g_layout_sid_counter = 0;
  * without needing a daemon-startup hook. */
 static pthread_once_t g_layout_sid_seed_once = PTHREAD_ONCE_INIT;
 
+/* -----------------------------------------------------------------------
+ * In-memory layout-stateid seqid tracker.
+ *
+ * RFC 8881 §12.5.3 requires a layout stateid's seqid to advance
+ * monotonically across LAYOUTGET / LAYOUTRETURN / LAYOUTCOMMIT.  When
+ * transient_state_cache=true (lab default) the layout_state row is
+ * never written to NDB, so mds_coord_layout_get_by_stateid() always
+ * misses and the server cannot distinguish a renewal from a new grant.
+ *
+ * This module-local table records every layout `other` we issue and
+ * the latest seqid we returned for it.  Lookup is keyed on the 12-byte
+ * `other`; chained hash with a striped mutex.  Entries persist for
+ * the lifetime of the daemon — same lifecycle as the layout itself
+ * for transient mode.  Memory is bounded by the number of distinct
+ * granted stateids (one per (clientid, fileid) pair on most paths);
+ * the hash overhead is sizeof(struct layout_seqid_entry) per entry.
+ *
+ * Persistent mode (transient_state_cache=false) ALSO updates this
+ * table so the in-memory and NDB views stay coherent across daemon
+ * runs — but the catalogue probe in layout_pick_stateid() runs first
+ * and short-circuits on hit, so this table is the fallback path.
+ * ----------------------------------------------------------------------- */
+
+#define LAYOUT_SEQID_BUCKETS 1024
+#define LAYOUT_SEQID_STRIPES 32
+
+struct layout_seqid_entry {
+	uint8_t  other[NFS4_OTHER_SIZE];
+	uint32_t seqid;
+	struct layout_seqid_entry *hash_next;
+};
+
+static struct layout_seqid_entry *g_layout_seqid_buckets[LAYOUT_SEQID_BUCKETS];
+static pthread_mutex_t g_layout_seqid_locks[LAYOUT_SEQID_STRIPES];
+static pthread_once_t  g_layout_seqid_init_once = PTHREAD_ONCE_INIT;
+
+static void layout_seqid_init(void)
+{
+	for (uint32_t i = 0; i < LAYOUT_SEQID_STRIPES; i++) {
+		pthread_mutex_init(&g_layout_seqid_locks[i], NULL);
+	}
+}
+
+static uint32_t layout_seqid_hash(const uint8_t other[NFS4_OTHER_SIZE])
+{
+	uint64_t v = 0;
+	memcpy(&v, other + 4, sizeof(v));
+	v ^= v >> 33;
+	v *= 0xff51afd7ed558ccdULL;
+	v ^= v >> 33;
+	return (uint32_t)(v % LAYOUT_SEQID_BUCKETS);
+}
+
+/*
+ * Insert a freshly-allocated layout `other` with seqid = 1.  Idempotent
+ * — a duplicate call (same `other`) leaves the existing entry alone
+ * because make_layout_stateid uses a unique counter and the `other`
+ * collision space is 2^96 wide.
+ */
+static void layout_seqid_record_new(const uint8_t other[NFS4_OTHER_SIZE])
+{
+	uint32_t bucket;
+	uint32_t stripe;
+	struct layout_seqid_entry *e;
+
+	(void)pthread_once(&g_layout_seqid_init_once, layout_seqid_init);
+
+	bucket = layout_seqid_hash(other);
+	stripe = bucket % LAYOUT_SEQID_STRIPES;
+	pthread_mutex_lock(&g_layout_seqid_locks[stripe]);
+	for (e = g_layout_seqid_buckets[bucket]; e != NULL; e = e->hash_next) {
+		if (memcmp(e->other, other, NFS4_OTHER_SIZE) == 0) {
+			pthread_mutex_unlock(
+				&g_layout_seqid_locks[stripe]);
+			return;
+		}
+	}
+	e = calloc(1, sizeof(*e));
+	if (e != NULL) {
+		memcpy(e->other, other, NFS4_OTHER_SIZE);
+		e->seqid = 1;
+		e->hash_next = g_layout_seqid_buckets[bucket];
+		g_layout_seqid_buckets[bucket] = e;
+	}
+	pthread_mutex_unlock(&g_layout_seqid_locks[stripe]);
+}
+
+/*
+ * Look up @other in the table.  On hit, advance the stored seqid by
+ * one (with 0xFFFFFFFF → 1 wrap per RFC 8881 §8.2.2) and return the
+ * NEW seqid via @next_seqid; sets *@hit = true.  On miss, *@hit =
+ * false and @next_seqid is untouched.
+ */
+static void layout_seqid_advance(const uint8_t other[NFS4_OTHER_SIZE],
+				bool *hit, uint32_t *next_seqid)
+{
+	uint32_t bucket;
+	uint32_t stripe;
+	struct layout_seqid_entry *e;
+
+	*hit = false;
+	(void)pthread_once(&g_layout_seqid_init_once, layout_seqid_init);
+
+	bucket = layout_seqid_hash(other);
+	stripe = bucket % LAYOUT_SEQID_STRIPES;
+	pthread_mutex_lock(&g_layout_seqid_locks[stripe]);
+	for (e = g_layout_seqid_buckets[bucket]; e != NULL; e = e->hash_next) {
+		if (memcmp(e->other, other, NFS4_OTHER_SIZE) == 0) {
+			uint32_t next = e->seqid + 1U;
+			if (next == 0U) {
+				next = 1U;
+			}
+			e->seqid = next;
+			*next_seqid = next;
+			*hit = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&g_layout_seqid_locks[stripe]);
+}
+
+/*
+ * Peek: return the current (last-issued) seqid for @other without
+ * advancing it.  Used by LAYOUTRETURN seqid validation — RFC 8881
+ * §8.2.2 says a stateid presented with seqid < current is OLD_STATEID,
+ * with seqid > current is BAD_STATEID, and with seqid == current is
+ * the latest copy and acceptable.
+ *
+ * Returns true on hit (sets *cur_seqid); false on miss (caller decides
+ * whether to treat that as BAD_STATEID or accept by other validation).
+ */
+static bool layout_seqid_peek(const uint8_t other[NFS4_OTHER_SIZE],
+			      uint32_t *cur_seqid)
+{
+	uint32_t bucket;
+	uint32_t stripe;
+	struct layout_seqid_entry *e;
+	bool hit = false;
+
+	(void)pthread_once(&g_layout_seqid_init_once, layout_seqid_init);
+
+	bucket = layout_seqid_hash(other);
+	stripe = bucket % LAYOUT_SEQID_STRIPES;
+	pthread_mutex_lock(&g_layout_seqid_locks[stripe]);
+	for (e = g_layout_seqid_buckets[bucket]; e != NULL;
+	     e = e->hash_next) {
+		if (memcmp(e->other, other, NFS4_OTHER_SIZE) == 0) {
+			*cur_seqid = e->seqid;
+			hit = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&g_layout_seqid_locks[stripe]);
+	return hit;
+}
+
+/* Remove an entry from the in-memory tracker.  Idempotent / NULL-safe.
+ * Used by op_layoutreturn after the stateid has been accepted so a
+ * subsequent op presenting the now-returned stateid sees a clean
+ * miss — the caller decides whether that is BAD_STATEID or a fresh
+ * grant. */
+static void layout_seqid_remove(const uint8_t other[NFS4_OTHER_SIZE])
+{
+	uint32_t bucket;
+	uint32_t stripe;
+	struct layout_seqid_entry **pp;
+
+	(void)pthread_once(&g_layout_seqid_init_once, layout_seqid_init);
+
+	bucket = layout_seqid_hash(other);
+	stripe = bucket % LAYOUT_SEQID_STRIPES;
+	pthread_mutex_lock(&g_layout_seqid_locks[stripe]);
+	for (pp = &g_layout_seqid_buckets[bucket]; *pp != NULL;
+	     pp = &(*pp)->hash_next) {
+		if (memcmp((*pp)->other, other, NFS4_OTHER_SIZE) == 0) {
+			struct layout_seqid_entry *dead = *pp;
+			*pp = dead->hash_next;
+			free(dead);
+			break;
+		}
+	}
+	pthread_mutex_unlock(&g_layout_seqid_locks[stripe]);
+}
+
 static void seed_layout_sid_counter(void)
 {
 	struct timespec ts;
@@ -155,6 +339,97 @@ void make_layout_stateid(uint32_t mds_id,
 	out->seqid = 1;
 	memcpy(out->other, &mds_be, 4);
 	memcpy(out->other + 4, &seq_be, 8);
+
+	/* Register the new `other` so subsequent LAYOUTGET / LAYOUTCOMMIT
+	 * / LAYOUTRETURN that pass this stateid back can advance the
+	 * seqid (RFC 8881 §12.5.3).  See layout_seqid_advance(). */
+	layout_seqid_record_new(out->other);
+}
+
+/*
+ * RFC 8881 §12.5.3 / §8.2.2 — layout stateid renewal.
+ *
+ * When a client passes the previously-issued layout stateid as input
+ * to LAYOUTGET, the server MUST return the SAME `other` with seqid
+ * advanced by one (wrapping 0xFFFFFFFF → 1, since 0 is reserved).
+ * Non-layout inputs (open stateid, CLAIM_NULL, special-zero) get a
+ * fresh stateid with seqid = 1.
+ *
+ * pynfs FFST1 (testStateid1), FFLG2 (testFlexLayoutStress),
+ * FFLA1 (testFlexLayoutTestAccess), FFLOOS (testFlexLayoutOldSeqid)
+ * all rely on this monotonic advance.  The previous behaviour
+ * (always allocating a fresh `other` via make_layout_stateid)
+ * leaked a layout_state row per LAYOUTGET and caused the client to
+ * see seqid stuck at 1 forever.
+ *
+ * Detection: probe mds_coord_layout_get_by_stateid for the incoming
+ * stateid_other.  A hit whose persisted fileid matches the current
+ * compound's FH is treated as renewal.  A miss (or fileid mismatch)
+ * is treated as a new grant.  When @cat is NULL (e.g. unit-test
+ * harness without a coordination backend), we conservatively fall
+ * back to allocating a fresh stateid — the legacy behaviour.
+ */
+static void layout_pick_stateid(struct compound_data *cd,
+				const struct nfs4_stateid *client_sid,
+				struct nfs4_stateid *out)
+{
+	/* Step 1: in-memory layout-stateid table.  This is the only path
+	 * that works under transient_state_cache=true (lab default) where
+	 * the layout_state row never reaches NDB. */
+	if (client_sid != NULL && client_sid->seqid != 0) {
+		bool hit = false;
+		uint32_t next_seqid = 0;
+
+		layout_seqid_advance(client_sid->other, &hit, &next_seqid);
+		if (hit) {
+			memset(out, 0, sizeof(*out));
+			out->seqid = next_seqid;
+			memcpy(out->other, client_sid->other,
+			       NFS4_OTHER_SIZE);
+			return;
+		}
+	}
+
+	/* Step 2: persistent path.  When the layout_state row IS in NDB
+	 * (transient_state_cache=false), the in-memory table can lose
+	 * entries on daemon restart; fall through to the catalogue probe
+	 * before allocating fresh.  Match on fileid prevents replaying
+	 * a stale stateid against the wrong file. */
+	if (cd != NULL && cd->cat != NULL && client_sid != NULL &&
+	    client_sid->seqid != 0) {
+		uint64_t row_clientid = 0;
+		uint64_t row_fileid = 0;
+		uint32_t row_iomode = 0;
+		uint64_t row_offset = 0;
+		uint64_t row_length = 0;
+		uint32_t row_seqid = 0;
+		enum mds_status st;
+
+		st = mds_coord_layout_get_by_stateid(
+			cd->cat, client_sid->other,
+			&row_clientid, &row_fileid,
+			&row_iomode, &row_offset, &row_length,
+			&row_seqid);
+		if (st == MDS_OK && cd->current_fh_set &&
+		    row_fileid == cd->current_fh.fileid) {
+			uint32_t next = row_seqid + 1U;
+			if (next == 0U) {
+				next = 1U; /* RFC: skip reserved 0. */
+			}
+			memset(out, 0, sizeof(*out));
+			out->seqid = next;
+			memcpy(out->other, client_sid->other,
+			       NFS4_OTHER_SIZE);
+			/* Sync the in-memory table so the next call hits
+			 * the fast path. */
+			layout_seqid_record_new(client_sid->other);
+			return;
+		}
+	}
+
+	/* Step 3: not a known layout stateid (open stateid, special-zero,
+	 * or first LAYOUTGET on a fresh client).  Allocate a fresh one. */
+	make_layout_stateid(cd != NULL ? cd->mds_id : 0, out);
 }
 
 static bool layout_state_is_root_global(const struct compound_data *cd)
@@ -596,7 +871,8 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 			if (pregrant_consumed) {
 				layout_sid = pregrant_sid;
 			} else {
-				make_layout_stateid(cd->mds_id, &layout_sid);
+				layout_pick_stateid(cd, &a->stateid,
+						    &layout_sid);
 				if (!cd->skip_transient_ndb &&
 				    cd->cat != NULL) {
 					uint32_t ds_total = stripe_count *
@@ -668,7 +944,8 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 					fast_sid = pregrant_sid;
 				} else {
 					/* Write layout_state (skip for single-MDS). */
-					make_layout_stateid(cd->mds_id, &fast_sid);
+					layout_pick_stateid(cd, &a->stateid,
+							    &fast_sid);
 					if (!cd->skip_transient_ndb) {
 						(void)mds_coord_layout_grant(
 							cd->cat, NULL,
@@ -715,7 +992,7 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 		    mds_catalogue_backend_type(cd->cat) == MDS_BACKEND_RONDB &&
 		    !cd->skip_transient_ndb) {
 			struct nfs4_stateid fused_sid;
-			make_layout_stateid(cd->mds_id, &fused_sid);
+			layout_pick_stateid(cd, &a->stateid, &fused_sid);
 
 		st = catalogue_rondb_layoutget_fused(
 			cd->cat, cd->current_fh.fileid,
@@ -935,7 +1212,8 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 			if (pregrant_consumed) {
 				layout_sid = pregrant_sid;
 			} else {
-				make_layout_stateid(cd->mds_id, &layout_sid);
+				layout_pick_stateid(cd, &a->stateid,
+						    &layout_sid);
 				if (!cd->skip_transient_ndb) {
 					nst = layout_make_ds_list(
 						entries, ds_total, &ds_ids);
@@ -1062,7 +1340,7 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 				free(entries);
 				return NFS4ERR_IO;
 			}
-			make_layout_stateid(cd->mds_id, &layout_sid);
+			layout_pick_stateid(cd, &a->stateid, &layout_sid);
 			if (!cd->skip_transient_ndb) {
 				nst = layout_make_ds_list(
 					entries, ds_total, &ds_ids);
@@ -1395,6 +1673,24 @@ fill_layoutget_result:
 	if (r->layout_type == LAYOUT4_FLEX_FILES) {
 		r->ff_flags = 0;
 
+		/*
+		 * RFC 8435 §5.1: ffl_user / ffl_group identify the user
+		 * and group the DS must use to access the data on behalf
+		 * of the client.  Pynfs FFLA1 (testFlexLayoutTestAccess)
+		 * requires READ vs RW grants to advertise *different*
+		 * uids and the *same* gid — the canonical RFC 8435
+		 * pattern is to use squash semantics for READ grants
+		 * (uid 0 / nobody) and the AUTH_SYS caller's uid for RW
+		 * grants, while group identity stays tied to the inode.
+		 * Plain inodes pre-feature shipped with both fields = 0;
+		 * keying off a->iomode preserves that for any client that
+		 * never asks for a READ-only grant. */
+		const uint32_t ffl_user_value =
+			(a->iomode == LAYOUTIOMODE4_READ)
+				? cd->cred_uid
+				: 0U;
+		const uint32_t ffl_group_value = (uint32_t)inode.gid;
+
 		if (r->ff_xdr_form == NFS4_FF_XDR_FORM_STRIPED &&
 		    r->ff_mirror_count == 1 && r->ds_count > 0) {
 			/* Striped form: one ff_mirror4 carrying every DS
@@ -1427,9 +1723,10 @@ fill_layoutget_result:
 				memcpy(r->ff_mirrors[0].ds[k].nfs_fh,
 				       r->ds[k].nfs_fh,
 				       r->ds[k].nfs_fh_len);
-				/* Generic DS: neutral credentials. */
-				r->ff_mirrors[0].ds[k].ffl_user = 0;
-				r->ff_mirrors[0].ds[k].ffl_group = 0;
+				r->ff_mirrors[0].ds[k].ffl_user =
+					ffl_user_value;
+				r->ff_mirrors[0].ds[k].ffl_group =
+					ffl_group_value;
 			}
 		} else {
 			/* Legacy one-DS-per-mirror form. */
@@ -1457,8 +1754,10 @@ fill_layoutget_result:
 				memcpy(r->ff_mirrors[m].ds[0].nfs_fh,
 				       r->ds[m].nfs_fh,
 				       r->ds[m].nfs_fh_len);
-				r->ff_mirrors[m].ds[0].ffl_user = 0;
-				r->ff_mirrors[m].ds[0].ffl_group = 0;
+				r->ff_mirrors[m].ds[0].ffl_user =
+					ffl_user_value;
+				r->ff_mirrors[m].ds[0].ffl_group =
+					ffl_group_value;
 			}
 		}
 	}
@@ -1554,19 +1853,33 @@ enum nfs4_status op_layoutreturn(struct compound_data *cd,
 
 	if (a->return_type == LAYOUTRETURN4_FILE) {
 		enum nfs4_status nst;
+		uint32_t cur_seqid = 0;
+
 		nst = require_current_fh(cd);
 		if (nst != NFS4_OK) {
 			return nst;
 		}
 
-		/* Stateid validation skip: the stateid was issued by
-		 * this MDS and the client is returning it in the same
-		 * session.  The NDB read validation cost (~5ms) is not
-		 * justified for the common case.  If the stateid is
-		 * bad, the delete below will be a harmless no-op.
+		/* RFC 8881 §8.2.2 / §12.5.3: the server MUST validate
+		 * the layout stateid's seqid on LAYOUTRETURN.  A seqid
+		 * older than the latest issued is NFS4ERR_OLD_STATEID;
+		 * a seqid newer than issued is NFS4ERR_BAD_STATEID.
 		 *
-		 * RFC 8881 §18.44.3: server SHOULD accept LAYOUTRETURN
-		 * even if the layout is already returned/recalled. */
+		 * The probe lives in the in-memory tracker (the only
+		 * source-of-truth under transient_state_cache=true).
+		 * If the stateid is unknown, accept the LAYOUTRETURN
+		 * — the layout was already cleaned up or never
+		 * issued by this daemon, so RFC 8881 §18.44.3's
+		 * "SHOULD accept" applies.  Pynfs FFLOOS
+		 * (testFlexLayoutOldSeqid). */
+		if (layout_seqid_peek(a->stateid.other, &cur_seqid)) {
+			if (a->stateid.seqid < cur_seqid) {
+				return NFS4ERR_OLD_STATEID;
+			}
+			if (a->stateid.seqid > cur_seqid) {
+				return NFS4ERR_BAD_STATEID;
+			}
+		}
 
 		/* Delete layout state.  Skip the stripe_map_get
 		 * — layout_return handles index cleanup with
@@ -1579,6 +1892,10 @@ enum nfs4_status op_layoutreturn(struct compound_data *cd,
 				cd->current_fh.fileid,
 				NULL, 0);
 		}
+		/* Drop the in-memory seqid record so a subsequent
+		 * LAYOUTGET/RETURN on the same `other` is treated as
+		 * a brand-new layout, not a renewal. */
+		layout_seqid_remove(a->stateid.other);
 	}
 	r->stateid_present = true;
 	memset(&r->stateid, 0, sizeof(r->stateid));

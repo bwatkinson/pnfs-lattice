@@ -895,6 +895,86 @@ wrongsec:
             goto cleanup;
         }
 
+        /*
+         * RFC 8881 §15.1.10.5 / §2.10.6.1.2 enforcement gate.  The
+         * client MUST NOT send a request larger than
+         * ca_maxrequestsize, and the server MUST reject any such
+         * request with NFS4ERR_REQ_TOO_BIG before doing per-op
+         * processing.  RFC 8881 §15.1.10.4 likewise mandates
+         * NFS4ERR_TOO_MANY_OPS when the compound carries more
+         * operations than ca_maxoperations.  Both checks MUST
+         * happen ahead of fine-grained XDR validation: pynfs SEQ6
+         * (testRequestTooBig) intentionally packs an oversize
+         * component4 inside a LOOKUP that would otherwise fail
+         * with NFS4ERR_BADXDR / NFS4ERR_NAMETOOLONG; the
+         * RFC-mandated behaviour is REQ_TOO_BIG.
+         *
+         * To enforce this without parsing the entire compound, we
+         * peek just enough of the wire bytes (tag + minorversion
+         * + op_count + opnum[0] + session_id) to locate the
+         * session, then restore the XDR cursor for the main
+         * decoder.  xdr_getpos / xdr_setpos give us a non-
+         * destructive look without rebuilding an XDR stream
+         * (which would require knowing the underlying buffer
+         * pointer, complicated by the GSS-unwrap rebind above).
+         */
+        if (srv->st != NULL) {
+            uint32_t saved_pos = xdr_getpos(&dec);
+            uint32_t peek_tag_len = 0;
+            uint32_t peek_minor = 0;
+            uint32_t peek_count = 0;
+            uint32_t peek_op0 = 0;
+            uint8_t peek_sid[SESSION_ID_SIZE];
+            char tag_skip[NFS4_TAG_MAXLEN];
+            bool peek_ok = false;
+
+            if (xdr_uint32_t(&dec, &peek_tag_len) &&
+                peek_tag_len < sizeof(tag_skip)) {
+                bool tag_ok = (peek_tag_len == 0) ||
+                    xdr_opaque_decode(&dec, tag_skip, peek_tag_len);
+                if (tag_ok &&
+                    xdr_uint32_t(&dec, &peek_minor) &&
+                    xdr_uint32_t(&dec, &peek_count) &&
+                    peek_count > 0 &&
+                    xdr_uint32_t(&dec, &peek_op0) &&
+                    peek_op0 == OP_SEQUENCE &&
+                    xdr_opaque_decode(&dec, (char *)peek_sid,
+                                      SESSION_ID_SIZE)) {
+                    peek_ok = true;
+                }
+            }
+
+            /* Always restore the decoder cursor so the main
+             * decode pass starts at the same offset regardless of
+             * how far the peek advanced. */
+            xdr_setpos(&dec, saved_pos);
+
+            if (peek_ok) {
+                uint32_t sess_max_req = 0;
+                uint32_t sess_max_ops = 0;
+
+                if (session_get_limits(srv->st, peek_sid,
+                        &sess_max_req, &sess_max_ops) == 0) {
+                    if (sess_max_req > 0 &&
+                        record_len > sess_max_req) {
+                        rc = send_compound_decode_failure(c,
+                            reply_buf, xid, "",
+                            NFS4ERR_REQ_TOO_BIG,
+                            NFS4ERR_REQ_TOO_BIG);
+                        goto cleanup;
+                    }
+                    if (sess_max_ops > 0 &&
+                        peek_count > sess_max_ops) {
+                        rc = send_compound_decode_failure(c,
+                            reply_buf, xid, "",
+                            NFS4ERR_TOO_MANY_OPS,
+                            NFS4ERR_TOO_MANY_OPS);
+                        goto cleanup;
+                    }
+                }
+            }
+        }
+
         {
             int dec_rc = nfs4_decode_compound_args(
                 &dec, tag, sizeof(tag), &minorver,
@@ -904,10 +984,10 @@ wrongsec:
                  * (RFC 5661 §15.2 / RFC 8881 §2.10.6.1.2):
                  *   -2 = count > NFS4_MAX_OPS  -> TOO_MANY_OPS
                  *   -1 = malformed wire bytes  -> BADXDR
-                 * In every case emit a single-element resarray with a
-                 * SEQUENCE result carrying the inner error code, so
-                 * Linux / pynfs clients can read resarray[0] without
-                 * crashing. */
+                 * In every case emit a single-element resarray
+                 * with a SEQUENCE result carrying the inner
+                 * error code, so Linux / pynfs clients can read
+                 * resarray[0] without crashing. */
                 enum nfs4_status err_status =
                     (dec_rc == -2) ? NFS4ERR_TOO_MANY_OPS
                                    : NFS4ERR_BADXDR;
@@ -997,19 +1077,49 @@ wrongsec:
 
         result_count = compound_process(&cd, ops, results, op_count);
 
-        /* DRC: if replay_cached is set, send the cached reply directly. */
-        if (cd.replay_cached && cd.st != NULL &&
+        /* DRC: if replay_cached is set, send the cached reply directly.
+         *
+         * RFC 5661 §2.10.6.1.3 requires the replied bytes match what
+         * the server originally sent for that (session, slot, seq_id),
+         * EXCEPT for the RPC XID which MUST match the new request's
+         * XID so the client's RPC layer can route the reply to the
+         * outstanding call.  Per RFC 5531, the XID is the first
+         * 4-byte field of the RPC reply header (ONC-RPC big-endian).
+         * We copy the cached bytes into our reply scratch buffer and
+         * overwrite [0..3] with the new request's XID before sending.
+         *
+         * NOTE: GSS-protected replies also embed MIC(seq_num) in the
+         * reply verifier; that MIC was computed over the original
+         * request's seq_num and will not validate against the
+         * replay's new seq_num.  Skip the cached-replay fast path
+         * for GSS for now — the cache miss path returns
+         * NFS4ERR_RETRY_UNCACHED_REP, which is RFC-conformant.
+         * Drives pynfs SEQ9a. */
+        if (cd.replay_cached && cd.st != NULL && gss_svc_eff == 0 &&
             op_count > 0 && ops[0].opnum == OP_SEQUENCE) {
             const uint8_t *cached = NULL;
             uint32_t cached_len = 0;
             if (session_slot_get_cached_reply(
                     cd.st, ops[0].arg.sequence.session_id,
                     ops[0].arg.sequence.slot_id,
-                    &cached, &cached_len) == 0) {
-                rc = send_record(c, cached, cached_len);
+                    &cached, &cached_len) == 0 &&
+                cached_len >= 4 && cached_len <= REPLY_BUF_SIZE) {
+                /* Defensive bounds: a malformed cache entry
+                 * (somehow shorter than 4 bytes or larger than
+                 * the reply buffer) MUST not be sent. */
+                memcpy(reply_buf, cached, cached_len);
+                /* Patch XID @ offset 0 (RFC 5531 §9 message header,
+                 * uint32 big-endian).  htonl() converts from host
+                 * order to network order for the wire. */
+                uint32_t xid_be = htonl(xid);
+                memcpy(reply_buf, &xid_be, 4);
+                rc = send_record(c, (uint8_t *)reply_buf,
+                                 cached_len);
                 goto cleanup;
             }
-            /* Cache miss — fall through to normal encoding. */
+            /* Cache miss / GSS / size sanity — fall through to
+             * normal encoding so the SEQUENCE result that
+             * compound_process already populated is sent. */
         }
 
         /* Determine overall status (first error). */

@@ -85,15 +85,29 @@ enum nfs4_status {
 	NFS4ERR_BADSESSION        = 10052,
 	NFS4ERR_BADSLOT           = 10053,
 	NFS4ERR_SEQ_MISORDERED    = 10063,
+	/* RFC 5661 §15.1.10.2 — the slot's reply was not cached so the
+	 * server cannot replay it.  Returned when the client retries
+	 * a request that was originally sent with sa_cachethis = FALSE
+	 * (RFC 5661 §2.10.6.2 permits the server to either reconstruct
+	 * the reply or return this code; we choose the simpler path).
+	 * Drives pynfs SEQ10b. */
+	NFS4ERR_RETRY_UNCACHED_REP = 10068,
 	NFS4ERR_SEQ_FALSE_RETRY   = 10076,
 	NFS4ERR_LAYOUTUNAVAILABLE = 10058,
 	NFS4ERR_WRONGSEC          = 10016,
-	NFS4ERR_NAMETOOLONG       = 10110,
+	/* RFC 5661 §15.1 numeric values are authoritative.  Earlier
+	 * revisions of this enum used the wrong codes for NAMETOOLONG
+	 * (was 10110) and REQ_TOO_BIG (was 10041 — which is actually
+	 * NFS4ERR_BADNAME on the wire).  pynfs SEQ6 caught the
+	 * REQ_TOO_BIG mis-numbering by reporting "got NFS4ERR_BADNAME"
+	 * when the server thought it was sending REQ_TOO_BIG. */
+	NFS4ERR_NAMETOOLONG       = 63,
 	/* RFC 5661 §15.1.1 — wire-format errors used by the COMPOUND
 	 * decode-failure path (rpc_server.c).  These MUST be carried in
 	 * a synthesised SEQUENCE result so the resarray is non-empty. */
 	NFS4ERR_BADXDR            = 10036,
-	NFS4ERR_REQ_TOO_BIG       = 10041,
+	NFS4ERR_BADNAME           = 10041,
+	NFS4ERR_REQ_TOO_BIG       = 10065,
 	NFS4ERR_TOO_MANY_OPS      = 10070,
 	/* RFC 8881 §15.1.1.4 / §18.46.3 — SEQUENCE must be the first op
 	 * in every COMPOUND that uses session-state.  pynfs SEQ2. */
@@ -311,6 +325,13 @@ struct nfs4_arg_create_session {
 	uint32_t back_slots;
 	uint32_t cb_prog;        /**< Callback program number. */
 	uint32_t cb_sec_flavor;  /**< Callback security flavor. */
+	/* RFC 8881 §18.36.4 client-requested forechannel attrs.  The
+	 * server emits MIN(client_request, server_pref) in the reply
+	 * and stores the negotiated values on the session for enforcement
+	 * at SEQUENCE-receive time.  Pynfs SEQ6 (testRequestTooBig) +
+	 * SEQ7 (testTooManyOps). */
+	uint32_t fore_max_request_size;
+	uint32_t fore_max_operations;
 };
 
 struct nfs4_arg_destroy_session {
@@ -808,6 +829,12 @@ struct nfs4_res_create_session {
 	uint32_t csr_flags;
 	uint32_t fore_slots;
 	uint32_t back_slots;
+	/* Negotiated forechannel attrs returned to the client.  These are
+	 * MIN(client_request, server_pref); the same values are stored on
+	 * the new session and consulted by the SEQUENCE wire-receive path
+	 * to enforce ca_maxrequestsize / ca_maxoperations. */
+	uint32_t fore_max_request_size;
+	uint32_t fore_max_operations;
 };
 
 struct nfs4_res_sequence {

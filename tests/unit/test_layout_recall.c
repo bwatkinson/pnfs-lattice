@@ -376,7 +376,9 @@ static void test_recall_with_cb_success(void)
     uint32_t fore = 0, back = 0;
     ASSERT_EQ(session_create_session(st, clientid, seqid, 16, 4,
                                      0x40000000, 0, /* AUTH_NONE */
-                                     session_id, &fore, &back), 0);
+                                     0, 0,
+                                     session_id, &fore, &back,
+                                     NULL, NULL), 0);
 
     /* Create socketpair for mock backchannel. */
     int sv[2];
@@ -470,7 +472,9 @@ static void test_recall_cb_fail_still_revokes(void)
     uint32_t fore = 0, back = 0;
     ASSERT_EQ(session_create_session(st, clientid, seqid, 16, 4,
                                      0x40000000, 0,
-                                     session_id, &fore, &back), 0);
+                                     0, 0,
+                                     session_id, &fore, &back,
+                                     NULL, NULL), 0);
     /* No bind_conn — cb_conn is NULL, so CB will be skipped. */
 
     layout_recall_set_session_table(lr, st);

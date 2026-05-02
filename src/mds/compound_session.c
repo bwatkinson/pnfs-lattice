@@ -59,9 +59,18 @@ enum nfs4_status op_sequence(struct compound_data *cd,
 	case 1:
 		/*
 		 * Replay detected, no cached reply.
-		 * RFC 8881 §2.10.6.1.3: SEQ_FALSE_RETRY.
+		 *
+		 * RFC 5661 §2.10.6.2 / §15.1.10.2: when the server cannot
+		 * replay the original reply (because the original was sent
+		 * with sa_cachethis = FALSE so we never cached it), the
+		 * RFC-conformant response is NFS4ERR_RETRY_UNCACHED_REP.
+		 * SEQ_FALSE_RETRY (§15.1.10.6) is reserved for the case
+		 * where the replay's op-array differs from the cached one;
+		 * we don't track that distinction so we conservatively
+		 * always return RETRY_UNCACHED_REP for the no-cache replay
+		 * path.  Drives pynfs SEQ10b.
 		 */
-		return NFS4ERR_SEQ_FALSE_RETRY;
+		return NFS4ERR_RETRY_UNCACHED_REP;
 	case 2:
 		/*
 		 * Replay with cached reply available.
@@ -126,9 +135,13 @@ enum nfs4_status op_create_session(struct compound_data *cd,
 				    a->back_slots,
 				    a->cb_prog,
 				    a->cb_sec_flavor,
+				    a->fore_max_request_size,
+				    a->fore_max_operations,
 				    r->session_id,
 				    &r->fore_slots,
-				    &r->back_slots);
+				    &r->back_slots,
+				    &r->fore_max_request_size,
+				    &r->fore_max_operations);
 	switch (rc) {
 	case 0:
 		r->csr_sequence = a->seqid;

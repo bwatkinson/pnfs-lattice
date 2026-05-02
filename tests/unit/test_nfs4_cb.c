@@ -92,7 +92,9 @@ static int setup_session(struct session_table **out_st,
     if (session_create_session(st, clientid, seqid,
                                16, back_slots,
                                cb_prog, cb_sec,
-                               out_sid, &fore, &back) != 0) {
+                               0, 0,
+                               out_sid, &fore, &back,
+                               NULL, NULL) != 0) {
         session_table_destroy(st);
         return -1;
     }
@@ -239,7 +241,9 @@ static void test_cb_slots_allocated(void)
     ASSERT_EQ(session_create_session(st, clientid, seqid,
                                      16, 8,
                                      0x40000000, 0,
-                                     sid, &fore, &back), 0);
+                                     0, 0,
+                                     sid, &fore, &back,
+                                     NULL, NULL), 0);
     ASSERT_EQ(fore, 16);
     ASSERT_EQ(back, 8);
 
@@ -266,7 +270,9 @@ static void test_zero_back_slots(void)
     ASSERT_EQ(session_create_session(st, clientid, seqid,
                                      16, 0,
                                      0, 0,
-                                     sid, &fore, &back), 0);
+                                     0, 0,
+                                     sid, &fore, &back,
+                                     NULL, NULL), 0);
     ASSERT_EQ(back, 0);
 
     session_table_destroy(st);

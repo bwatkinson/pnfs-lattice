@@ -156,7 +156,11 @@ bool decode_op_create_session(XDR *xdrs, struct nfs4_op *op)
 }
 
     /* fore_chan_attrs: headerpadsize, maxrequestsize, maxresponsesize,
-     * maxresponsesize_cached, maxoperations, maxrequests. */
+     * maxresponsesize_cached, maxoperations, maxrequests.  Capture
+     * maxrequestsize and maxoperations into a-> fields so the
+     * server-side negotiation in session_create_session() can return
+     * MIN(client, server) and the SEQUENCE wire path can enforce the
+     * negotiated limit (RFC 8881 §18.36.4 / pynfs SEQ6+SEQ7). */
     {
         uint32_t pad, maxreq, maxresp, maxcached, maxops;
 
@@ -175,6 +179,8 @@ bool decode_op_create_session(XDR *xdrs, struct nfs4_op *op)
         if (!xdr_uint32_t(xdrs, &maxops)) {
             return false;
 }
+        a->fore_max_request_size = maxreq;
+        a->fore_max_operations   = maxops;
         if (!xdr_uint32_t(xdrs, &a->fore_slots)) {
             return false;
         }
@@ -854,13 +860,19 @@ bool encode_res_create_session(XDR *xdrs,
         return false;
 }
 
-    /* fore_chan_attrs: pad, maxreq, maxresp, maxcached, maxops, maxreqs */
+    /* fore_chan_attrs: pad, maxreq, maxresp, maxcached, maxops, maxreqs.
+     * Emit the negotiated maxrequestsize / maxoperations from the
+     * compound result struct (already MIN(client, server)) so the
+     * client knows the effective per-session caps.  RFC 8881
+     * §18.36.4 / pynfs SEQ6+SEQ7. */
     {
         uint32_t pad = 0;
-        uint32_t maxreq = 1048576;
+        uint32_t maxreq = (cs->fore_max_request_size > 0)
+                          ? cs->fore_max_request_size : 1048576U;
         uint32_t maxresp = 1048576;
         uint32_t maxcached = 65536;
-        uint32_t maxops = NFS4_MAX_OPS;
+        uint32_t maxops = (cs->fore_max_operations > 0)
+                          ? cs->fore_max_operations : NFS4_MAX_OPS;
         uint32_t slots = cs->fore_slots;
 
         if (!xdr_uint32_t(xdrs, &pad)) {

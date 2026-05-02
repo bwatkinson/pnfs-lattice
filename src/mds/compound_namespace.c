@@ -1515,7 +1515,25 @@ enum nfs4_status op_rename(struct compound_data *cd,
 			return NFS4ERR_XDEV;
 		}
 		if (!src_local && !dst_local) {
-			return NFS4ERR_XDEV;
+			/*
+			 * Both paths fall outside any subtree this MDS
+			 * actively owns.  In the single-RonDB-cluster
+			 * deployment model (the only mode supported by
+			 * cat_rename) this is NOT cross-device: every MDS
+			 * sees the same NDB metadata, and the shard map
+			 * is purely an ownership hint for routing.  An
+			 * unmapped path — e.g. the pynfs default test root
+			 * `/pynfs-test/...`, which is not configured as
+			 * any shard — is reachable by every node.
+			 *
+			 * Returning NFS4ERR_XDEV here was over-conservative
+			 * and broke RFC 5661 §18.26 same-directory rename
+			 * for any client whose mount path was not pre-
+			 * declared in the shard map (pynfs SEQ10b
+			 * testReplayCache007).  Fall through to the normal
+			 * cat_rename path; RonDB's cross-partition 2PC
+			 * handles atomicity even if src and dst happened
+			 * to live on different shards. */
 		}
 		/* Both local — cross-shard rename (Phase 4). */
 		if (cd->current_shard != NULL &&

@@ -1230,6 +1230,16 @@ int nfs4_decode_compound_args(XDR *xdrs,
 
     for (i = 0; i < count; i++) {
         if (!decode_one_op(xdrs, &ops[i])) {
+            /*
+             * Report how many ops decoded successfully so the
+             * caller can still inspect ops[0..i-1] (e.g. to read
+             * the SEQUENCE session_id and enforce per-session
+             * limits before returning NFS4ERR_BADXDR).  This is
+             * load-bearing for pynfs SEQ6 (testRequestTooBig)
+             * where the LOOKUP after SEQUENCE intentionally
+             * carries an oversize component4 that fails the
+             * MDS_MAX_NAME bound check inside decode_op_lookup. */
+            *op_count = i;
             return -1;
 }
         /*

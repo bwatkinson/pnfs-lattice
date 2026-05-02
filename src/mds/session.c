@@ -620,14 +620,32 @@ int session_create_session(struct session_table *st,
 			   uint32_t back_slots,
 			   uint32_t cb_prog,
 			   uint32_t cb_sec_flavor,
+			   uint32_t fore_max_request_size,
+			   uint32_t fore_max_operations,
 			   uint8_t out_session_id[SESSION_ID_SIZE],
 			   uint32_t *out_fore_slots,
-			   uint32_t *out_back_slots)
+			   uint32_t *out_back_slots,
+			   uint32_t *out_fore_max_request_size,
+			   uint32_t *out_fore_max_operations)
 {
 	struct nfs4_client *c;
 	struct nfs4_session *s = NULL;
 	uint32_t actual_fore;
 	uint32_t actual_back;
+	uint32_t actual_max_req;
+	uint32_t actual_max_ops;
+	/* Server hard caps that match what encode_res_create_session
+	 * advertises in the wire reply (1 MiB / NFS4_MAX_OPS).  These
+	 * are the absolute upper bounds; the negotiated value is
+	 * MIN(client_request, server_pref).  We DO NOT enforce a lower
+	 * floor: pynfs SEQ6 sets ca_maxrequestsize=512 and SEQ7 sets
+	 * ca_maxoperations to a small N, and both tests rely on the
+	 * server accepting and enforcing those small values verbatim. */
+	const uint32_t SERVER_MAX_REQUEST_SIZE = 1048576U;
+	/* Mirror NFS4_MAX_OPS from xdr_codec.h.  Inlined as a literal
+	 * to keep session.c free of XDR-layer header dependencies; if
+	 * NFS4_MAX_OPS ever changes, both sites must be updated. */
+	const uint32_t SERVER_MAX_OPERATIONS   = 64U;
 	int rc = 0;
 
 	if (st == NULL || out_session_id == NULL) {
@@ -661,6 +679,20 @@ int session_create_session(struct session_table *st,
 	actual_back = (back_slots > SESSION_MAX_SLOTS)
 		? SESSION_MAX_SLOTS : back_slots;
 
+	/* Negotiate forechannel attrs: MIN(client_request, server_pref).
+	 * A zero-valued client request is treated as "use server max".
+	 * Any positive client value within (0, SERVER_MAX_*] is honored
+	 * verbatim so SEQ6 (small ca_maxrequestsize) and SEQ7 (small
+	 * ca_maxoperations) can drive the rpc-server enforcement path. */
+	actual_max_req = fore_max_request_size;
+	if (actual_max_req == 0U || actual_max_req > SERVER_MAX_REQUEST_SIZE) {
+		actual_max_req = SERVER_MAX_REQUEST_SIZE;
+	}
+	actual_max_ops = fore_max_operations;
+	if (actual_max_ops == 0U || actual_max_ops > SERVER_MAX_OPERATIONS) {
+		actual_max_ops = SERVER_MAX_OPERATIONS;
+	}
+
 	/* Allocate session. */
 	s = calloc(1, sizeof(*s));
 	if (s == NULL) {
@@ -681,6 +713,8 @@ int session_create_session(struct session_table *st,
 	 * With seq_id=0, the check (1 == 0+1) accepts it. */
 	s->num_slots = actual_fore;
 	s->clientid = clientid;
+	s->max_request_size = actual_max_req;
+	s->max_operations = actual_max_ops;
 
 	/* Backchannel slots + callback metadata. */
 	s->cb_prog = cb_prog;
@@ -748,8 +782,41 @@ int session_create_session(struct session_table *st,
 	if (out_back_slots != NULL) {
 		*out_back_slots = actual_back;
 }
+	if (out_fore_max_request_size != NULL) {
+		*out_fore_max_request_size = actual_max_req;
+	}
+	if (out_fore_max_operations != NULL) {
+		*out_fore_max_operations = actual_max_ops;
+	}
 
 out:
+	pthread_mutex_unlock(&st->locks[0]);
+	return rc;
+}
+
+int session_get_limits(struct session_table *st,
+		       const uint8_t session_id[SESSION_ID_SIZE],
+		       uint32_t *out_max_req,
+		       uint32_t *out_max_ops)
+{
+	struct nfs4_session *s;
+	int rc = -1;
+
+	if (st == NULL || session_id == NULL) {
+		return -1;
+	}
+
+	pthread_mutex_lock(&st->locks[0]);
+	s = find_session(st, session_id);
+	if (s != NULL) {
+		if (out_max_req != NULL) {
+			*out_max_req = s->max_request_size;
+		}
+		if (out_max_ops != NULL) {
+			*out_max_ops = s->max_operations;
+		}
+		rc = 0;
+	}
 	pthread_mutex_unlock(&st->locks[0]);
 	return rc;
 }

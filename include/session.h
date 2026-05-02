@@ -83,6 +83,12 @@ struct nfs4_session {
 	struct nfs4_slot    *slots;           /* [num_slots] */
 	struct nfs4_session *hash_next;       /* Session hash chain */
 	struct nfs4_session *client_next;     /* Per-client session list */
+	/* RFC 8881 §18.36.4 negotiated forechannel attrs.  Stored at
+	 * session-create time as MIN(client_request, server_pref) and
+	 * enforced on every COMPOUND that carries a SEQUENCE on this
+	 * session.  Pynfs SEQ6 / SEQ7 rely on these caps. */
+	uint32_t             max_request_size;
+	uint32_t             max_operations;
 	/* Backchannel state (RFC 8881 §2.10.3.1) */
 	uint32_t             cb_prog;         /* Callback program number */
 	uint32_t             cb_sec_flavor;   /* Callback security flavor */
@@ -248,9 +254,31 @@ int session_create_session(struct session_table *st,
 			   uint32_t back_slots,
 			   uint32_t cb_prog,
 			   uint32_t cb_sec_flavor,
+			   uint32_t fore_max_request_size,
+			   uint32_t fore_max_operations,
 			   uint8_t out_session_id[SESSION_ID_SIZE],
 			   uint32_t *out_fore_slots,
-			   uint32_t *out_back_slots);
+			   uint32_t *out_back_slots,
+			   uint32_t *out_fore_max_request_size,
+			   uint32_t *out_fore_max_operations);
+
+/**
+ * Look up the negotiated per-session forechannel limits.  Used by the
+ * RPC layer to enforce RFC 8881 §15.1.10.5 (NFS4ERR_REQ_TOO_BIG) and
+ * §15.1.10.4 (NFS4ERR_TOO_MANY_OPS) on every COMPOUND request that
+ * carries a SEQUENCE on this session.
+ *
+ * @param st            Session table.
+ * @param session_id    16-byte session ID extracted from SEQUENCE arg.
+ * @param out_max_req   Receives the negotiated ca_maxrequestsize
+ *                      (output undefined when the function returns -1).
+ * @param out_max_ops   Receives the negotiated ca_maxoperations.
+ * @return 0 on hit (limits filled), -1 on session not found.
+ */
+int session_get_limits(struct session_table *st,
+		       const uint8_t session_id[SESSION_ID_SIZE],
+		       uint32_t *out_max_req,
+		       uint32_t *out_max_ops);
 
 /* -----------------------------------------------------------------------
  * API — DESTROY_SESSION (RFC 8881 §18.37)

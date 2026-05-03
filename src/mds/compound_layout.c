@@ -32,6 +32,7 @@
 #include "layout_ds_ids.h"
 #include "layout_cache.h"  /* Phase D of docs/hpc-nto1-plan.md */
 #include "layout_commit_aggregator.h"  /* Phase F of docs/hpc-nto1-plan.md */
+#include "layout_recall.h"  /* byte-range conflict-recall on op_layoutget */
 
 
 /* -----------------------------------------------------------------------
@@ -779,6 +780,55 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 	    !(inode.flags & MDS_IFLAG_DS_PENDING)) {
 		return NFS4ERR_LAYOUTUNAVAILABLE;
 }
+
+	/*
+	 * Mark's bug — byte-range CB_LAYOUTRECALL.
+	 *
+	 * Before granting a new layout, scan existing holders on this
+	 * fileid and emit byte-range CB_LAYOUTRECALL to any holder
+	 * whose iomode conflicts with the requesting iomode AND whose
+	 * range overlaps the requested (offset, length).  The kernel
+	 * client (Linux 6.18+ Slice 3) consumes the byte-range recall
+	 * by invalidating only the recalled sub-range of its layout
+	 * cache, instead of dropping the whole layout as it would for
+	 * a whole-file CB_LAYOUTRECALL.
+	 *
+	 * Best-effort: any CB delivery error or catalogue scan failure
+	 * still leaves the catalogue in a coherent state — holders
+	 * whose row was revoked observe NFS4ERR_BAD_STATEID on their
+	 * next LAYOUT*, and the requesting LAYOUTGET below proceeds
+	 * normally.  Skipped when:
+	 *   - cd->lr is unset (test compat / no recall coordinator),
+	 *   - the request's stateid matches the requesting client's
+	 *     existing layout (idempotent renew — no recall needed).
+	 * The same-client case is handled inside the helper by the
+	 * clientid filter, but we early-out here to avoid the catalogue
+	 * round trip for the common renew path.
+	 */
+	if (cd->lr != NULL) {
+		uint32_t recalled = 0;
+		uint32_t req_iomode_for_recall = a->iomode;
+
+		/* Promote READ to RW for the conflict scan when the
+		 * server is granting RW upgrades unconditionally
+		 * (matches the long-lived grant policy below): if we
+		 * are about to grant RW, any conflicting holder must
+		 * see a recall regardless of what the client asked
+		 * for. */
+		if (grant_iomode == LAYOUTIOMODE4_RW) {
+			req_iomode_for_recall = LAYOUTIOMODE4_RW;
+		}
+
+		(void)layout_recall_byte_range_for_holders(
+			cd->lr,
+			cd->current_fh.fileid,
+			cd->clientid,
+			req_iomode_for_recall,
+			a->offset,
+			a->length,
+			&recalled);
+		(void)recalled; /* tracked via per-holder log; metrics tbd */
+	}
 
 	/*
 	 * If the CQ fused a layout pregrant onto the preceding

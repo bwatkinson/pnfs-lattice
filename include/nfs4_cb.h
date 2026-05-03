@@ -119,6 +119,34 @@ int nfs4_cb_recall(struct nfs4_session *session,
 		   uint32_t timeout_ms);
 
 /**
+ * Send CB_RECALL on a raw file descriptor.
+ *
+ * Same as nfs4_cb_recall() but takes pre-extracted callback channel
+ * parameters instead of a session pointer.  Mirrors the
+ * nfs4_cb_layoutrecall_fd() helper used by the layout recall
+ * coordinator: callers snapshot the session's cb metadata under the
+ * session-table lock, dup() the cb_conn fd, then perform the I/O
+ * outside the lock with a stable fd ownership boundary.
+ *
+ * @param fd            Connected socket fd (caller owns lifetime).
+ * @param session_id    16-byte session ID.
+ * @param cb_prog       Callback program number.
+ * @param slot_seq_id   Backchannel slot 0 sequence id.
+ * @param num_cb_slots  Total backchannel slots.
+ * @param args          Recall arguments.
+ * @param timeout_ms    Reply timeout (0 = default 5000).
+ * @return 0 on success, negative errno on failure, positive NFS4
+ *         status on per-op error in the reply.
+ */
+int nfs4_cb_recall_fd(int fd,
+		      const uint8_t session_id[SESSION_ID_SIZE],
+		      uint32_t cb_prog,
+		      uint32_t slot_seq_id,
+		      uint32_t num_cb_slots,
+		      const struct nfs4_cb_recall_args *args,
+		      uint32_t timeout_ms);
+
+/**
  * Arguments for a single CB_NOTIFY (RFC 8881 §20.4).
  *
  * v8c supports three structural event types:

@@ -1101,6 +1101,13 @@ int main(int argc, char *argv[])
 				layout_recall_set_shard(lr, def);
 			}
 		}
+		/* Wire the session table so the recall coordinator can
+		 * snapshot holders' backchannels for byte-range
+		 * CB_LAYOUTRECALL on op_layoutget conflict (Mark's bug)
+		 * and the existing DS-failure / admin paths.  Without
+		 * this binding the recall coordinator falls back to
+		 * authoritative-revoke-only mode. */
+		layout_recall_set_session_table(lr, session_tbl);
 		if (cfg.ds_heartbeat_ms == 0) {
 			(void)fprintf(stderr,
 				"INFO: DS health monitoring disabled "
@@ -1385,8 +1392,14 @@ int main(int argc, char *argv[])
 				(void)fprintf(stderr,
 					"WARN: dirent_cache_init failed\n");
 			}
-			rpc_cfg.dcache = dcache;
+		rpc_cfg.dcache = dcache;
 		}
+
+		/* Layout recall coordinator — used by op_layoutget for
+		 * byte-range conflict-recall (Mark's bug) and reused by
+		 * the existing DS-failure / admin paths.  NULL-safe in
+		 * compound_data; op_layoutget skips the conflict scan. */
+		rpc_cfg.lr = lr;
 
 		/* HPC-Shared layout cache (Phase D of
 		 * docs/hpc-nto1-plan.md).  Populated only for inodes with
@@ -1473,6 +1486,14 @@ int main(int argc, char *argv[])
 							    rondb_boot_epoch);
 				}
 #endif
+				/* Wire the session table so deleg_recall_file()
+				 * can snapshot the holder's backchannel and
+				 * issue CB_RECALL on a dup'd fd.  Without this,
+				 * the recall path silently revokes the
+				 * delegation without notifying the client —
+				 * legacy pre-fix behaviour, retained when
+				 * session_tbl == NULL. */
+				deleg_table_set_session_table(dt, session_tbl);
 				/* Transient-state profile keeps delegations
 				 * in memory only — removes the NDB write
 				 * from the OPEN hot path. */

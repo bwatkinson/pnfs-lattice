@@ -26,6 +26,7 @@
 
 struct nfs4_session;  /* Forward — for CB_RECALL delivery. */
 struct mds_catalogue;
+struct session_table; /* Forward — for backchannel snapshot lookup. */
 
 /** Opaque delegation table handle. */
 struct deleg_table;
@@ -49,6 +50,20 @@ void deleg_table_destroy(struct deleg_table *dt);
 void deleg_table_set_cat(struct deleg_table *dt,
                          struct mds_catalogue *cat,
                          uint64_t boot_epoch);
+
+/**
+ * Attach the session table.
+ *
+ * Required for deleg_recall_file() to send CB_RECALL on a holder's
+ * backchannel.  Without it, the recall path falls back to revoke-
+ * without-CB (the legacy behaviour pre-Phase "properly fix delegation
+ * conflict-recall").
+ *
+ * The session table is borrowed; the caller retains ownership and
+ * must outlive the deleg_table.  NULL-safe: clears any prior binding.
+ */
+void deleg_table_set_session_table(struct deleg_table *dt,
+                                   struct session_table *st);
 
 /**
  * Toggle transient (in-memory-only) delegation state.

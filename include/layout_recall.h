@@ -73,6 +73,44 @@ int layout_recall_for_ds(struct layout_recall *lr, uint32_t ds_id);
  */
 int layout_recall_for_file(struct layout_recall *lr, uint64_t fileid);
 
+/**
+ * Byte-range conflict-recall on op_layoutget.
+ *
+ * Recalls only the holders whose existing layout overlaps the
+ * requested (offset, length) AND whose iomode conflicts with the
+ * requesting iomode (RW vs anything; READ vs RW).  For each such
+ * holder we emit `CB_LAYOUTRECALL` with `recall_type = LAYOUTRECALL4_FILE`
+ * and the *intersection* of (req_off, req_len) with (hold_off, hold_len)
+ * — RFC 8881 §12.5.5 byte-range partial recall.  The holder's
+ * authoritative layout state is then revoked from the catalogue (full
+ * stateid revoke; partial-revoke granularity is a Phase 2 follow-up).
+ *
+ * Same-client renew (clientid == requesting_clientid) is skipped — a
+ * client may upgrade or extend its own layout without recalling itself.
+ *
+ * Best-effort and idempotent.  CB delivery failure (no backchannel,
+ * timeout, send error) is non-fatal; the catalogue revoke runs
+ * regardless so the requesting LAYOUTGET can proceed.
+ *
+ * @param lr             Recall coordinator handle.
+ * @param fileid         File targeted by the LAYOUTGET.
+ * @param req_clientid   Requesting client (skip self).
+ * @param req_iomode     LAYOUTIOMODE4_READ or LAYOUTIOMODE4_RW.
+ * @param req_offset     Requested range start (bytes).
+ * @param req_length     Requested range length (UINT64_MAX = to-EOF).
+ * @param recalled_out   Optional: receives the count of holders the
+ *                       helper recalled.  Pass NULL to ignore.
+ * @return 0 on success (zero or more recalls sent), -errno on
+ *         catalogue failure (no recalls sent).
+ */
+int layout_recall_byte_range_for_holders(struct layout_recall *lr,
+                                         uint64_t fileid,
+                                         uint64_t req_clientid,
+                                         uint32_t req_iomode,
+                                         uint64_t req_offset,
+                                         uint64_t req_length,
+                                         uint32_t *recalled_out);
+
 struct session_table;
 
 /**

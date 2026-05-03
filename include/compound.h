@@ -1323,6 +1323,13 @@ struct compound_data {
 	struct layout_commit_aggregator *lcommit_agg;
 	struct deleg_table       *dt;         /* NULL = no delegations */
 	struct dir_deleg_table   *ddt;        /* NULL = no dir delegations */
+	/*
+	 * Layout recall coordinator (NULL = no recall, legacy path).
+	 * Used by op_layoutget for byte-range conflict-recall and by
+	 * any future cross-client revoke initiated from a compound op.
+	 * Borrowed: lifetime is the daemon's, set once at startup.
+	 */
+	struct layout_recall     *lr;
 	struct mds_shard_map     *shard_map; /* NULL = no shard routing (tests/legacy) */
 	const struct mds_shard   *current_shard; /* Active shard (set by FH/path transitions) */
 	const struct mds_shard   *saved_shard;   /* SAVEFH snapshot of current_shard */

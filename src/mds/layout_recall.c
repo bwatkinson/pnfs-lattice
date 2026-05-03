@@ -512,6 +512,328 @@ static int file_holder_cb(uint64_t clientid,
     return 0;
 }
 
+/* -----------------------------------------------------------------------
+ * Byte-range conflict-recall (op_layoutget)
+ *
+ * Mark's bug `bugs from mark/mds_byte_range_layoutrecall.md`: the MDS
+ * historically only emitted whole-file CB_LAYOUTRECALL even when the
+ * conflicting LAYOUTGET request only touched a sub-range of the
+ * holder's grant.  This blocks Slice 3 of the strict N-to-1 kernel
+ * patch series, which depends on partial recalls so concurrent writers
+ * to disjoint ranges of the same shared file don't ping-pong each
+ * other's whole layout.
+ *
+ * The helper below mirrors layout_recall_for_file but:
+ *   - takes (offset, length, iomode) from the requesting compound;
+ *   - filters the holder set by iomode-conflict;
+ *   - computes the intersection of [req_off, req_off + req_len) with
+ *     each holder's stored (offset, length);
+ *   - emits CB_LAYOUTRECALL with recall_type = LAYOUTRECALL4_FILE and
+ *     the intersection;
+ *   - revokes the holder's authoritative layout-state row.
+ *
+ * v1 conservative behaviour: full-revoke the holder's grant when the
+ * intersection is non-empty.  RFC permits emitting a byte-range CB
+ * even when the server tracks whole-file granularity — the kernel
+ * client invalidates only the recalled sub-range of its cache, which
+ * is what Slice 3 needs.  Splitting the layout-state row into two
+ * adjacent ranges is a Phase 2 follow-up.
+ * ----------------------------------------------------------------------- */
+
+/* RFC 8881 §12.4.4: layout iomode constants (mirrored from
+ * include/compound.h to avoid pulling that header here). */
+#define LAYOUTIOMODE4_READ  1
+#define LAYOUTIOMODE4_RW    2
+#define LAYOUTIOMODE4_ANY   3
+
+static bool iomode_conflicts(uint32_t holder_iomode, uint32_t requester_iomode)
+{
+    /*
+     * RFC 8881 §12.5.5: a layout conflicts with another if at least
+     * one side has write semantics (RW).  Two READs do not conflict.
+     * ANY behaves as RW for safety.
+     */
+    bool holder_w = (holder_iomode == LAYOUTIOMODE4_RW) ||
+                    (holder_iomode == LAYOUTIOMODE4_ANY);
+    bool req_w    = (requester_iomode == LAYOUTIOMODE4_RW) ||
+                    (requester_iomode == LAYOUTIOMODE4_ANY);
+    return holder_w || req_w;
+}
+
+/*
+ * Compute [out_off, out_off + out_len) = [a_off, a_off + a_len)
+ *                                       ∩ [b_off, b_off + b_len).
+ * Length values of UINT64_MAX mean "to EOF" per RFC 8881 §12.5.5.
+ * Returns false on empty intersection (caller skips the recall).
+ */
+static bool range_intersect(uint64_t a_off, uint64_t a_len,
+                            uint64_t b_off, uint64_t b_len,
+                            uint64_t *out_off, uint64_t *out_len)
+{
+    uint64_t a_end;
+    uint64_t b_end;
+    uint64_t lo;
+    uint64_t hi;
+
+    /* Saturating add: a_off + a_len, capping at UINT64_MAX. */
+    a_end = (a_len == UINT64_MAX || a_len > UINT64_MAX - a_off)
+              ? UINT64_MAX : a_off + a_len;
+    b_end = (b_len == UINT64_MAX || b_len > UINT64_MAX - b_off)
+              ? UINT64_MAX : b_off + b_len;
+
+    lo = (a_off > b_off) ? a_off : b_off;
+    hi = (a_end < b_end) ? a_end : b_end;
+    if (lo >= hi) {
+        return false;
+    }
+    *out_off = lo;
+    /* Preserve UINT64_MAX as "to EOF" so the wire CB carries the
+     * RFC-canonical sentinel rather than a numerically-identical but
+     * structurally-different absolute byte count. */
+    *out_len = (hi == UINT64_MAX) ? UINT64_MAX : (hi - lo);
+    return true;
+}
+
+struct byte_range_holder {
+    uint64_t            clientid;
+    uint64_t            fileid;
+    struct nfs4_stateid stateid;
+    uint32_t            iomode;
+    uint64_t            offset;
+    uint64_t            length;
+    uint64_t            recall_offset;
+    uint64_t            recall_length;
+};
+
+#define LAYOUT_BYTE_RANGE_MAX_HOLDERS 256
+
+struct byte_range_collect_ctx {
+    struct byte_range_holder *holders;
+    uint32_t                  count;
+    uint32_t                  capacity;
+    uint64_t                  fileid;
+    uint64_t                  req_clientid;
+    uint32_t                  req_iomode;
+    uint64_t                  req_offset;
+    uint64_t                  req_length;
+    struct mds_catalogue     *cat;
+};
+
+/*
+ * Per-holder iterator callback for mds_coord_layout_iter_file.  We
+ * receive (clientid, stateid, iomode) and look up (offset, length)
+ * via mds_coord_layout_get_by_stateid; the latter is a single NDB
+ * read keyed on stateid_other so the cost is bounded.
+ */
+static int byte_range_collect_cb(uint64_t clientid,
+                                 const struct nfs4_stateid *stateid,
+                                 uint32_t iomode, void *ctx)
+{
+    struct byte_range_collect_ctx *c = ctx;
+    uint64_t hold_off = 0;
+    uint64_t hold_len = 0;
+    uint64_t inter_off = 0;
+    uint64_t inter_len = 0;
+    uint64_t scratch_clientid = 0;
+    uint64_t scratch_fileid = 0;
+    uint32_t scratch_iomode = 0;
+    uint32_t scratch_seqid = 0;
+    enum mds_status st;
+
+    if (c == NULL || stateid == NULL) {
+        return 0;
+    }
+    if (clientid == c->req_clientid) {
+        return 0; /* self — skip */
+    }
+    if (!iomode_conflicts(iomode, c->req_iomode)) {
+        return 0;
+    }
+    if (c->count >= c->capacity) {
+        return 1; /* stop scan; defer surplus to next call */
+    }
+
+    if (c->cat != NULL) {
+        st = mds_coord_layout_get_by_stateid(c->cat,
+                                              stateid->other,
+                                              &scratch_clientid,
+                                              &scratch_fileid,
+                                              &scratch_iomode,
+                                              &hold_off, &hold_len,
+                                              &scratch_seqid);
+        if (st != MDS_OK) {
+            /* Stale or partially-persisted state — fall back to
+             * whole-file recall to be safe. */
+            hold_off = 0;
+            hold_len = UINT64_MAX;
+        }
+    } else {
+        hold_off = 0;
+        hold_len = UINT64_MAX;
+    }
+
+    if (!range_intersect(c->req_offset, c->req_length,
+                          hold_off, hold_len,
+                          &inter_off, &inter_len)) {
+        return 0; /* disjoint ranges — no conflict */
+    }
+
+    c->holders[c->count].clientid       = clientid;
+    c->holders[c->count].fileid         = c->fileid;
+    c->holders[c->count].stateid        = *stateid;
+    c->holders[c->count].iomode         = iomode;
+    c->holders[c->count].offset         = hold_off;
+    c->holders[c->count].length         = hold_len;
+    c->holders[c->count].recall_offset  = inter_off;
+    c->holders[c->count].recall_length  = inter_len;
+    c->count++;
+    return 0;
+}
+
+struct byte_range_cb_ctx {
+    struct byte_range_holder *holders;
+    uint32_t                  count;
+    uint32_t                  timeout_ms;
+};
+
+static int byte_range_cb_target_cb(const struct session_cb_snap *snap,
+                                   void *ctx)
+{
+    struct byte_range_cb_ctx *c = ctx;
+    uint32_t i;
+
+    if (snap == NULL || c == NULL) {
+        return 0;
+    }
+    /* For each holder this session belongs to, snapshot fd and emit
+     * the byte-range CB_LAYOUTRECALL.  We only consume the snap
+     * pointer for the duration of this callback; no state survives. */
+    for (i = 0; i < c->count; i++) {
+        struct nfs4_cb_layoutrecall_args args;
+        int fd;
+        int dup_fd;
+        int rc;
+
+        if (c->holders[i].clientid != snap->clientid) {
+            continue;
+        }
+        fd = rpc_conn_get_fd(snap->cb_conn);
+        if (fd < 0) {
+            continue;
+        }
+        dup_fd = dup(fd);
+        if (dup_fd < 0) {
+            continue;
+        }
+
+        memset(&args, 0, sizeof(args));
+        args.layout_type = 1; /* LAYOUT4_NFSV4_1_FILES */
+        args.iomode      = c->holders[i].iomode;
+        args.recall_type = LAYOUTRECALL4_FILE;
+        args.fileid      = c->holders[i].fileid;
+        args.stateid     = c->holders[i].stateid;
+        args.offset      = c->holders[i].recall_offset;
+        args.length      = c->holders[i].recall_length;
+
+        rc = nfs4_cb_layoutrecall_fd(dup_fd, snap->session_id,
+                                     snap->cb_prog,
+                                     snap->slot_seq_id,
+                                     1, &args, c->timeout_ms);
+        if (rc != 0) {
+            (void)fprintf(stderr,
+                "layout_recall: byte-range CB_LAYOUTRECALL "
+                "clientid=%llu fileid=%llu off=%llu len=%llu "
+                "rc=%d \u2014 revoking\n",
+                (unsigned long long)c->holders[i].clientid,
+                (unsigned long long)c->holders[i].fileid,
+                (unsigned long long)args.offset,
+                (unsigned long long)args.length, rc);
+        }
+        (void)close(dup_fd);
+    }
+    return 0;
+}
+
+int layout_recall_byte_range_for_holders(struct layout_recall *lr,
+                                         uint64_t fileid,
+                                         uint64_t req_clientid,
+                                         uint32_t req_iomode,
+                                         uint64_t req_offset,
+                                         uint64_t req_length,
+                                         uint32_t *recalled_out)
+{
+    struct byte_range_holder holders[LAYOUT_BYTE_RANGE_MAX_HOLDERS];
+    struct byte_range_collect_ctx col;
+    struct byte_range_cb_ctx cb_ctx;
+    enum mds_status st;
+    uint32_t i;
+
+    if (recalled_out != NULL) {
+        *recalled_out = 0;
+    }
+    if (lr == NULL) {
+        return -EINVAL;
+    }
+    if (lr->cat == NULL) {
+        /* No catalogue — no holders to query; treat as no-conflict. */
+        return 0;
+    }
+
+    memset(&col, 0, sizeof(col));
+    col.holders      = holders;
+    col.capacity     = LAYOUT_BYTE_RANGE_MAX_HOLDERS;
+    col.fileid       = fileid;
+    col.req_clientid = req_clientid;
+    col.req_iomode   = req_iomode;
+    col.req_offset   = req_offset;
+    col.req_length   = req_length;
+    col.cat          = lr->cat;
+
+    st = mds_coord_layout_iter_file(lr->cat, fileid,
+                                     byte_range_collect_cb, &col);
+    if (st != MDS_OK && st != MDS_ERR_NOTFOUND) {
+        return -EIO;
+    }
+    if (col.count == 0) {
+        return 0;
+    }
+
+    /*
+     * Snapshot every holder's backchannel under the session-table
+     * lock and emit CB_LAYOUTRECALL on the dup'd fd.  We use the
+     * existing session_for_each_with_cb iterator: it visits every
+     * session with cb_conn != NULL exactly once, and for each call
+     * we walk our local holders[] array filtering by clientid.  This
+     * keeps the lock window short (no nested I/O) and avoids storing
+     * raw session pointers across the operation.
+     */
+    if (lr->st != NULL) {
+        cb_ctx.holders    = holders;
+        cb_ctx.count      = col.count;
+        cb_ctx.timeout_ms = lr->revoke_ms;
+        (void)session_for_each_with_cb(lr->st, byte_range_cb_target_cb,
+                                       &cb_ctx);
+    }
+
+    /*
+     * Authoritative revoke: drop each holder's layout-state row.
+     * v1 full-revokes the whole grant whenever the intersection is
+     * non-empty.  Splitting the holder's row into two adjacent
+     * ranges is a Phase 2 follow-up; the on-wire CB is already
+     * byte-range correct, which is what the kernel client cares
+     * about.
+     */
+    for (i = 0; i < col.count; i++) {
+        revoke_layout(lr, holders[i].stateid.other,
+                      holders[i].clientid, holders[i].fileid, 0);
+    }
+
+    if (recalled_out != NULL) {
+        *recalled_out = col.count;
+    }
+    return 0;
+}
+
 int layout_recall_for_file(struct layout_recall *lr, uint64_t fileid)
 {
     struct recall_entry *entries = NULL;

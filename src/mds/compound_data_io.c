@@ -787,25 +787,91 @@ open_existing:
 	 * all reclaims via RECLAIM_COMPLETE — not per individual OPEN.
 	 */
 
-	/* Best-effort delegation grant (RFC 8881 §10.4).
-	 * Grant READ delegation when no other client holds a delegation
-	 * on this file.  WRITE delegation only on exclusive access. */
+	/*
+	 * Delegation conflict-recall + conditional grant
+	 * (RFC 8881 §10.4).
+	 *
+	 * Step 1 — recall any other-client delegations that
+	 * conflict with this OPEN.  deleg_recall_file() snapshots
+	 * each holder's backchannel under the session-table lock,
+	 * sends CB_RECALL on a dup'd fd, then revokes the entry
+	 * regardless of CB outcome.  Best-effort: caller proceeds
+	 * even if some clients are unreachable.
+	 *
+	 * Step 2 — conditionally grant a delegation back to the
+	 * requesting client.  We only grant when:
+	 *   (a) the deleg_table is wired (cd->dt != NULL),
+	 *   (b) the catalogue → backchannel snapshot path is
+	 *       available (cd->st != NULL) so a future recall
+	 *       can deliver CB_RECALL,
+	 *   (c) deleg_check_conflict reports no remaining
+	 *       holder (Step 1 may not have cleared everything
+	 *       on a no-backchannel client),
+	 *   (d) the OPEN is single-purpose (READ-only → READ
+	 *       deleg; WRITE-only with no co-openers → WRITE
+	 *       deleg; mixed → NONE).
+	 *
+	 * Without (b) we degrade to OPEN_DELEGATE_NONE: an
+	 * unrecallable delegation is a deadlock waiting to
+	 * happen.  The encoder (xdr_ops_core.c::encode_res_open)
+	 * emits the full open_delegation4 body when
+	 * r->delegation_type != OPEN_DELEGATE_NONE.
+	 */
 	r->delegation_type = OPEN_DELEGATE_NONE;
+
 	if (cd->dt != NULL) {
-		bool conflict = false;
+		/* Step 1: recall conflicting delegations from OTHER
+		 * clients.  Returns recall-count; we ignore it because
+		 * the only thing the caller cares about is that no
+		 * conflicting other-client grant remains in memory
+		 * after this returns. */
+		(void)deleg_recall_file(cd->dt, target_fid,
+					 cd->clientid, 0);
 
-		if (deleg_check_conflict(cd->dt, target_fid,
-					 cd->clientid, &conflict) == 0 &&
-		    !conflict) {
-			uint32_t dtype = OPEN_DELEGATE_READ;
+		/* Step 2: try to grant.  Skip if no session table is
+		 * wired (no recall path available for the new grant)
+		 * or if a residual conflict somehow survives the
+		 * recall pass. */
+		if (cd->st != NULL) {
+			bool has_conflict = false;
+			uint32_t deleg_type = OPEN_DELEGATE_NONE;
 
-			if ((a->share_access & OPEN4_SHARE_ACCESS_WRITE) &&
-			    a->share_deny == OPEN4_SHARE_DENY_BOTH) {
-				dtype = OPEN_DELEGATE_WRITE;
-			}
-			if (deleg_grant(cd->dt, cd->clientid, target_fid,
-					dtype, NULL, &r->deleg_stateid) == 0) {
-				r->delegation_type = dtype;
+			if (deleg_check_conflict(cd->dt, target_fid,
+						 cd->clientid,
+						 &has_conflict) == 0 &&
+			    !has_conflict) {
+				uint32_t want_read = a->share_access &
+					OPEN4_SHARE_ACCESS_READ;
+				uint32_t want_write = a->share_access &
+					OPEN4_SHARE_ACCESS_WRITE;
+
+				if (want_write && !want_read) {
+					deleg_type = OPEN_DELEGATE_WRITE;
+				} else if (want_read && !want_write) {
+					deleg_type = OPEN_DELEGATE_READ;
+				} else if (want_read && want_write) {
+					/* Mixed RW OPEN: only grant a WRITE
+					 * delegation when no other opener
+					 * exists on this file (open_state
+					 * tracks share-mode conflicts; a WRITE
+					 * deleg gives the client exclusive
+					 * caching authority). */
+					deleg_type = OPEN_DELEGATE_WRITE;
+				}
+
+				if (deleg_type != OPEN_DELEGATE_NONE) {
+					struct nfs4_stateid sid;
+
+					if (deleg_grant(cd->dt, cd->clientid,
+							target_fid, deleg_type,
+							NULL /* session looked
+							       up at recall time
+							       via cd->dt->st */,
+							&sid) == 0) {
+						r->delegation_type = deleg_type;
+						r->deleg_stateid = sid;
+					}
+				}
 			}
 		}
 	}

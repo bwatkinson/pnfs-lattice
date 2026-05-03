@@ -939,8 +939,86 @@ out:
 }
 
 /* -----------------------------------------------------------------------
- * fd-based CB_LAYOUTRECALL (no session/rpc_conn dependency)
+ * fd-based senders (no session/rpc_conn dependency)
+ *
+ * These are used by the recall coordinators (delegation conflict-recall
+ * on op_open/op_setattr/op_remove/op_rename/op_write, and layout
+ * conflict-recall on op_layoutget).  The pattern is:
+ *   1. Under the session table lock, snapshot the holder's cb
+ *      metadata (session_id, cb_prog, slot_seq_id, num_cb_slots) and
+ *      dup() the cb_conn fd.
+ *   2. Release the lock.
+ *   3. Send the CB on the dup'd fd; close the fd after the reply.
+ * This avoids dereferencing a borrowed session pointer that may be
+ * freed by DESTROY_SESSION or lease expiry while a recall is in flight.
  * ----------------------------------------------------------------------- */
+
+int nfs4_cb_recall_fd(int fd,
+                      const uint8_t session_id[SESSION_ID_SIZE],
+                      uint32_t cb_prog,
+                      uint32_t slot_seq_id,
+                      uint32_t num_cb_slots,
+                      const struct nfs4_cb_recall_args *args,
+                      uint32_t timeout_ms)
+{
+    char msg_buf[CB_MAX_MSG_SIZE];
+    XDR xdrs;
+    uint32_t xid;
+    uint8_t *reply = NULL;
+    uint32_t reply_len = 0;
+    int rc;
+
+    if (fd < 0 || args == NULL || session_id == NULL) {
+        return -EINVAL;
+    }
+
+    if (timeout_ms == 0) {
+        timeout_ms = cb_default_timeout();
+    }
+
+    xid = atomic_fetch_add(&cb_xid_counter, 1);
+
+    xdrmem_create(&xdrs, msg_buf, sizeof(msg_buf), XDR_ENCODE);
+
+    if (!encode_rpc_call_header(&xdrs, xid, cb_prog, 1)) {
+        xdr_destroy(&xdrs);
+        return -EIO;
+    }
+    if (!encode_cb_compound_header(&xdrs, 2)) { /* CB_SEQUENCE + CB_RECALL */
+        xdr_destroy(&xdrs);
+        return -EIO;
+    }
+
+    uint32_t highest_slot = (num_cb_slots > 0) ? num_cb_slots - 1 : 0;
+
+    if (!encode_cb_sequence(&xdrs, session_id, 0,
+                            slot_seq_id, highest_slot)) {
+        xdr_destroy(&xdrs);
+        return -EIO;
+    }
+    if (!encode_cb_recall(&xdrs, args)) {
+        xdr_destroy(&xdrs);
+        return -EIO;
+    }
+
+    uint32_t msg_len = xdr_getpos(&xdrs);
+
+    xdr_destroy(&xdrs);
+
+    rc = send_record(fd, (uint8_t *)msg_buf, msg_len);
+    if (rc != 0) {
+        return -EIO;
+    }
+
+    rc = recv_record(fd, timeout_ms, &reply, &reply_len);
+    if (rc != 0) {
+        return rc;
+    }
+
+    rc = decode_cb_compound_reply(reply, reply_len);
+    free(reply);
+    return rc;
+}
 
 int nfs4_cb_layoutrecall_fd(int fd,
                             const uint8_t session_id[SESSION_ID_SIZE],

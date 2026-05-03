@@ -728,11 +728,17 @@ int open_state_close(struct open_state_table *ot,
     }
 
     /*
-     * Validate seqid (RFC 8881 §8.2.1):
-     * - seqid < current → NFS4ERR_OLD_STATEID (rc = -4)
-     * - seqid > current → NFS4ERR_BAD_STATEID (rc = -1)
+     * Validate seqid (RFC 5661 §8.2.1, RFC 8881 §8.2.2):
+     * - seqid == 0   → "current" / "don't care"; server uses its
+     *                  own stored seqid and skips the comparison.
+     *                  Standard pynfs convention; some Linux
+     *                  client paths (LOCKU, OPEN_DOWNGRADE) also
+     *                  emit zero-seqid stateids per RFC.
+     * - seqid <  current → NFS4ERR_OLD_STATEID (rc = -4)
+     * - seqid >  current → NFS4ERR_BAD_STATEID (rc = -1)
      */
-    if (stateid->seqid != os->stateid.seqid) {
+    if (stateid->seqid != 0 &&
+        stateid->seqid != os->stateid.seqid) {
         if (stateid->seqid < os->stateid.seqid) {
             rc = -4;  /* NFS4ERR_OLD_STATEID */
         } else {
@@ -885,7 +891,14 @@ int open_state_downgrade(struct open_state_table *ot,
         pthread_mutex_unlock(&ot->locks[file_lock_idx]);
         return -2;
     }
-    if (os->stateid.seqid != stateid->seqid) {
+    /*
+     * Zero-seqid: per RFC 5661 §8.2.2 the server MUST treat a
+     * zero seqid as "current" — use its own stored seqid and
+     * skip the strict equality check.  See open_state_close()
+     * for the matching CLOSE-path comment.
+     */
+    if (stateid->seqid != 0 &&
+        os->stateid.seqid != stateid->seqid) {
         int seq_rc = (stateid->seqid < os->stateid.seqid) ? -4 : -3;
 
         pthread_rwlock_unlock(&ot->stateid_locks[stateid_lock_idx]);

@@ -130,6 +130,7 @@ struct rpc_server {
     struct layout_commit_aggregator *lcommit_agg;
     struct deleg_table              *dt;
     struct dir_deleg_table          *ddt;
+    struct layout_recall            *lr;
     struct copy_offload_table       *cot;
     const struct rename_2pc_transport *transport;
 
@@ -1039,6 +1040,7 @@ wrongsec:
         cd.lcommit_agg = srv->lcommit_agg;
         cd.dt = srv->dt;
         cd.ddt = srv->ddt;
+        cd.lr = srv->lr;
         cd.cot = srv->cot;
         cd.transport = srv->transport;
         cd.mds_id = srv->mds_id;
@@ -1575,6 +1577,7 @@ int rpc_server_create(const struct rpc_server_config *cfg,
     srv->lcommit_agg = cfg->lcommit_agg;
     srv->dt = cfg->dt;
     srv->ddt = cfg->ddt;
+    srv->lr = cfg->lr;
     srv->cot = cfg->cot;
     srv->transport = cfg->transport;
     srv->gpudirect_required = cfg->gpudirect_required;

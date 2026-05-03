@@ -12,6 +12,7 @@
 
 #include "xdr_codec.h"
 #include "xdr_internal.h"
+#include "delegation.h"  /* OPEN_DELEGATE_NONE/READ/WRITE */
 
 /* From xdr_codec.c — needed for READDIR inline attr encoding. */
 extern uint32_t mds_type_to_nfs4(enum mds_file_type t);
@@ -1156,7 +1157,6 @@ bool encode_res_open(XDR *xdrs, const struct nfs4_result *r)
      */
     uint32_t rflags = OPEN4_RESULT_LOCKTYPE_POSIX;
     const uint32_t empty_bm[NFS4_BITMAP_WORDS] = {0, 0};
-    uint32_t deleg_type = 0; /* OPEN_DELEGATE_NONE */
 
     /* stateid4 */
     if (!xdr_nfs4_stateid_encode(xdrs, &o->stateid)) {
@@ -1176,8 +1176,102 @@ bool encode_res_open(XDR *xdrs, const struct nfs4_result *r)
     if (!xdr_nfs4_bitmap_encode(xdrs, empty_bm, NFS4_BITMAP_WORDS)) {
         return false;
 }
-    /* delegation: OPEN_DELEGATE_NONE */
-    return xdr_uint32_t(xdrs, &deleg_type);
+
+    /*
+     * open_delegation4 (RFC 8881 §18.16.4) is a discriminated union
+     * keyed on open_delegation_type4:
+     *   case OPEN_DELEGATE_NONE  (0): void
+     *   case OPEN_DELEGATE_READ  (1): open_read_delegation4
+     *   case OPEN_DELEGATE_WRITE (2): open_write_delegation4
+     *
+     * Pre-fix the encoder hard-coded NONE on every reply, so
+     * pynfs DELEG1 (testReadDeleg) saw "Could not get delegation"
+     * even when op_open had successfully called deleg_grant().
+     * Now we honour o->delegation_type and emit the matching body.
+     *
+     * The body is the same prefix for both READ and WRITE, plus a
+     * WRITE-only nfs_space_limit4 inserted between recall and
+     * permissions.  We support both.
+     */
+    {
+        uint32_t deleg_type = o->delegation_type;
+
+        if (deleg_type != OPEN_DELEGATE_READ &&
+            deleg_type != OPEN_DELEGATE_WRITE) {
+            deleg_type = OPEN_DELEGATE_NONE;
+        }
+        if (!xdr_uint32_t(xdrs, &deleg_type)) {
+            return false;
+        }
+        if (deleg_type == OPEN_DELEGATE_NONE) {
+            return true;
+        }
+
+        /* Common to both READ and WRITE bodies: stateid + recall
+         * (RFC 8881 §18.16.4).  recall=false on grant; the server
+         * sets it true only inside CB_RECALL bodies. */
+        if (!xdr_nfs4_stateid_encode(xdrs, &o->deleg_stateid)) {
+            return false;
+        }
+        {
+            int32_t recall = 0;
+            if (!xdr_putbool(xdrs, recall)) {
+                return false;
+            }
+        }
+
+        if (deleg_type == OPEN_DELEGATE_WRITE) {
+            /*
+             * nfs_space_limit4: union switch (limitby4 limitby).
+             * NFS_LIMIT_SIZE = 1 (uint64 filesize); we advertise
+             * an effectively unlimited cap.  RFC 8881 §18.16.4. */
+            uint32_t limitby = 1; /* NFS_LIMIT_SIZE */
+            uint64_t filesize = (uint64_t)INT64_MAX;
+
+            if (!xdr_uint32_t(xdrs, &limitby)) {
+                return false;
+            }
+            if (!xdr_uint64_t(xdrs, &filesize)) {
+                return false;
+            }
+        }
+
+        /*
+         * nfsace4 permissions:
+         *   acetype4   = ACE4_ACCESS_ALLOWED_ACE_TYPE (0)
+         *   aceflag4   = 0
+         *   acemask4   = ACE4_READ_DATA (0x1) for READ deleg,
+         *                ACE4_WRITE_DATA|ACE4_READ_DATA (0x3) for WRITE
+         *   utf8str_mixed who = "EVERYONE@" (RFC 7530 §6.2.1.5)
+         *
+         * The Linux client only consults this for cache-policy
+         * hints; "EVERYONE@" is the broadest valid grant. */
+        {
+            uint32_t acetype = 0;
+            uint32_t aceflag = 0;
+            uint32_t acemask = (deleg_type == OPEN_DELEGATE_WRITE)
+                                 ? 0x3u : 0x1u;
+            const char *who = "EVERYONE@";
+            uint32_t who_len = (uint32_t)strlen(who);
+
+            if (!xdr_uint32_t(xdrs, &acetype)) {
+                return false;
+            }
+            if (!xdr_uint32_t(xdrs, &aceflag)) {
+                return false;
+            }
+            if (!xdr_uint32_t(xdrs, &acemask)) {
+                return false;
+            }
+            if (!xdr_uint32_t(xdrs, &who_len)) {
+                return false;
+            }
+            if (!xdr_opaque_encode(xdrs, who, who_len)) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 

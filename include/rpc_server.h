@@ -41,6 +41,7 @@ struct layout_cache;
 struct layout_commit_aggregator;
 struct deleg_table;
 struct dir_deleg_table;
+struct layout_recall;
 
 /* -----------------------------------------------------------------------
  * Configuration
@@ -146,6 +147,14 @@ struct rpc_server_config {
     struct layout_commit_aggregator *lcommit_agg;
     struct deleg_table *dt;
     struct dir_deleg_table *ddt; /**< Dir delegation table (NULL when feature off). */
+    /*
+     * Layout recall coordinator (RFC 8881 §12.5.5 / DS-failure /
+     * admin recall / Mark's byte-range partial recall on op_layoutget).
+     * NULL means "no conflict-recall"; the LAYOUTGET path skips the
+     * holder scan and grants without consulting other clients,
+     * matching pre-byte-range-fix behaviour.
+     */
+    struct layout_recall *lr;
 };
 
 /* -----------------------------------------------------------------------

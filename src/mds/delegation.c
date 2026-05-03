@@ -17,6 +17,7 @@
  */
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -28,8 +29,78 @@
 #include "delegation.h"
 #include "nfs4_cb.h"
 #include "session.h"
+#include "rpc_server.h" /* rpc_conn_get_fd */
 #include "mds_catalogue.h"
 #include "mds_coordination.h"
+
+/*
+ * Maximum number of delegations on a single fileid we recall in one
+ * deleg_recall_file() call.  Bounds stack usage of the snapshot array
+ * (~56 B per slot * 64 = 3.5 KiB).  Production workloads see at most
+ * one or two READ delegations per fileid; the cap is defensive.
+ */
+#define DELEG_RECALL_MAX_PER_FILE 64
+
+/*
+ * Per-recall snapshot copied out of the bucket while the stripe lock
+ * is held.  After the lock is dropped we use only this snapshot to
+ * issue CB_RECALL — there is no chance of dereferencing a stale
+ * session pointer because we never read e->session outside the lock.
+ */
+struct deleg_recall_target {
+    struct nfs4_stateid stateid;
+    uint64_t            clientid;
+    uint64_t            fileid;
+};
+
+/*
+ * Context passed to session_for_each_with_cb() to find the
+ * backchannel snapshot for one specific clientid.  The first match
+ * wins (most clients have a single session); we copy out the cb
+ * metadata + dup the cb_conn fd while still under the session-table
+ * lock, then release the lock and perform the I/O.
+ */
+struct deleg_cb_lookup_ctx {
+    uint64_t want_clientid;
+    bool     found;
+    uint8_t  session_id[SESSION_ID_SIZE];
+    uint32_t cb_prog;
+    uint32_t slot_seq_id;
+    uint32_t num_cb_slots;
+    int      fd;          /* dup'd; caller closes */
+};
+
+static int deleg_cb_lookup_cb(const struct session_cb_snap *snap, void *ctx)
+{
+    struct deleg_cb_lookup_ctx *c = ctx;
+    int fd;
+    int dup_fd;
+
+    if (snap == NULL || c == NULL) {
+        return 0;
+    }
+    if (c->found) {
+        return 1; /* stop — already snapshotted */
+    }
+    if (snap->clientid != c->want_clientid) {
+        return 0;
+    }
+    fd = rpc_conn_get_fd(snap->cb_conn);
+    if (fd < 0) {
+        return 0; /* this session has no usable cb fd; keep looking */
+    }
+    dup_fd = dup(fd);
+    if (dup_fd < 0) {
+        return 0; /* resource pressure; keep looking */
+    }
+    c->found = true;
+    memcpy(c->session_id, snap->session_id, SESSION_ID_SIZE);
+    c->cb_prog      = snap->cb_prog;
+    c->slot_seq_id  = snap->slot_seq_id;
+    c->num_cb_slots = 1; /* matches layout_recall.c usage */
+    c->fd           = dup_fd;
+    return 1;
+}
 
 /* -----------------------------------------------------------------------
  * Constants
@@ -83,6 +154,14 @@ struct deleg_table {
     uint32_t              mds_id;
     _Atomic uint64_t      sid_counter; /* Stateid sequence */
     struct mds_catalogue *cat;         /* RonDB (shared-attr). */
+    /*
+     * Borrowed session-table reference used to snapshot the holder's
+     * backchannel metadata (session_id, cb_prog, slot_seq_id, fd) when
+     * deleg_recall_file() needs to send CB_RECALL.  Set once at daemon
+     * startup; outlives every grant in the table.  NULL means "no CB";
+     * recalls degrade to silent revoke (legacy behaviour).
+     */
+    struct session_table *st;
     uint64_t              boot_epoch;
     /* When true, deleg_grant keeps grants in memory only.
      * Mirrors `skip_transient_ndb` used by layout / open-state paths. */
@@ -206,6 +285,14 @@ void deleg_table_set_cat(struct deleg_table *dt,
     if (dt != NULL) {
         dt->cat = cat;
         dt->boot_epoch = boot_epoch;
+    }
+}
+
+void deleg_table_set_session_table(struct deleg_table *dt,
+                                   struct session_table *st)
+{
+    if (dt != NULL) {
+        dt->st = st;
     }
 }
 
@@ -362,10 +449,12 @@ int deleg_recall_file(struct deleg_table *dt,
                       uint64_t fileid, uint64_t clientid,
                       uint32_t timeout_ms)
 {
+    struct deleg_recall_target targets[DELEG_RECALL_MAX_PER_FILE];
+    uint32_t target_count = 0;
     uint32_t bucket;
     struct deleg_entry *e;
     struct deleg_entry **pp;
-    int recalled = 0;
+    int recalled;
 
     if (dt == NULL) {
         return -1;
@@ -374,6 +463,17 @@ int deleg_recall_file(struct deleg_table *dt,
         timeout_ms = DELEG_RECALL_DEFAULT_MS;
     }
 
+    /*
+     * Phase 1 — under the stripe lock: snapshot every conflicting
+     * grant out of the bucket and unlink it.  We MUST NOT call into
+     * the session table or send any CB while holding the stripe lock
+     * (the session table has its own lock; nesting them creates a
+     * lock-order trap with concurrent EXCHANGE_ID / DESTROY_SESSION
+     * paths that already grab the session lock first).  By copying
+     * the in-memory record into a stack array we can drop the stripe
+     * lock immediately and do all CB I/O against detached snapshots
+     * with no chance of dereferencing a stale session pointer.
+     */
     lock_stripe(dt, fileid);
 
     bucket = deleg_hash(fileid);
@@ -386,73 +486,98 @@ int deleg_recall_file(struct deleg_table *dt,
             continue;
         }
 
-        /* Best-effort CB_RECALL on the backchannel.  Protocol-level:
-         * client should DELEGRETURN within lease_time_sec; we send
-         * the recall now, record the wire result, and still revoke
-         * from our in-memory table.  If the client does DELEGRETURN,
-         * op_delegreturn() separately lands and is a no-op on an
-         * already-revoked entry (BAD_STATEID is expected and fine).
-         *
-         * Intentional: we don't block on the client's response — the
-         * cb_recall helper already handles its own timeout, and any
-         * error (ENOTCONN / ETIMEDOUT / EIO / NFS4 status) means the
-         * client is unreachable and immediate revocation is the
-         * correct answer.
-         *
-         * Dedupe: if a recall is already in flight within the
-         * DELEG_RECALL_PENDING_NS window (set by a previous
-         * concurrent caller), skip sending another CB_RECALL to
-         * the same client for the same stateid.  Revoke locally
-         * either way — the authoritative contract with the caller
-         * is "this delegation is gone after this returns". */
-        if (e->session != NULL) {
-            struct timespec nowts;
-            uint64_t now_ns;
-            bool suppress_send = false;
-
-            clock_gettime(CLOCK_MONOTONIC, &nowts);
-            now_ns = (uint64_t)nowts.tv_sec * 1000000000ULL +
-                     (uint64_t)nowts.tv_nsec;
-
-            if (e->recall_pending &&
-                (now_ns - e->recall_sent_ns) < DELEG_RECALL_PENDING_NS) {
-                suppress_send = true;
-            }
-
-            if (!suppress_send) {
-                struct nfs4_cb_recall_args ra;
-                int cbrc;
-
-                memset(&ra, 0, sizeof(ra));
-                ra.stateid = e->stateid;
-                ra.truncate = false;
-                ra.fileid   = e->fileid;
-                e->recall_pending = true;
-                e->recall_sent_ns = now_ns;
-                cbrc = nfs4_cb_recall(e->session, &ra, timeout_ms);
-                if (cbrc != 0) {
-                    (void)fprintf(stderr,
-                        "deleg: CB_RECALL fileid=%llu client=%llu "
-                        "rc=%d \u2014 revoking\n",
-                        (unsigned long long)e->fileid,
-                        (unsigned long long)e->clientid, cbrc);
-                }
-            }
+        if (target_count < DELEG_RECALL_MAX_PER_FILE) {
+            targets[target_count].stateid  = e->stateid;
+            targets[target_count].clientid = e->clientid;
+            targets[target_count].fileid   = e->fileid;
+            target_count++;
+        } else {
+            /*
+             * Cap exceeded: leave the surplus entry in place and
+             * stop scanning.  The next deleg_recall_file caller (or
+             * the periodic lease reaper) will pick it up.  This
+             * cannot happen with the current per-file delegation
+             * model (max one WRITE or N READ where N <= clients),
+             * but the bound is here to keep stack usage finite if
+             * the model ever loosens.
+             */
+            (void)fprintf(stderr,
+                "deleg: recall cap %u reached on fileid=%llu; "
+                "deferring surplus entries\n",
+                (unsigned)DELEG_RECALL_MAX_PER_FILE,
+                (unsigned long long)fileid);
+            break;
         }
 
-        /* Revoke: remove from in-memory table.  If catalogue-backed
-         * delegation persistence is active (cat != NULL &&
-         * !skip_transient_ndb) we also drop the authoritative row
-         * so other MDSes stop observing the grant. */
+        /* Drop authoritative RonDB row before unlinking so a
+         * cross-MDS observer sees consistent state. */
         if (dt->cat != NULL && !dt->skip_transient_ndb) {
             (void)mds_coord_deleg_del(dt->cat, e->stateid.other);
         }
         *pp = e->hash_next;
         free(e);
-        recalled++;
     }
 
     unlock_stripe(dt, fileid);
+
+    /*
+     * Phase 2 — outside the stripe lock: for each detached snapshot,
+     * find the holder's backchannel via the session table, dup() the
+     * cb_conn fd under the session-table lock, then send CB_RECALL on
+     * the dup'd fd.  Per RFC 8881 §10.4, the recall is best-effort:
+     * the authoritative contract with the caller is "this delegation
+     * is gone", which is already true after Phase 1.  Any send error
+     * (ENOTCONN / ETIMEDOUT / EIO / NFS4 status) is logged and
+     * swallowed.  No retry: the caller proceeds with the conflicting
+     * mutation.
+     */
+    recalled = (int)target_count;
+    if (dt->st == NULL) {
+        /*
+         * No session table wired — caller intentionally configured
+         * "revoke without CB" mode (the legacy path used by tests
+         * and by deployments that have no backchannel).  All grants
+         * are already gone from memory + RonDB; nothing more to do.
+         */
+        return recalled;
+    }
+
+    for (uint32_t i = 0; i < target_count; i++) {
+        struct deleg_cb_lookup_ctx lc;
+        struct nfs4_cb_recall_args ra;
+        int cbrc;
+
+        memset(&lc, 0, sizeof(lc));
+        lc.want_clientid = targets[i].clientid;
+        lc.fd = -1;
+
+        (void)session_for_each_with_cb(dt->st, deleg_cb_lookup_cb, &lc);
+        if (!lc.found) {
+            /* Holder has no bound backchannel — silent revoke is
+             * the only correct outcome.  The client will discover
+             * its delegation is gone on its next OPEN/READ/WRITE
+             * via NFS4ERR_BAD_STATEID. */
+            continue;
+        }
+
+        memset(&ra, 0, sizeof(ra));
+        ra.stateid  = targets[i].stateid;
+        ra.truncate = false;
+        ra.fileid   = targets[i].fileid;
+
+        cbrc = nfs4_cb_recall_fd(lc.fd, lc.session_id, lc.cb_prog,
+                                 lc.slot_seq_id, lc.num_cb_slots,
+                                 &ra, timeout_ms);
+        if (cbrc != 0) {
+            (void)fprintf(stderr,
+                "deleg: CB_RECALL fileid=%llu client=%llu "
+                "rc=%d \u2014 already revoked\n",
+                (unsigned long long)targets[i].fileid,
+                (unsigned long long)targets[i].clientid, cbrc);
+        }
+        (void)close(lc.fd);
+    }
+
     return recalled;
 }
 

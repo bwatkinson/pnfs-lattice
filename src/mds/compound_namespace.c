@@ -329,6 +329,26 @@ enum nfs4_status op_lookup(struct compound_data *cd,
 		return nst;
 }
 
+	/*
+	 * RFC 5661 §16.4.5 / RFC 8881 §18.16.5: "If the component is
+	 * a zero length string [...] the error NFS4ERR_INVAL will be
+	 * returned."  Without this guard, falling through to the
+	 * catalogue layer for an empty name returns NFS4ERR_NOENT
+	 * (the dirent lookup misses), which violates the RFC and is
+	 * what pynfs SEQ9c (testReplayCache003) was catching: the
+	 * test sends LOOKUP(b"") expecting INVAL, then re-sends with
+	 * the same SEQUENCE seqid to verify the replay cache returns
+	 * the SAME error.  The replay cache itself was correct; the
+	 * first response was simply mis-coded.  Decoder always
+	 * NUL-terminates op->arg.lookup.name (struct nfs4_arg_lookup
+	 * uses a fixed char[MDS_MAX_NAME + 1] populated via
+	 * xdr_string_decode), so name[0] == '\0' iff the wire
+	 * component4 length was zero.
+	 */
+	if (op->arg.lookup.name[0] == '\0') {
+		return NFS4ERR_INVAL;
+	}
+
 	/* Xattr namespace: LOOKUP verifies the xattr exists. */
 	if (is_xattr_fh(cd->current_fh.fileid)) {
 		uint64_t base = xattr_base_fileid(cd->current_fh.fileid);
@@ -1417,6 +1437,27 @@ enum nfs4_status op_rename(struct compound_data *cd,
 	if (nst != NFS4_OK) {
 		return nst;
 }
+
+	/*
+	 * RFC 8881 §18.26.4: "If oldname or newname has zero length,
+	 * NFS4ERR_INVAL will be returned."  Without this guard the
+	 * empty source name falls through to cat_rename which returns
+	 * NFS4ERR_NOENT (the source dirent doesn't exist), violating
+	 * the RFC and breaking pynfs SEQ9d (testReplayCache004).
+	 * Both names are decoded into NUL-terminated fixed buffers
+	 * (struct nfs4_arg_rename.{src,dst}_name[MDS_MAX_NAME + 1])
+	 * so name[0] == '\0' iff the wire component4 was zero-length.
+	 * The check is intentionally placed BEFORE the freeze /
+	 * health checks: a malformed argument is a client bug that
+	 * deserves an immediate INVAL regardless of subtree state,
+	 * and ordering INVAL ahead of DELAY matches the precedence
+	 * implied by RFC 8881 §2.6.3.1.
+	 */
+	if (op->arg.rename.src_name[0] == '\0' ||
+	    op->arg.rename.dst_name[0] == '\0') {
+		return NFS4ERR_INVAL;
+	}
+
 	/* Check BOTH target and source directories for freeze. */
 	nst = check_subtree_frozen(cd);
 	if (nst != NFS4_OK) {
@@ -1846,6 +1887,23 @@ static int readdir_plus_cat_cb(const struct mds_cat_dirent *entry,
 
 	if (entry == NULL) { return 0; }
 
+	/*
+	 * RFC 5661 §3.2: a component4 name is a utf8str_cs and the
+	 * specification implicitly requires non-zero length for any
+	 * directory entry (zero-length names are explicitly rejected
+	 * by LOOKUP / RENAME / CREATE / REMOVE per §16.4.5 /
+	 * §18.26.4).  Pre-existing zero-length dirents in the
+	 * catalogue — e.g. created by an older codepath that did not
+	 * validate the name, or by a backend repair that left a
+	 * sentinel row — must therefore be hidden from the wire so
+	 * conformant clients (pynfs's clean_dir, Linux's getdents)
+	 * don't choke trying to LOOKUP("").  This is a defensive
+	 * filter only; CREATE/OPEN at the handler level should be
+	 * extended to reject empty names so no new such entries are
+	 * ever written.
+	 */
+	if (entry->name[0] == '\0') { return 0; }
+
 	if (!f->past_cookie) {
 		if (f->cookie_fileid == 0) {
 			f->past_cookie = true;
@@ -1907,6 +1965,14 @@ static int xattr_readdir_cb(const char *name, size_t name_len, void *arg)
 	if (ctx->rd->count >= NFS4_READDIR_MAX) {
 		return -1;
 }
+
+	/* Same RFC 5661 §3.2 component4 rule applies to xattr names
+	 * (RFC 8276 §4 — xattr names are component4): zero-length
+	 * entries cannot exist on the wire, so skip any such row that
+	 * may have leaked into the catalogue. */
+	if (name == NULL || name_len == 0) {
+		return 0;
+	}
 
 	e = &ctx->rd->entries[ctx->rd->count];
 	memset(e, 0, sizeof(*e));

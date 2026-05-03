@@ -726,6 +726,17 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 	int prep_state;
 	bool clear_ds_pending_on_success = false;
 	uint32_t i;
+	struct nfs4_stateid client_sid;
+
+	/* RFC 8881 §16.2.4 — resolve CURRENT_STATEID4 marker.  Pynfs
+	 * CSID7 testOpenLayoutGet bundles LAYOUTGET right after OPEN with
+	 * the marker as the layout stateid argument.  Resolve once here
+	 * so all six call sites of layout_pick_stateid below see the same
+	 * resolved input. */
+	nst = compound_resolve_stateid(cd, &a->stateid, &client_sid);
+	if (nst != NFS4_OK) {
+		return nst;
+	}
 
 	/*
 	 * Phase 6 — wide long-lived layout grant.
@@ -921,7 +932,7 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 			if (pregrant_consumed) {
 				layout_sid = pregrant_sid;
 			} else {
-				layout_pick_stateid(cd, &a->stateid,
+				layout_pick_stateid(cd, &client_sid,
 						    &layout_sid);
 				if (!cd->skip_transient_ndb &&
 				    cd->cat != NULL) {
@@ -994,7 +1005,7 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 					fast_sid = pregrant_sid;
 				} else {
 					/* Write layout_state (skip for single-MDS). */
-					layout_pick_stateid(cd, &a->stateid,
+					layout_pick_stateid(cd, &client_sid,
 							    &fast_sid);
 					if (!cd->skip_transient_ndb) {
 						(void)mds_coord_layout_grant(
@@ -1042,7 +1053,7 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 		    mds_catalogue_backend_type(cd->cat) == MDS_BACKEND_RONDB &&
 		    !cd->skip_transient_ndb) {
 			struct nfs4_stateid fused_sid;
-			layout_pick_stateid(cd, &a->stateid, &fused_sid);
+			layout_pick_stateid(cd, &client_sid, &fused_sid);
 
 		st = catalogue_rondb_layoutget_fused(
 			cd->cat, cd->current_fh.fileid,
@@ -1262,7 +1273,7 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 			if (pregrant_consumed) {
 				layout_sid = pregrant_sid;
 			} else {
-				layout_pick_stateid(cd, &a->stateid,
+				layout_pick_stateid(cd, &client_sid,
 						    &layout_sid);
 				if (!cd->skip_transient_ndb) {
 					nst = layout_make_ds_list(
@@ -1390,7 +1401,7 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 				free(entries);
 				return NFS4ERR_IO;
 			}
-			layout_pick_stateid(cd, &a->stateid, &layout_sid);
+			layout_pick_stateid(cd, &client_sid, &layout_sid);
 			if (!cd->skip_transient_ndb) {
 				nst = layout_make_ds_list(
 					entries, ds_total, &ds_ids);
@@ -1904,8 +1915,16 @@ enum nfs4_status op_layoutreturn(struct compound_data *cd,
 	if (a->return_type == LAYOUTRETURN4_FILE) {
 		enum nfs4_status nst;
 		uint32_t cur_seqid = 0;
+		struct nfs4_stateid sid_resolved;
 
 		nst = require_current_fh(cd);
+		if (nst != NFS4_OK) {
+			return nst;
+		}
+
+		/* RFC 8881 §16.2.4 — resolve CURRENT_STATEID4 marker. */
+		nst = compound_resolve_stateid(cd, &a->stateid,
+					       &sid_resolved);
 		if (nst != NFS4_OK) {
 			return nst;
 		}
@@ -1922,11 +1941,11 @@ enum nfs4_status op_layoutreturn(struct compound_data *cd,
 		 * issued by this daemon, so RFC 8881 §18.44.3's
 		 * "SHOULD accept" applies.  Pynfs FFLOOS
 		 * (testFlexLayoutOldSeqid). */
-		if (layout_seqid_peek(a->stateid.other, &cur_seqid)) {
-			if (a->stateid.seqid < cur_seqid) {
+		if (layout_seqid_peek(sid_resolved.other, &cur_seqid)) {
+			if (sid_resolved.seqid < cur_seqid) {
 				return NFS4ERR_OLD_STATEID;
 			}
-			if (a->stateid.seqid > cur_seqid) {
+			if (sid_resolved.seqid > cur_seqid) {
 				return NFS4ERR_BAD_STATEID;
 			}
 		}
@@ -1937,7 +1956,7 @@ enum nfs4_status op_layoutreturn(struct compound_data *cd,
 		if (cd->cat != NULL) {
 			(void)mds_coord_layout_return(
 				cd->cat, NULL,
-				a->stateid.other,
+				sid_resolved.other,
 				cd->clientid,
 				cd->current_fh.fileid,
 				NULL, 0);
@@ -1945,7 +1964,7 @@ enum nfs4_status op_layoutreturn(struct compound_data *cd,
 		/* Drop the in-memory seqid record so a subsequent
 		 * LAYOUTGET/RETURN on the same `other` is treated as
 		 * a brand-new layout, not a renewal. */
-		layout_seqid_remove(a->stateid.other);
+		layout_seqid_remove(sid_resolved.other);
 	}
 	r->stateid_present = true;
 	memset(&r->stateid, 0, sizeof(r->stateid));
@@ -1959,12 +1978,19 @@ enum nfs4_status op_layoutcommit(struct compound_data *cd,
 {
 	const struct nfs4_arg_layoutcommit *a = &op->arg.layoutcommit;
 	struct nfs4_res_layoutcommit *r = &res->res.layoutcommit;
+	struct nfs4_stateid sid_resolved;
 	enum nfs4_status nst;
 
 	nst = require_current_fh(cd);
 	if (nst != NFS4_OK) {
 		return nst;
 }
+
+	/* RFC 8881 §16.2.4 — resolve CURRENT_STATEID4 marker. */
+	nst = compound_resolve_stateid(cd, &a->stateid, &sid_resolved);
+	if (nst != NFS4_OK) {
+		return nst;
+	}
 
 	/* Validate the committed layout stateid (RFC 8881 §18.6).
 	 * Best-effort: if layout_grant persistence failed (RonDB mode),
@@ -1975,7 +2001,7 @@ enum nfs4_status op_layoutcommit(struct compound_data *cd,
 		enum mds_status lc_st;
 
 		lc_st = coord_layout_get_by_stateid(
-			cd, a->stateid.other,
+			cd, sid_resolved.other,
 			&lc_clientid, &lc_fileid,
 			NULL, NULL, NULL, NULL);
 		if (lc_st == MDS_OK) {

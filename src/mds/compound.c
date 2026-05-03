@@ -38,6 +38,143 @@
 void dir_deleg_count_conflict_unavail(struct dir_deleg_table *ddt);
 
 /* -----------------------------------------------------------------------
+ * RFC 8881 §16.2.4 — current-stateid helpers.
+ *
+ * The wire form of the special CURRENT_STATEID4 marker is
+ * seqid==1 with other==all-zeros (§16.2.3.1.2).  Operations that
+ * consume a stateid call compound_resolve_stateid() before validating
+ * it; producing operations call compound_set_current_stateid() in
+ * compound_process()'s post-dispatch state machine.  See
+ * compound_internal.h for the full contract.
+ * ----------------------------------------------------------------------- */
+
+bool compound_is_current_stateid(const struct nfs4_stateid *sid)
+{
+	static const uint8_t zero_other[NFS4_OTHER_SIZE] = {0};
+
+	if (sid == NULL) {
+		return false;
+	}
+	return sid->seqid == 1u &&
+	       memcmp(sid->other, zero_other, NFS4_OTHER_SIZE) == 0;
+}
+
+enum nfs4_status compound_resolve_stateid(
+	const struct compound_data *cd,
+	const struct nfs4_stateid *in,
+	struct nfs4_stateid *out)
+{
+	if (cd == NULL || in == NULL || out == NULL) {
+		return NFS4ERR_BAD_STATEID;
+	}
+	if (compound_is_current_stateid(in)) {
+		if (!cd->current_stateid_set) {
+			return NFS4ERR_BAD_STATEID;
+		}
+		*out = cd->current_stateid;
+		return NFS4_OK;
+	}
+	*out = *in;
+	return NFS4_OK;
+}
+
+void compound_set_current_stateid(struct compound_data *cd,
+				  const struct nfs4_stateid *sid)
+{
+	if (cd == NULL || sid == NULL) {
+		return;
+	}
+	cd->current_stateid = *sid;
+	cd->current_stateid_set = true;
+}
+
+void compound_invalidate_current_stateid(struct compound_data *cd)
+{
+	if (cd == NULL) {
+		return;
+	}
+	memset(&cd->current_stateid, 0, sizeof(cd->current_stateid));
+	cd->current_stateid_set = false;
+}
+
+void compound_save_current_stateid(struct compound_data *cd)
+{
+	if (cd == NULL) {
+		return;
+	}
+	cd->saved_stateid = cd->current_stateid;
+	cd->saved_stateid_set = cd->current_stateid_set;
+}
+
+void compound_restore_current_stateid(struct compound_data *cd)
+{
+	if (cd == NULL) {
+		return;
+	}
+	cd->current_stateid = cd->saved_stateid;
+	cd->current_stateid_set = cd->saved_stateid_set;
+}
+
+/*
+ * Post-dispatch state-machine for current_stateid.  Called from
+ * compound_process() after each op that returned NFS4_OK.
+ *
+ * Producers update current_stateid from the result slot.  Invalidators
+ * (FH-changing ops) clear it.  SAVEFH/RESTOREFH save/restore it
+ * alongside the current FH.  Ops that neither produce nor invalidate
+ * are no-ops here.
+ */
+static void compound_update_current_stateid_post(
+	struct compound_data *cd,
+	const struct nfs4_op *op,
+	const struct nfs4_result *res)
+{
+	if (cd == NULL || op == NULL || res == NULL) {
+		return;
+	}
+	switch (op->opnum) {
+	case OP_OPEN:
+		compound_set_current_stateid(cd, &res->res.open.stateid);
+		break;
+	case OP_OPEN_DOWNGRADE:
+	case OP_CLOSE:
+		/* op_close and op_open_downgrade share the close result
+		 * union slot for their output stateid. */
+		compound_set_current_stateid(cd, &res->res.close.stateid);
+		break;
+	case OP_LOCK:
+		compound_set_current_stateid(cd, &res->res.lock.stateid);
+		break;
+	case OP_LOCKU:
+		compound_set_current_stateid(cd, &res->res.locku.stateid);
+		break;
+	case OP_LAYOUTGET:
+		compound_set_current_stateid(cd, &res->res.layoutget.stateid);
+		break;
+	case OP_LAYOUTRETURN:
+		if (res->res.layoutreturn.stateid_present) {
+			compound_set_current_stateid(
+				cd, &res->res.layoutreturn.stateid);
+		}
+		break;
+	case OP_PUTFH:
+	case OP_PUTROOTFH:
+	case OP_LOOKUP:
+	case OP_LOOKUPP:
+		compound_invalidate_current_stateid(cd);
+		break;
+	case OP_SAVEFH:
+		compound_save_current_stateid(cd);
+		break;
+	case OP_RESTOREFH:
+		compound_restore_current_stateid(cd);
+		break;
+	default:
+		break;
+	}
+}
+
+/* -----------------------------------------------------------------------
  * RFC 8881 §1.7 / §14.4 — UTF-8 (utf8str_cs) well-formedness validator.
  *
  * RFC 8881 §1.7 mandates utf8str_cs is the "Net-Unicode" form defined by
@@ -1115,6 +1252,9 @@ static enum nfs4_status dispatch_op(struct compound_data *cd,
 	case OP_LOCK: {
 		const struct nfs4_arg_lock *a = &op->arg.lock;
 		struct lock_conflict conf;
+		struct nfs4_stateid open_sid_resolved;
+		struct nfs4_stateid lock_sid_resolved;
+		enum nfs4_status rsid_st;
 		int rc;
 		if (cd->lt == NULL) { return NFS4ERR_NOTSUPP; }
 		if (!cd->current_fh_set) { return NFS4ERR_NOFILEHANDLE; }
@@ -1127,13 +1267,23 @@ static enum nfs4_status dispatch_op(struct compound_data *cd,
 		if (!grace_is_active() && a->reclaim) {
 			return NFS4ERR_NO_GRACE;
 		}
+		/* RFC 8881 §16.2.4 — resolve CURRENT_STATEID4 magic in
+		 * either locker variant.  The new-lock-owner branch uses
+		 * open_stateid; the existing-lock-owner branch uses
+		 * lock_stateid.  Both can carry the marker. */
+		rsid_st = compound_resolve_stateid(cd, &a->open_stateid,
+						   &open_sid_resolved);
+		if (rsid_st != NFS4_OK) { return rsid_st; }
+		rsid_st = compound_resolve_stateid(cd, &a->lock_stateid,
+						   &lock_sid_resolved);
+		if (rsid_st != NFS4_OK) { return rsid_st; }
 		memset(&conf, 0, sizeof(conf));
-		res->res.lock.stateid = a->lock_stateid;
+		res->res.lock.stateid = lock_sid_resolved;
 		rc = lock_acquire(cd->lt, cd->current_fh.fileid,
 			a->lock_type, a->offset, a->length,
 			cd->clientid,
 			a->lock_owner, a->lock_owner_len,
-			&a->open_stateid,
+			&open_sid_resolved,
 			&res->res.lock.stateid, &conf);
 		if (rc == NFS4ERR_DENIED) {
 			res->res.lock.denied.offset = conf.offset;
@@ -1169,9 +1319,14 @@ static enum nfs4_status dispatch_op(struct compound_data *cd,
 	}
 	case OP_LOCKU: {
 		const struct nfs4_arg_locku *a = &op->arg.locku;
+		struct nfs4_stateid lock_sid_resolved;
+		enum nfs4_status rsid_st;
 		int rc;
 		if (cd->lt == NULL) { return NFS4ERR_NOTSUPP; }
-		res->res.locku.stateid = a->lock_stateid;
+		rsid_st = compound_resolve_stateid(cd, &a->lock_stateid,
+						   &lock_sid_resolved);
+		if (rsid_st != NFS4_OK) { return rsid_st; }
+		res->res.locku.stateid = lock_sid_resolved;
 		rc = lock_release(cd->lt, &res->res.locku.stateid,
 			a->lock_type, a->offset, a->length);
 		if (rc == NFS4ERR_BAD_STATEID) { return NFS4ERR_BAD_STATEID; }
@@ -1289,10 +1444,23 @@ static enum nfs4_status dispatch_op(struct compound_data *cd,
 	}
 	case OP_FREE_STATEID: {
 		/* RFC 8881 §18.38: free lock/layout stateid.
-		 * Open stateids must be freed via CLOSE, not FREE_STATEID. */
-		const struct nfs4_stateid *fs = &op->arg.free_stateid;
+		 * Open stateids must be freed via CLOSE, not FREE_STATEID;
+		 * an attempt to FREE_STATEID a still-open stateid returns
+		 * NFS4ERR_LOCKS_HELD (pynfs CSID9 testOpenFreestateidClose). */
+		struct nfs4_stateid fs_resolved;
+		enum nfs4_status rsid_st;
+		rsid_st = compound_resolve_stateid(
+			cd, &op->arg.free_stateid, &fs_resolved);
+		if (rsid_st != NFS4_OK) { return rsid_st; }
+		/* Reject FREE_STATEID against an active open stateid. */
+		if (cd->ot != NULL) {
+			struct nfs4_open_state os;
+			if (open_state_find(cd->ot, &fs_resolved, &os) == 0) {
+				return NFS4ERR_LOCKS_HELD;
+			}
+		}
 		if (cd->lt != NULL) {
-			struct nfs4_stateid fs_sid = *fs;
+			struct nfs4_stateid fs_sid = fs_resolved;
 			if (lock_release(cd->lt, &fs_sid, 0, 0, 0) == 0) {
 				return NFS4_OK;
 			}
@@ -1300,7 +1468,7 @@ static enum nfs4_status dispatch_op(struct compound_data *cd,
 		/* Try layout state via catalogue coordination API. */
 		if (cd->cat != NULL) {
 			if (mds_coord_layout_return(
-				cd->cat, NULL, fs->other,
+				cd->cat, NULL, fs_resolved.other,
 				cd->clientid, 0,
 				NULL, 0) == MDS_OK) {
 				return NFS4_OK;
@@ -1708,6 +1876,13 @@ uint32_t compound_process(struct compound_data *cd,
 
 		if (results[i].status == NFS4_OK) {
 			account_subtree_op(cd, ops[i].opnum);
+			/* RFC 8881 §16.2.4 — update current_stateid from
+			 * producer ops (OPEN, OPEN_DOWNGRADE, CLOSE, LOCK,
+			 * LOCKU, LAYOUTGET, LAYOUTRETURN), invalidate on
+			 * FH-changing ops (PUTFH, PUTROOTFH, LOOKUP,
+			 * LOOKUPP), save/restore on SAVEFH/RESTOREFH. */
+			compound_update_current_stateid_post(
+				cd, &ops[i], &results[i]);
 		}
 		if (results[i].status != NFS4_OK) {
 			revoke_unused_pregrant(cd);

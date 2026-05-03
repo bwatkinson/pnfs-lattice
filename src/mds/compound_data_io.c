@@ -1023,6 +1023,7 @@ enum nfs4_status op_close(struct compound_data *cd,
 {
 	const struct nfs4_arg_close *a = &op->arg.close;
 	struct nfs4_res_close *r = &res->res.close;
+	struct nfs4_stateid sid_resolved;
 	enum nfs4_status nst;
 	int rc;
 
@@ -1034,6 +1035,17 @@ enum nfs4_status op_close(struct compound_data *cd,
 	if (nst != NFS4_OK) {
 		return nst;
 }
+
+	/* RFC 8881 §16.2.4 — resolve CURRENT_STATEID4 marker.  Pynfs
+	 * CSID1 testOpenAndClose, CSID3 testOpenWriteClose, CSID10
+	 * testOpenSaveFHLookupRestoreFHClose all bundle CLOSE with the
+	 * marker right after an OPEN.  CSID5 / CSID6 expect BAD_STATEID
+	 * because LOOKUP / a missing producer leaves current_stateid
+	 * unset — compound_resolve_stateid returns BAD_STATEID for both. */
+	nst = compound_resolve_stateid(cd, &a->stateid, &sid_resolved);
+	if (nst != NFS4_OK) {
+		return nst;
+	}
 
 	/* QA Phase 4 + QA review Blocker 4 — final-close drain hook.
 	 *
@@ -1063,7 +1075,7 @@ enum nfs4_status op_close(struct compound_data *cd,
 	uint64_t close_fileid = cd->current_fh.fileid;
 
 	rc = open_state_close(cd->ot, cd->clientid,
-			      &a->stateid, &r->stateid);
+			      &sid_resolved, &r->stateid);
 	switch (rc) {
 	case 0:  break;
 	case -4: return NFS4ERR_OLD_STATEID;
@@ -1096,15 +1108,26 @@ enum nfs4_status op_delegreturn(struct compound_data *cd,
 			       const struct nfs4_op *op,
 			       struct nfs4_result *res)
 {
-	const struct nfs4_stateid *sid = &op->arg.close.stateid; /* reuse close arg */
+	struct nfs4_stateid sid_resolved;
+	enum nfs4_status nst;
 
 	(void)res;
+
+	/* RFC 8881 §16.2.4 — resolve CURRENT_STATEID4 marker.  The
+	 * decoder reuses the close arg union slot for DELEGRETURN's
+	 * stateid (no separate arg struct), so the magic value can
+	 * land here too. */
+	nst = compound_resolve_stateid(cd, &op->arg.close.stateid,
+				       &sid_resolved);
+	if (nst != NFS4_OK) {
+		return nst;
+	}
 
 	/* File delegation stateid is self-identifying; current_fh is not
 	 * strictly required per RFC 8881 §18.8.  Accept gracefully
 	 * even if the stateid is not found (expired or already returned). */
 	if (cd->dt != NULL) {
-		if (deleg_return(cd->dt, sid, cd->clientid) == 0) {
+		if (deleg_return(cd->dt, &sid_resolved, cd->clientid) == 0) {
 			return NFS4_OK;
 		}
 	}
@@ -1116,7 +1139,7 @@ enum nfs4_status op_delegreturn(struct compound_data *cd,
 	 * 8881 §10.11.1, so we swallow the "not found" result.
 	 */
 	if (cd->ddt != NULL) {
-		(void)dir_deleg_return(cd->ddt, sid, cd->clientid);
+		(void)dir_deleg_return(cd->ddt, &sid_resolved, cd->clientid);
 	}
 
 	return NFS4_OK;
@@ -1136,6 +1159,7 @@ enum nfs4_status op_open_downgrade(struct compound_data *cd,
 				   struct nfs4_result *res)
 {
 	const struct nfs4_arg_open_downgrade *a = &op->arg.open_downgrade;
+	struct nfs4_stateid sid_resolved;
 	enum nfs4_status nst;
 
 	if (cd->ot == NULL) {
@@ -1152,6 +1176,12 @@ enum nfs4_status op_open_downgrade(struct compound_data *cd,
 		return NFS4ERR_INVAL;
 	}
 
+	/* RFC 8881 §16.2.4 — resolve CURRENT_STATEID4 marker. */
+	nst = compound_resolve_stateid(cd, &a->stateid, &sid_resolved);
+	if (nst != NFS4_OK) {
+		return nst;
+	}
+
 	/*
 	 * Validate the open stateid.  For a metadata-only MDS, accepting
 	 * the downgrade and bumping the seqid is sufficient — actual
@@ -1161,7 +1191,7 @@ enum nfs4_status op_open_downgrade(struct compound_data *cd,
 		int rc;
 
 		rc = open_state_downgrade(cd->ot, cd->clientid,
-					 &a->stateid,
+					 &sid_resolved,
 					 a->share_access,
 					 a->share_deny,
 					 &res->res.close.stateid);
@@ -1269,6 +1299,25 @@ enum nfs4_status validate_io_stateid(
 	uint32_t required_access)
 {
 	struct nfs4_open_state os;
+	struct nfs4_stateid sid_resolved;
+	enum nfs4_status rsid_st;
+
+	if (stateid == NULL) {
+		return NFS4ERR_BAD_STATEID;
+	}
+
+	/*
+	 * RFC 8881 §16.2.4 — resolve CURRENT_STATEID4 marker before
+	 * any other stateid logic.  This covers op_read, op_write,
+	 * op_setattr, op_io_advise, op_allocate, op_deallocate, and
+	 * any other caller that funnels through this validator.
+	 * Pynfs CSID3 testOpenWriteClose drives the WRITE path here.
+	 */
+	rsid_st = compound_resolve_stateid(cd, stateid, &sid_resolved);
+	if (rsid_st != NFS4_OK) {
+		return rsid_st;
+	}
+	stateid = &sid_resolved;
 
 	/* Test-compat mode: no open-state table → skip validation. */
 	if (cd->ot == NULL) {

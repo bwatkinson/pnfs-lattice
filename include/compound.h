@@ -88,6 +88,10 @@ enum nfs4_status {
 	NFS4ERR_OP_NOT_IN_SESSION = 10071,
 	NFS4ERR_OLD_STATEID       = 10024,
 	NFS4ERR_BAD_STATEID       = 10025,
+	/* RFC 8881 §15.1 — FREE_STATEID called against a stateid that
+	 * still has locks (or, per Linux NFSD's interpretation, an open
+	 * stateid that has not been CLOSEd).  Pynfs CSID9. */
+	NFS4ERR_LOCKS_HELD        = 10037,
 	NFS4ERR_SHARE_DENIED      = 10045,
 	NFS4ERR_OPENMODE          = 10046,
 	NFS4ERR_BADSESSION        = 10052,
@@ -1545,6 +1549,31 @@ struct compound_data {
 	 * (open_state, layout_state).  Set from config
 	 * transient_state_cache flag. */
 	bool                      skip_transient_ndb;
+
+	/* RFC 8881 §16.2.4 — current stateid tracking.
+	 *
+	 * Updated by ops that PRODUCE a stateid (OPEN, OPEN_DOWNGRADE,
+	 * CLOSE, LOCK, LOCKU, LAYOUTGET, LAYOUTRETURN).  Read by ops that
+	 * CONSUME a stateid when the wire stateid is the special
+	 * CURRENT_STATEID4 marker (seqid==1, other==all-zeros, RFC 8881
+	 * §16.2.3.1.2).  Cleared by FH-mutating ops (PUTFH, PUTROOTFH,
+	 * LOOKUP, LOOKUPP).  Saved/restored by SAVEFH/RESTOREFH alongside
+	 * the current FH.
+	 *
+	 * `current_stateid_set` is true once a producing op has set the
+	 * value within this compound.  When false, resolving the magic
+	 * value yields NFS4ERR_BAD_STATEID (matches Linux NFSD; pynfs
+	 * CSID5/CSID6 expect NFS4ERR_STALE_STATEID or NFS4ERR_BAD_STATEID).
+	 *
+	 * `saved_stateid` mirrors `saved_fh` for the SAVEFH/RESTOREFH
+	 * pair so a compound that saves an FH+stateid pair, swaps to a
+	 * different FH, and restores can resume consuming current_stateid
+	 * from the saved producer (pynfs CSID10).
+	 */
+	struct nfs4_stateid       current_stateid;
+	bool                      current_stateid_set;
+	struct nfs4_stateid       saved_stateid;
+	bool                      saved_stateid_set;
 
 	/* Active COMPOUND op stream (valid only during compound_process). */
 	const struct nfs4_op      *ops;

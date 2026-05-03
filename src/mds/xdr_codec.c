@@ -1168,10 +1168,17 @@ static bool decode_one_op(XDR *xdrs, struct nfs4_op *op)
         op->arg.test_stateid.count = count;
         return true;
     }
-    case OP_FREE_STATEID: {
-        struct nfs4_stateid sid;
-        return xdr_nfs4_stateid_decode(xdrs, &sid);
-    }
+    case OP_FREE_STATEID:
+        /*
+         * RFC 8881 §18.38.1 FREE_STATEID4args = stateid4 fsa_stateid.
+         * Pre-fix the decoder wrote the stateid into a stack-local
+         * and dropped it on the floor, leaving op->arg.free_stateid
+         * zeroed.  Pynfs CSID9 (testOpenFreestateidClose) caught
+         * this: the FREE_STATEID(current_stateid) was decoded as the
+         * special anonymous stateid (all-zero) and the dispatcher
+         * then no-op'd it instead of returning NFS4ERR_LOCKS_HELD.
+         */
+        return xdr_nfs4_stateid_decode(xdrs, &op->arg.free_stateid);
     case OP_BIND_CONN_TO_SESSION: {
         /* RFC 8881 §18.34: session_id(16) + dir(4) + use_rdma(4).
          * Reuse destroy_session arg struct for the session_id. */

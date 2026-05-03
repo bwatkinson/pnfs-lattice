@@ -222,9 +222,58 @@ enum nfs4_status check_subtree_frozen(const struct compound_data *cd);
 
 enum nfs4_status check_repl_health(const struct compound_data *cd);
 
-enum nfs4_status mds_status_to_nfs4(enum mds_status st);
+enum nfs4_status mds_status_to_nfs4(enum mds_status s);
 
 uint64_t xattr_base_fileid(uint64_t fh);
+
+/* -----------------------------------------------------------------------
+ * Current-stateid helpers (RFC 8881 §16.2.4)
+ *
+ * The wire form of the special CURRENT_STATEID4 marker is
+ * seqid==1 and other==all-zeros (RFC 8881 §16.2.3.1.2).  Operations
+ * that consume a stateid and observe this marker MUST replace it with
+ * the per-compound current_stateid stashed by an earlier producer
+ * (OPEN, LOCK, LOCKU, OPEN_DOWNGRADE, CLOSE, LAYOUTGET, LAYOUTRETURN).
+ *
+ * compound_resolve_stateid() encapsulates that lookup; it returns
+ * NFS4ERR_BAD_STATEID when the magic value is observed but no
+ * producer has set the current_stateid yet (pynfs CSID6
+ * testCloseNoStateid) or the FH has changed since the producer ran
+ * (pynfs CSID5 testOpenLookupClose).
+ *
+ * The set/invalidate/save/restore helpers are wired centrally from
+ * compound_process() and from op_savefh/op_restorefh; individual
+ * handlers should not call them directly.
+ * ----------------------------------------------------------------------- */
+
+/** True iff @sid is the wire-form CURRENT_STATEID4 marker. */
+bool compound_is_current_stateid(const struct nfs4_stateid *sid);
+
+/**
+ * Resolve a possibly-magic stateid.
+ *
+ * On magic input with current_stateid set: writes the resolved stateid
+ * into @out and returns NFS4_OK.  On magic input without a current
+ * stateid set: returns NFS4ERR_BAD_STATEID.  Otherwise copies @in to
+ * @out verbatim and returns NFS4_OK.
+ */
+enum nfs4_status compound_resolve_stateid(
+	const struct compound_data *cd,
+	const struct nfs4_stateid *in,
+	struct nfs4_stateid *out);
+
+/** Mark @sid as the producer of the current_stateid for this compound. */
+void compound_set_current_stateid(struct compound_data *cd,
+				  const struct nfs4_stateid *sid);
+
+/** Clear current_stateid (FH-changing ops invalidate). */
+void compound_invalidate_current_stateid(struct compound_data *cd);
+
+/** SAVEFH companion: snapshot current_stateid into saved_stateid. */
+void compound_save_current_stateid(struct compound_data *cd);
+
+/** RESTOREFH companion: restore current_stateid from saved_stateid. */
+void compound_restore_current_stateid(struct compound_data *cd);
 
 /* -----------------------------------------------------------------------
  * Session ops (compound_session.c)

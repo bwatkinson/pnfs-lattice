@@ -83,6 +83,17 @@ struct nfs4_session {
 	struct nfs4_slot    *slots;           /* [num_slots] */
 	struct nfs4_session *hash_next;       /* Session hash chain */
 	struct nfs4_session *client_next;     /* Per-client session list */
+	/* RFC 8881 §2.10.5 / §20.1 — NFSv4 minor version negotiated by
+	 * the EXCHANGE_ID + CREATE_SESSION pair.  Stored on the session
+	 * so the CB_COMPOUND emitter (nfs4_cb.c) can echo it in the
+	 * `minorversion` field of every callback compound — RFC 8881
+	 * §20.1 requires the callback compound's minorversion to match
+	 * the session's negotiated value (a v4.2 client running pynfs
+	 * rejects v4.1 callbacks with NFS4ERR_MINOR_VERS_MISMATCH).
+	 *
+	 * Populated from cd->minorversion at op_create_session time.
+	 * 0 indicates v4.0 (no SESSION concept; field unused on the wire). */
+	uint32_t             minorversion;
 	/* RFC 8881 §18.36.4 negotiated forechannel attrs.  Stored at
 	 * session-create time as MIN(client_request, server_pref) and
 	 * enforced on every COMPOUND that carries a SEQUENCE on this
@@ -256,6 +267,7 @@ int session_create_session(struct session_table *st,
 			   uint32_t cb_sec_flavor,
 			   uint32_t fore_max_request_size,
 			   uint32_t fore_max_operations,
+			   uint32_t minorversion,
 			   uint8_t out_session_id[SESSION_ID_SIZE],
 			   uint32_t *out_fore_slots,
 			   uint32_t *out_back_slots,
@@ -411,6 +423,15 @@ struct session_cb_snap {
     uint32_t cb_sec_flavor;
     const struct rpc_conn *cb_conn; /**< Borrowed ptr — valid only during callback */
     uint32_t slot_seq_id;    /**< Current seq_id for backchannel slot 0 */
+    /*
+     * RFC 8881 §20.1 — negotiated NFSv4 minor version.  Carried in
+     * the snapshot so the CB encoder can populate the CB_COMPOUND
+     * `minorversion` field with the value the client expects on
+     * its callback receiver (a mismatch yields
+     * NFS4ERR_MINOR_VERS_MISMATCH at the client's CB compound
+     * dispatch).
+     */
+    uint32_t minorversion;
 };
 
 /**

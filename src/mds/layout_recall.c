@@ -93,6 +93,7 @@ struct cb_target {
     uint32_t cb_sec_flavor;
     int      fd;             /* dup'd fd — caller must close */
     uint32_t slot_seq_id;
+    uint32_t minorversion;   /* RFC 8881 §20.1 — CB_COMPOUND minor */
 };
 
 struct cb_target_list {
@@ -144,6 +145,7 @@ static int snap_cb_target(const struct session_cb_snap *snap, void *ctx)
     t->cb_sec_flavor = snap->cb_sec_flavor;
     t->fd = dup_fd;
     t->slot_seq_id = snap->slot_seq_id;
+    t->minorversion = snap->minorversion;
     tl->count++;
 
     return 0;
@@ -170,7 +172,8 @@ static void attempt_cb_for_target(const struct cb_target *t,
 
     int rc = nfs4_cb_layoutrecall_fd(t->fd, t->session_id,
                                       t->cb_prog, t->slot_seq_id,
-                                      1, &args, timeout_ms);
+                                      1, t->minorversion,
+                                      &args, timeout_ms);
     if (rc != 0) {
         (void)fprintf(stderr, "layout_recall: CB_LAYOUTRECALL to "
                 "clientid=%lu failed (rc=%d) — will revoke\n",
@@ -738,7 +741,8 @@ static int byte_range_cb_target_cb(const struct session_cb_snap *snap,
         rc = nfs4_cb_layoutrecall_fd(dup_fd, snap->session_id,
                                      snap->cb_prog,
                                      snap->slot_seq_id,
-                                     1, &args, c->timeout_ms);
+                                     1, snap->minorversion,
+                                     &args, c->timeout_ms);
         if (rc != 0) {
             (void)fprintf(stderr,
                 "layout_recall: byte-range CB_LAYOUTRECALL "

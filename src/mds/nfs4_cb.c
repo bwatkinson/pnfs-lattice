@@ -29,7 +29,15 @@
  * ----------------------------------------------------------------------- */
 
 #define CB_COMPOUND_TAG     "pnfs-mds-cb"
-#define CB_MINOR_VERSION    1
+/*
+ * RFC 8881 §2.10.5.2 / §20.1 — callback program version registered
+ * with the client via CREATE_SESSION's cb_program is hardcoded to 1
+ * for both NFSv4.1 and NFSv4.2 (the program version on the wire is
+ * separate from the protocol minorversion carried inside
+ * CB_COMPOUND4args).  Pre-NFSv4.1 used a different program/version
+ * scheme tied to SETCLIENTID; that path is not implemented.
+ */
+#define CB_PROG_VERSION     1
 #define CB_DEFAULT_TIMEOUT_BUILTIN 5000  /* ms (compile-time fallback) */
 #define CB_MAX_MSG_SIZE     4096
 
@@ -202,7 +210,7 @@ static bool encode_rpc_call_header(XDR *xdrs, uint32_t xid,
 }
     v = prog;          if (!xdr_uint32_t(xdrs, &v)) { return false;
 }
-    v = CB_MINOR_VERSION; if (!xdr_uint32_t(xdrs, &v)) { return false;
+    v = CB_PROG_VERSION; if (!xdr_uint32_t(xdrs, &v)) { return false;
 }
     v = proc;          if (!xdr_uint32_t(xdrs, &v)) { return false;
 }
@@ -229,7 +237,8 @@ static bool encode_rpc_call_header(XDR *xdrs, uint32_t xid,
     return true;
 }
 
-static bool encode_cb_compound_header(XDR *xdrs, uint32_t op_count)
+static bool encode_cb_compound_header(XDR *xdrs, uint32_t minorversion,
+                                      uint32_t op_count)
 {
     /* tag (opaque<>) */
     uint32_t tag_len = (uint32_t)strlen(CB_COMPOUND_TAG);
@@ -241,8 +250,15 @@ static bool encode_cb_compound_header(XDR *xdrs, uint32_t op_count)
         return false;
 }
 
-    /* minorversion */
-    uint32_t minor = CB_MINOR_VERSION;
+    /*
+     * RFC 8881 §20.1 / RFC 7862 §20.1 — minorversion in CB_COMPOUND4args
+     * MUST match the session's negotiated minorversion (1 for v4.1,
+     * 2 for v4.2).  A mismatch returns NFS4ERR_MINOR_VERS_MISMATCH at
+     * the client's CB compound dispatcher (pynfs nfs4client.py:182).
+     * Caller passes the value snapshot from struct nfs4_session via
+     * struct session_cb_snap.minorversion.
+     */
+    uint32_t minor = minorversion;
 
     if (!xdr_uint32_t(xdrs, &minor)) {
         return false;
@@ -660,7 +676,8 @@ int nfs4_cb_layoutrecall(struct nfs4_session *session,
         rc = -EIO;
         goto out;
     }
-    if (!encode_cb_compound_header(&xdrs, 2)) { /* CB_SEQUENCE + CB_LAYOUTRECALL */
+    if (!encode_cb_compound_header(&xdrs, session->minorversion, 2)) {
+        /* CB_SEQUENCE + CB_LAYOUTRECALL */
         rc = -EIO;
         goto out;
     }
@@ -748,7 +765,7 @@ int nfs4_cb_notify(struct nfs4_session *session,
         rc = -EIO;
         goto out;
     }
-    if (!encode_cb_compound_header(&xdrs, 2)) {
+    if (!encode_cb_compound_header(&xdrs, session->minorversion, 2)) {
         rc = -EIO;
         goto out;
     }
@@ -792,6 +809,7 @@ int nfs4_cb_notify_fd(int fd,
                       uint32_t cb_prog,
                       uint32_t slot_seq_id,
                       uint32_t num_cb_slots,
+                      uint32_t minorversion,
                       const struct nfs4_cb_notify_args *args,
                       uint32_t timeout_ms)
 {
@@ -822,7 +840,7 @@ int nfs4_cb_notify_fd(int fd,
         xdr_destroy(&xdrs);
         return -EIO;
     }
-    if (!encode_cb_compound_header(&xdrs, 2)) {
+    if (!encode_cb_compound_header(&xdrs, minorversion, 2)) {
         xdr_destroy(&xdrs);
         return -EIO;
     }
@@ -899,7 +917,8 @@ int nfs4_cb_recall(struct nfs4_session *session,
         rc = -EIO;
         goto out;
     }
-    if (!encode_cb_compound_header(&xdrs, 2)) { /* CB_SEQUENCE + CB_RECALL */
+    if (!encode_cb_compound_header(&xdrs, session->minorversion, 2)) {
+        /* CB_SEQUENCE + CB_RECALL */
         rc = -EIO;
         goto out;
     }
@@ -958,6 +977,7 @@ int nfs4_cb_recall_fd(int fd,
                       uint32_t cb_prog,
                       uint32_t slot_seq_id,
                       uint32_t num_cb_slots,
+                      uint32_t minorversion,
                       const struct nfs4_cb_recall_args *args,
                       uint32_t timeout_ms)
 {
@@ -984,7 +1004,8 @@ int nfs4_cb_recall_fd(int fd,
         xdr_destroy(&xdrs);
         return -EIO;
     }
-    if (!encode_cb_compound_header(&xdrs, 2)) { /* CB_SEQUENCE + CB_RECALL */
+    if (!encode_cb_compound_header(&xdrs, minorversion, 2)) {
+        /* CB_SEQUENCE + CB_RECALL */
         xdr_destroy(&xdrs);
         return -EIO;
     }
@@ -1025,6 +1046,7 @@ int nfs4_cb_layoutrecall_fd(int fd,
                             uint32_t cb_prog,
                             uint32_t slot_seq_id,
                             uint32_t num_cb_slots,
+                            uint32_t minorversion,
                             const struct nfs4_cb_layoutrecall_args *args,
                             uint32_t timeout_ms)
 {
@@ -1051,7 +1073,7 @@ int nfs4_cb_layoutrecall_fd(int fd,
         xdr_destroy(&xdrs);
         return -EIO;
     }
-    if (!encode_cb_compound_header(&xdrs, 2)) {
+    if (!encode_cb_compound_header(&xdrs, minorversion, 2)) {
         xdr_destroy(&xdrs);
         return -EIO;
     }

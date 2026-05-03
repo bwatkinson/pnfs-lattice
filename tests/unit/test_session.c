@@ -209,6 +209,7 @@ static void test_create_session_basic(void)
 					 32, 4,
 					 0, 0,
 					 0, 0,
+					 1, /* minorversion */
 					 session_id, &fore, &back, NULL, NULL), 0);
 
 	ASSERT_EQ(fore, 32);
@@ -242,6 +243,7 @@ static void test_create_session_stale_clientid(void)
 					 32, 4,
 					 0, 0,
 					 0, 0,
+					 1, /* minorversion */
 					 session_id, &fore, &back, NULL, NULL), -1);
 
 	session_table_destroy(st);
@@ -270,6 +272,7 @@ static void test_create_session_bad_seqid(void)
 					 32, 4,
 					 0, 0,
 					 0, 0,
+					 1, /* minorversion */
 					 session_id, &fore, &back, NULL, NULL), -2);
 
 	session_table_destroy(st);
@@ -298,6 +301,7 @@ static void test_create_session_slot_cap(void)
 					 9999, 4,
 					 0, 0,
 					 0, 0,
+					 1, /* minorversion */
 					 session_id, &fore, &back, NULL, NULL), 0);
 
 	ASSERT_EQ(fore, SESSION_MAX_SLOTS);
@@ -326,6 +330,7 @@ static void test_destroy_session(void)
 					 16, 4,
 					 0, 0,
 					 0, 0,
+					 1, /* minorversion */
 					 session_id, &fore, &back, NULL, NULL), 0);
 
 	/* Destroy the session. */
@@ -360,6 +365,7 @@ static void test_sequence_valid(void)
 					 16, 4,
 					 0, 0,
 					 0, 0,
+					 1, /* minorversion */
 					 session_id, &fore, &back, NULL, NULL), 0);
 
 	/* Slot starts at seq_id = 0; first new request uses 1. */
@@ -399,6 +405,7 @@ static void test_sequence_replay(void)
 					 16, 4,
 					 0, 0,
 					 0, 0,
+					 1, /* minorversion */
 					 session_id, &fore, &back, NULL, NULL), 0);
 
 	/* First request: seq_id = 1. */
@@ -436,6 +443,7 @@ static void test_sequence_misordered(void)
 					 16, 4,
 					 0, 0,
 					 0, 0,
+					 1, /* minorversion */
 					 session_id, &fore, &back, NULL, NULL), 0);
 
 	/* First request: seq_id = 1. */
@@ -493,6 +501,7 @@ static void test_sequence_bad_slot(void)
 					 4, 0,
 					 0, 0,
 					 0, 0,
+					 1, /* minorversion */
 					 session_id, &fore, &back, NULL, NULL), 0);
 
 	/* 4 slots → valid 0-3; slot 99 is out of range. */
@@ -722,6 +731,7 @@ static void test_compound_replay_seq_false_retry(void)
 					 16, 4,
 					 0, 0,
 					 0, 0,
+					 1, /* minorversion */
 					 session_id, &fore, &back, NULL, NULL), 0);
 
 	/* First compound: SEQUENCE(seq_id=1) + PUTROOTFH + GETATTR. */

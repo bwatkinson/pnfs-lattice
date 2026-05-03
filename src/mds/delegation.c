@@ -67,7 +67,8 @@ struct deleg_cb_lookup_ctx {
     uint32_t cb_prog;
     uint32_t slot_seq_id;
     uint32_t num_cb_slots;
-    int      fd;          /* dup'd; caller closes */
+    uint32_t minorversion;  /* RFC 8881 §20.1 — echo session minor in CB */
+    int      fd;            /* dup'd; caller closes */
 };
 
 static int deleg_cb_lookup_cb(const struct session_cb_snap *snap, void *ctx)
@@ -98,6 +99,7 @@ static int deleg_cb_lookup_cb(const struct session_cb_snap *snap, void *ctx)
     c->cb_prog      = snap->cb_prog;
     c->slot_seq_id  = snap->slot_seq_id;
     c->num_cb_slots = 1; /* matches layout_recall.c usage */
+    c->minorversion = snap->minorversion;
     c->fd           = dup_fd;
     return 1;
 }
@@ -567,6 +569,7 @@ int deleg_recall_file(struct deleg_table *dt,
 
         cbrc = nfs4_cb_recall_fd(lc.fd, lc.session_id, lc.cb_prog,
                                  lc.slot_seq_id, lc.num_cb_slots,
+                                 lc.minorversion,
                                  &ra, timeout_ms);
         if (cbrc != 0) {
             (void)fprintf(stderr,

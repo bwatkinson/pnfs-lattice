@@ -55,6 +55,55 @@ struct nfs4_stateid {
 #define OPEN4_SHARE_ACCESS_WRITE   0x0002U
 #define OPEN4_SHARE_ACCESS_BOTH    0x0003U
 
+/* RFC 8881 §18.16.3 share_access3 — mask to extract the basic
+ * READ/WRITE bits from the full share_access field on the wire.  The
+ * remaining bits encode delegation hints (WANT_*) and when-to-deliver
+ * hints (SIGNAL/PUSH); they MUST be masked off before comparison
+ * against the OPEN_BOTH constant or stored as the canonical share
+ * mode in open_state. */
+#define OPEN4_SHARE_ACCESS_BASIC_MASK   0x0003U
+
+/*
+ * RFC 8881 §18.16.3 OPEN4_SHARE_ACCESS_WANT_* hints — client preference
+ * for the kind of delegation it wants (or doesn't want) on this OPEN.
+ * Encoded in bits 8-11 of the share_access field.  Server-side semantics:
+ *
+ *   WANT_NO_PREFERENCE       Server picks; default if the client did
+ *                            not set any WANT bit.
+ *   WANT_READ_DELEG          Server SHOULD grant a READ delegation if
+ *                            possible.
+ *   WANT_WRITE_DELEG         Server SHOULD grant a WRITE delegation if
+ *                            possible.
+ *   WANT_ANY_DELEG           Either is fine.
+ *   WANT_NO_DELEG            Server MUST NOT grant a delegation.  Used
+ *                            by clients that would rather not deal with
+ *                            the recall path (and by pynfs DELEG4
+ *                            "testNoDeleg" to verify the gate).
+ *   WANT_CANCEL              Cancel a previous WANT_*_DELEG hint.
+ *
+ * The when-bits (SIGNAL_DELEG_WHEN_RESRC_AVAIL, PUSH_DELEG_WHEN_UNCONTENDED)
+ * are out of scope for this server today; we ignore them but preserve
+ * the bit values so a future revision can surface them via OPEN4_RESULT.
+ */
+/*
+ * RFC 7863 §2 (NFSv4.2 XDR) — the canonical mask spans bits 8-15:
+ *   const OPEN4_SHARE_ACCESS_WANT_DELEG_MASK = 0xFF00;
+ * In current use only the low nibble is populated (NO_PREFERENCE,
+ * READ_DELEG, WRITE_DELEG, ANY_DELEG, NO_DELEG, CANCEL = 0x0..0x500),
+ * but the spec reserves the full byte for future extensions.  We use
+ * 0xFF00 verbatim so a future hint value at e.g. 0x0600 is still
+ * captured correctly by the client-hint extraction in op_open.
+ */
+#define OPEN4_SHARE_ACCESS_WANT_DELEG_MASK         0xFF00U
+#define OPEN4_SHARE_ACCESS_WANT_NO_PREFERENCE      0x0000U
+#define OPEN4_SHARE_ACCESS_WANT_READ_DELEG         0x0100U
+#define OPEN4_SHARE_ACCESS_WANT_WRITE_DELEG        0x0200U
+#define OPEN4_SHARE_ACCESS_WANT_ANY_DELEG          0x0300U
+#define OPEN4_SHARE_ACCESS_WANT_NO_DELEG           0x0400U
+#define OPEN4_SHARE_ACCESS_WANT_CANCEL             0x0500U
+#define OPEN4_SHARE_ACCESS_WANT_SIGNAL_DELEG_WHEN_RESRC_AVAIL  0x10000U
+#define OPEN4_SHARE_ACCESS_WANT_PUSH_DELEG_WHEN_UNCONTENDED    0x20000U
+
 #define OPEN4_SHARE_DENY_NONE      0x0000U
 #define OPEN4_SHARE_DENY_READ      0x0001U
 #define OPEN4_SHARE_DENY_WRITE     0x0002U

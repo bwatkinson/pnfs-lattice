@@ -789,7 +789,7 @@ open_existing:
 
 	/*
 	 * Delegation conflict-recall + conditional grant
-	 * (RFC 8881 §10.4).
+	 * (RFC 8881 §10.4 / §18.16.3).
 	 *
 	 * Step 1 — recall any other-client delegations that
 	 * conflict with this OPEN.  deleg_recall_file() snapshots
@@ -799,25 +799,46 @@ open_existing:
 	 * even if some clients are unreachable.
 	 *
 	 * Step 2 — conditionally grant a delegation back to the
-	 * requesting client.  We only grant when:
-	 *   (a) the deleg_table is wired (cd->dt != NULL),
-	 *   (b) the catalogue → backchannel snapshot path is
-	 *       available (cd->st != NULL) so a future recall
-	 *       can deliver CB_RECALL,
-	 *   (c) deleg_check_conflict reports no remaining
-	 *       holder (Step 1 may not have cleared everything
-	 *       on a no-backchannel client),
-	 *   (d) the OPEN is single-purpose (READ-only → READ
-	 *       deleg; WRITE-only with no co-openers → WRITE
-	 *       deleg; mixed → NONE).
+	 * requesting client.  Honors RFC 8881 §18.16.3 WANT_*
+	 * hints carried in share_access bits 8-11:
+	 *   WANT_NO_DELEG    → r->delegation_type stays NONE
+	 *                      (pynfs DELEG4 testNoDeleg gate).
+	 *   WANT_READ_DELEG  → grant READ deleg when share_access
+	 *                      includes READ.
+	 *   WANT_WRITE_DELEG → grant WRITE deleg when share_access
+	 *                      includes WRITE.
+	 *   WANT_ANY_DELEG / WANT_NO_PREFERENCE / unset → server
+	 *                      picks based on share_access.
+	 *   WANT_CANCEL      → treated as NO_DELEG (we don't track
+	 *                      pending hints, so cancelling one
+	 *                      degenerates to don't-grant).
+	 *
+	 * Additional preconditions (all must hold):
+	 *   (a) cd->dt != NULL  — deleg table wired,
+	 *   (b) cd->st != NULL  — session table wired so a future
+	 *       recall can deliver CB_RECALL,
+	 *   (c) deleg_check_conflict reports no residual holder
+	 *       (Step 1 may not have cleared everything on a
+	 *       no-backchannel holder).
 	 *
 	 * Without (b) we degrade to OPEN_DELEGATE_NONE: an
-	 * unrecallable delegation is a deadlock waiting to
-	 * happen.  The encoder (xdr_ops_core.c::encode_res_open)
-	 * emits the full open_delegation4 body when
-	 * r->delegation_type != OPEN_DELEGATE_NONE.
+	 * unrecallable delegation is a deadlock waiting to happen.
+	 * The encoder (xdr_ops_core.c::encode_res_open) emits the
+	 * full open_delegation4 body when r->delegation_type !=
+	 * OPEN_DELEGATE_NONE.
 	 */
 	r->delegation_type = OPEN_DELEGATE_NONE;
+	/*
+	 * Default decline reason for v4.1+ NONE_EXT (RFC 8881 §18.16.4).
+	 * Zero == WND4_NOT_WANTED, so this is also what compound_process()
+	 * leaves after its memset of the result slot; the explicit
+	 * assignments below override it on paths where a more specific
+	 * reason applies (CONTENTION on residual conflict, RESOURCE on
+	 * a missing recall path).  All NONE_EXT tails (will_push /
+	 * will_signal) stay at false because we never promise the client
+	 * a future push or avail-signal.
+	 */
+	r->none_reason = WND4_NOT_WANTED;
 
 	if (cd->dt != NULL) {
 		/* Step 1: recall conflicting delegations from OTHER
@@ -835,28 +856,60 @@ open_existing:
 		if (cd->st != NULL) {
 			bool has_conflict = false;
 			uint32_t deleg_type = OPEN_DELEGATE_NONE;
+			uint32_t want_hint = a->share_access &
+				OPEN4_SHARE_ACCESS_WANT_DELEG_MASK;
+
+			/* Hard-stop: client explicitly asked for no
+			 * delegation.  Skip the grant entirely.
+			 * RFC 8881 §18.16.4: WND4_NOT_WANTED is the
+			 * correct decline reason for both WANT_NO_DELEG
+			 * and WANT_CANCEL. */
+			if (want_hint == OPEN4_SHARE_ACCESS_WANT_NO_DELEG ||
+			    want_hint == OPEN4_SHARE_ACCESS_WANT_CANCEL) {
+				r->none_reason = WND4_NOT_WANTED;
+				goto deleg_grant_done;
+			}
 
 			if (deleg_check_conflict(cd->dt, target_fid,
 						 cd->clientid,
 						 &has_conflict) == 0 &&
 			    !has_conflict) {
-				uint32_t want_read = a->share_access &
+				uint32_t basic = a->share_access &
+					OPEN4_SHARE_ACCESS_BASIC_MASK;
+				uint32_t want_read = basic &
 					OPEN4_SHARE_ACCESS_READ;
-				uint32_t want_write = a->share_access &
+				uint32_t want_write = basic &
 					OPEN4_SHARE_ACCESS_WRITE;
 
-				if (want_write && !want_read) {
-					deleg_type = OPEN_DELEGATE_WRITE;
-				} else if (want_read && !want_write) {
-					deleg_type = OPEN_DELEGATE_READ;
-				} else if (want_read && want_write) {
-					/* Mixed RW OPEN: only grant a WRITE
-					 * delegation when no other opener
-					 * exists on this file (open_state
-					 * tracks share-mode conflicts; a WRITE
-					 * deleg gives the client exclusive
-					 * caching authority). */
-					deleg_type = OPEN_DELEGATE_WRITE;
+				switch (want_hint) {
+				case OPEN4_SHARE_ACCESS_WANT_READ_DELEG:
+					/* Client asked for READ deleg.  Grant
+					 * iff share_access includes READ. */
+					if (want_read) {
+						deleg_type = OPEN_DELEGATE_READ;
+					}
+					break;
+				case OPEN4_SHARE_ACCESS_WANT_WRITE_DELEG:
+					/* Client asked for WRITE deleg.  Grant
+					 * iff share_access includes WRITE. */
+					if (want_write) {
+						deleg_type = OPEN_DELEGATE_WRITE;
+					}
+					break;
+				case OPEN4_SHARE_ACCESS_WANT_ANY_DELEG:
+				case OPEN4_SHARE_ACCESS_WANT_NO_PREFERENCE:
+				default:
+					/* Server picks based on share_access. */
+					if (want_write && !want_read) {
+						deleg_type = OPEN_DELEGATE_WRITE;
+					} else if (want_read && !want_write) {
+						deleg_type = OPEN_DELEGATE_READ;
+					} else if (want_read && want_write) {
+						/* Mixed RW OPEN: WRITE deleg gives
+						 * exclusive caching authority. */
+						deleg_type = OPEN_DELEGATE_WRITE;
+					}
+					break;
 				}
 
 				if (deleg_type != OPEN_DELEGATE_NONE) {
@@ -870,10 +923,58 @@ open_existing:
 							&sid) == 0) {
 						r->delegation_type = deleg_type;
 						r->deleg_stateid = sid;
+					} else {
+						/* Grant failed (table full,
+						 * persistence error): the
+						 * server lacked the resource
+						 * to issue the deleg. */
+						r->none_reason = WND4_RESOURCE;
 					}
 				}
+				/* deleg_type == NONE here means we
+				 * decided not to grant (want hint vs.
+				 * share_access mismatch).  Leave
+				 * none_reason at the WND4_NOT_WANTED
+				 * default. */
+			} else {
+				/* Either the conflict probe failed or a
+				 * residual other-client delegation
+				 * survived the recall pass (e.g. the
+				 * holder's backchannel was unreachable).
+				 * RFC 8881 §18.16.4 — WND4_CONTENTION. */
+				r->none_reason = WND4_CONTENTION;
 			}
+		} else {
+			/* Session table not wired: even if we granted, we
+			 * could never deliver a CB_RECALL on conflict.
+			 * Treat as a server resource shortage so the
+			 * client knows it's a transient condition rather
+			 * than a permanent server policy. */
+			r->none_reason = WND4_RESOURCE;
 		}
+	}
+	/* cd->dt == NULL: deleg subsystem is disabled.  none_reason
+	 * stays at WND4_NOT_WANTED — "server not granting" is the
+	 * least misleading reason for a v4.1+ client. */
+deleg_grant_done:
+	/*
+	 * RFC 8881 §18.16.4 wire-form selection.
+	 *
+	 * v4.1+ sessions: if we did not grant a delegation, upgrade
+	 * the result discriminator from OPEN_DELEGATE_NONE (legacy
+	 * void) to OPEN_DELEGATE_NONE_EXT so the encoder emits the
+	 * open_none_delegation4 body carrying the populated
+	 * none_reason.  This is what pynfs DELEG4 (testNoDeleg) and
+	 * the v4.1+ Linux client expect when the open carried any
+	 * WANT_* hint or hit a conflict.
+	 *
+	 * v4.0 sessions stay on bare NONE — discriminator value 4 is
+	 * not part of the v4.0 open_delegation4 union, so emitting
+	 * it would corrupt the wire form for those clients.
+	 */
+	if (r->delegation_type == OPEN_DELEGATE_NONE &&
+	    cd->minorversion >= 1) {
+		r->delegation_type = OPEN_DELEGATE_NONE_EXT;
 	}
 
 	/* Populate result and update current_fh. */

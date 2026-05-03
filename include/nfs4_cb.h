@@ -83,6 +83,7 @@ int nfs4_cb_layoutrecall_fd(int fd,
                             uint32_t cb_prog,
                             uint32_t slot_seq_id,
                             uint32_t num_cb_slots,
+                            uint32_t minorversion,
                             const struct nfs4_cb_layoutrecall_args *args,
                             uint32_t timeout_ms);
 
@@ -143,6 +144,7 @@ int nfs4_cb_recall_fd(int fd,
 		      uint32_t cb_prog,
 		      uint32_t slot_seq_id,
 		      uint32_t num_cb_slots,
+		      uint32_t minorversion,
 		      const struct nfs4_cb_recall_args *args,
 		      uint32_t timeout_ms);
 
@@ -210,6 +212,7 @@ int nfs4_cb_notify_fd(int fd,
 		      uint32_t cb_prog,
 		      uint32_t slot_seq_id,
 		      uint32_t num_cb_slots,
+		      uint32_t minorversion,
 		      const struct nfs4_cb_notify_args *args,
 		      uint32_t timeout_ms);
 

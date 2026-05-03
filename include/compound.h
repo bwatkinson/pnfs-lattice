@@ -808,9 +808,31 @@ struct nfs4_res_readdir {
 struct nfs4_res_open {
 	struct nfs4_stateid stateid;
 	struct mds_inode    inode;    /* Opened/created file attributes */
-	/* Delegation grant (RFC 8881 §18.16.4). */
-	uint32_t            delegation_type; /* OPEN_DELEGATE_NONE/READ/WRITE */
-	struct nfs4_stateid deleg_stateid;   /* Valid when delegation_type != NONE */
+	/*
+	 * Delegation grant (RFC 8881 §18.16.4).
+	 *
+	 * delegation_type is one of:
+	 *   OPEN_DELEGATE_NONE      — v4.0-style "no delegation" (void body).
+	 *   OPEN_DELEGATE_READ      — READ delegation; deleg_stateid valid.
+	 *   OPEN_DELEGATE_WRITE     — WRITE delegation; deleg_stateid valid.
+	 *   OPEN_DELEGATE_NONE_EXT  — v4.1+ "declined" with reason; reads
+	 *                             none_reason from the why_no_delegation4
+	 *                             bag.  WND4_NOT_WANTED is the typical
+	 *                             reason when the client set
+	 *                             OPEN4_SHARE_ACCESS_WANT_NO_DELEG.
+	 *
+	 * none_reason is consulted only when delegation_type is
+	 * OPEN_DELEGATE_NONE_EXT.  none_will_push / none_will_signal apply
+	 * to WND4_CONTENTION / WND4_RESOURCE respectively per RFC 8881
+	 * §18.16.4.  None of these tails are populated by op_open today
+	 * (we never promise to push/signal); the fields are zero-init in
+	 * the result and consumed by encode_res_open as the union tail.
+	 */
+	uint32_t            delegation_type;
+	struct nfs4_stateid deleg_stateid;   /* Valid when delegation_type is READ or WRITE */
+	uint32_t            none_reason;     /* WND4_*, valid when delegation_type == OPEN_DELEGATE_NONE_EXT */
+	bool                none_will_push;  /* WND4_CONTENTION tail */
+	bool                none_will_signal;/* WND4_RESOURCE tail */
 };
 
 struct nfs4_res_close {

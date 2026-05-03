@@ -19,10 +19,53 @@
 #include <stdbool.h>
 #include "open_state.h"  /* struct nfs4_stateid */
 
-/* Delegation types (RFC 8881 §18.16.4 — open_delegation_type4). */
-#define OPEN_DELEGATE_NONE   0
-#define OPEN_DELEGATE_READ   1
-#define OPEN_DELEGATE_WRITE  2
+/* Delegation types (RFC 8881 §18.16.4 — open_delegation_type4,
+ * extended by RFC 7862 §15.5 — NFSv4.2 attribute delegations).
+ *
+ *   0 OPEN_DELEGATE_NONE              — v4.0 / fallback (void body)
+ *   1 OPEN_DELEGATE_READ              — read deleg
+ *   2 OPEN_DELEGATE_WRITE             — write deleg
+ *   3 OPEN_DELEGATE_NONE_EXT          — v4.1+ "declined" with reason
+ *   4 OPEN_DELEGATE_READ_ATTRS_DELEG  — v4.2 attr-only deleg (NOT us)
+ *   5 OPEN_DELEGATE_WRITE_ATTRS_DELEG — v4.2 attr-only deleg (NOT us)
+ *
+ * The encoder selects between OPEN_DELEGATE_NONE and
+ * OPEN_DELEGATE_NONE_EXT based on the session minorversion: v4.0
+ * sessions get bare NONE (void body); v4.1+ sessions whose request
+ * carried any WANT_* hint, or whose grant was declined for a known
+ * reason, get NONE_EXT with the appropriate ond_why.
+ *
+ * IMPORTANT: do NOT confuse NONE_EXT (3) with READ_ATTRS_DELEG (4).
+ * An earlier revision of this header used 4 for NONE_EXT; that
+ * value collides with the v4.2 attribute-delegation discriminator,
+ * caused Wireshark to dissect our "declined" replies as
+ * READ_ATTRS_DELEG, and made pynfs parse the open_none_delegation4
+ * body as the (longer) attr-deleg body — producing EOFError on
+ * every OPEN reply.  RFC numbers are the source of truth. */
+#define OPEN_DELEGATE_NONE                 0
+#define OPEN_DELEGATE_READ                 1
+#define OPEN_DELEGATE_WRITE                2
+#define OPEN_DELEGATE_NONE_EXT             3   /* RFC 8881 §18.16.4 */
+#define OPEN_DELEGATE_READ_ATTRS_DELEG     4   /* RFC 7862 §15.5  (unused) */
+#define OPEN_DELEGATE_WRITE_ATTRS_DELEG    5   /* RFC 7862 §15.5  (unused) */
+
+/*
+ * why_no_delegation4 codes (RFC 8881 §18.16.4).  Only valid when
+ * the open_delegation4 type is OPEN_DELEGATE_NONE_EXT.  WND4_NOT_WANTED
+ * is the most common reason — the client set OPEN4_SHARE_ACCESS_WANT_NO_DELEG
+ * (or WANT_CANCEL).  WND4_CONTENTION and WND4_RESOURCE carry an
+ * additional bool tail (ond_server_will_push_deleg /
+ * ond_server_will_signal_avail).  All other variants have a void tail.
+ */
+#define WND4_NOT_WANTED         0
+#define WND4_CONTENTION         1
+#define WND4_RESOURCE           2
+#define WND4_NOT_SUPP_FTYPE     3
+#define WND4_WRITE_DELEG_NOT_SUPP_FTYPE 4
+#define WND4_NOT_SUPP_UPGRADE   5
+#define WND4_NOT_SUPP_DOWNGRADE 6
+#define WND4_CANCELLED          7
+#define WND4_IS_DIR             8
 
 struct nfs4_session;  /* Forward — for CB_RECALL delivery. */
 struct mds_catalogue;

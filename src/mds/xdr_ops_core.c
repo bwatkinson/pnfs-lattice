@@ -1180,30 +1180,70 @@ bool encode_res_open(XDR *xdrs, const struct nfs4_result *r)
     /*
      * open_delegation4 (RFC 8881 §18.16.4) is a discriminated union
      * keyed on open_delegation_type4:
-     *   case OPEN_DELEGATE_NONE  (0): void
-     *   case OPEN_DELEGATE_READ  (1): open_read_delegation4
-     *   case OPEN_DELEGATE_WRITE (2): open_write_delegation4
+     *   case OPEN_DELEGATE_NONE     (0): void  (v4.0 / v4.1 fallback)
+     *   case OPEN_DELEGATE_READ     (1): open_read_delegation4
+     *   case OPEN_DELEGATE_WRITE    (2): open_write_delegation4
+     *   case OPEN_DELEGATE_NONE_EXT (4): open_none_delegation4 (v4.1+)
      *
      * Pre-fix the encoder hard-coded NONE on every reply, so
      * pynfs DELEG1 (testReadDeleg) saw "Could not get delegation"
      * even when op_open had successfully called deleg_grant().
      * Now we honour o->delegation_type and emit the matching body.
      *
-     * The body is the same prefix for both READ and WRITE, plus a
-     * WRITE-only nfs_space_limit4 inserted between recall and
-     * permissions.  We support both.
+     * The READ / WRITE body is the same prefix for both (stateid +
+     * recall=false), plus a WRITE-only nfs_space_limit4 inserted
+     * between recall and permissions, plus the nfsace4 with
+     * EVERYONE@.
+     *
+     * The NONE_EXT body (open_none_delegation4) is:
+     *   why_no_delegation4 ond_why;
+     *   union switch (why_no_delegation4 ond_why) {
+     *     case WND4_CONTENTION:  bool ond_server_will_push_deleg;
+     *     case WND4_RESOURCE:    bool ond_server_will_signal_avail;
+     *     default:               void;
+     *   };
+     *
+     * Sanitisation: any value other than the four supported types
+     * collapses to OPEN_DELEGATE_NONE so a producer bug never
+     * yields an unparseable wire form.
      */
     {
         uint32_t deleg_type = o->delegation_type;
 
         if (deleg_type != OPEN_DELEGATE_READ &&
-            deleg_type != OPEN_DELEGATE_WRITE) {
+            deleg_type != OPEN_DELEGATE_WRITE &&
+            deleg_type != OPEN_DELEGATE_NONE_EXT) {
             deleg_type = OPEN_DELEGATE_NONE;
         }
         if (!xdr_uint32_t(xdrs, &deleg_type)) {
             return false;
         }
         if (deleg_type == OPEN_DELEGATE_NONE) {
+            return true;
+        }
+
+        if (deleg_type == OPEN_DELEGATE_NONE_EXT) {
+            /* open_none_delegation4: ond_why + per-reason tail. */
+            uint32_t ond_why = o->none_reason;
+
+            if (ond_why > WND4_IS_DIR) {
+                ond_why = WND4_NOT_WANTED;
+            }
+            if (!xdr_uint32_t(xdrs, &ond_why)) {
+                return false;
+            }
+            if (ond_why == WND4_CONTENTION) {
+                int32_t will = o->none_will_push ? 1 : 0;
+                if (!xdr_putbool(xdrs, will)) {
+                    return false;
+                }
+            } else if (ond_why == WND4_RESOURCE) {
+                int32_t will = o->none_will_signal ? 1 : 0;
+                if (!xdr_putbool(xdrs, will)) {
+                    return false;
+                }
+            }
+            /* All other reason codes have a void tail. */
             return true;
         }
 

@@ -622,6 +622,7 @@ int session_create_session(struct session_table *st,
 			   uint32_t cb_sec_flavor,
 			   uint32_t fore_max_request_size,
 			   uint32_t fore_max_operations,
+			   uint32_t minorversion,
 			   uint8_t out_session_id[SESSION_ID_SIZE],
 			   uint32_t *out_fore_slots,
 			   uint32_t *out_back_slots,
@@ -713,6 +714,7 @@ int session_create_session(struct session_table *st,
 	 * With seq_id=0, the check (1 == 0+1) accepts it. */
 	s->num_slots = actual_fore;
 	s->clientid = clientid;
+	s->minorversion = minorversion;
 	s->max_request_size = actual_max_req;
 	s->max_operations = actual_max_ops;
 
@@ -1107,10 +1109,35 @@ int session_for_each_with_cb(struct session_table *st,
             snap.cb_prog = s->cb_prog;
             snap.cb_sec_flavor = s->cb_sec_flavor;
             snap.cb_conn = s->cb_conn;
-            snap.slot_seq_id = (s->cb_slots != NULL && s->num_cb_slots > 0)
-                                ? s->cb_slots[0].seq_id : 0;
+            /*
+             * RFC 8881 §2.10.5.1 / §18.46.4: CB_SEQUENCE sa_sequenceid
+             * MUST start at 1 and increment by 1 per CB on the slot.
+             * The fd-based callers (delegation/layout conflict-recall)
+             * use this snap value verbatim as sa_sequenceid, so we must
+             * hand them the NEXT id (current + 1), not the current one.
+             *
+             * We commit the increment only when the callback signals it
+             * actually consumed the snap (rc == 1).  rc == 0 — "keep
+             * looking" — leaves the slot's seq_id untouched, so an
+             * uninterested iteration over many sessions doesn't burn
+             * seqids on slots whose CB never goes out.  Seqid skips
+             * would be silently rejected by the v4.1 client (the
+             * sequenceid contract is +1 exactly, never a jump).
+             */
+            uint32_t prepared_seq =
+                (s->cb_slots != NULL && s->num_cb_slots > 0)
+                    ? s->cb_slots[0].seq_id + 1 : 0;
+            snap.slot_seq_id = prepared_seq;
+            snap.minorversion = s->minorversion;
 
             rc = cb(&snap, ctx);
+            if (rc == 1) {
+                /* Snap consumed — commit the seq advance. */
+                if (s->cb_slots != NULL && s->num_cb_slots > 0) {
+                    s->cb_slots[0].seq_id = prepared_seq;
+                }
+                break;
+            }
             if (rc != 0) {
                 break;
             }

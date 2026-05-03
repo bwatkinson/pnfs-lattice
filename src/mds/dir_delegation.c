@@ -620,6 +620,7 @@ struct ddt_cb_target {
 	uint32_t cb_prog;
 	uint32_t slot_seq_id;
 	uint32_t num_cb_slots;
+	uint32_t minorversion;
 };
 
 struct ddt_cb_snap_ctx {
@@ -650,6 +651,7 @@ static int ddt_cb_snap_cb(const struct session_cb_snap *snap, void *ctx)
 	c->target.cb_prog = snap->cb_prog;
 	c->target.slot_seq_id = snap->slot_seq_id;
 	c->target.num_cb_slots = 1; /* session_cb_snap always exposes slot 0 */
+	c->target.minorversion = snap->minorversion;
 	c->found = true;
 	return 1; /* stop iteration */
 }
@@ -787,6 +789,7 @@ int dir_deleg_notify_dir(struct dir_deleg_table *ddt,
 						       cbt.cb_prog,
 						       cbt.slot_seq_id,
 						       cbt.num_cb_slots,
+						       cbt.minorversion,
 						       &args,
 						       timeout_ms);
 				close(cbt.fd);

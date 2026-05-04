@@ -110,6 +110,14 @@ int layout_recall_for_file(struct layout_recall *lr, uint64_t fileid);
  *                       LAYOUT4_FLEX_FILES }).  Passing a stale or
  *                       wrong value would yield a CB the holder
  *                       client cannot decode — Mark's bug.
+ *
+ *                       Pass 0 for callers that do not have an
+ *                       active LAYOUTGET request (op_setattr on
+ *                       SIZE, op_remove on final unlink); the helper
+ *                       then substitutes the coordinator-level
+ *                       default set by
+ *                       layout_recall_set_default_layout_type()
+ *                       (default LAYOUT4_FLEX_FILES).
  * @param recalled_out   Optional: receives the count of holders the
  *                       helper recalled.  Pass NULL to ignore.
  * @return 0 on success (zero or more recalls sent), -errno on

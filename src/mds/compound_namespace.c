@@ -37,6 +37,7 @@
 #include "ds_cache.h"
 #include "layout_cache.h"  /* Phase D of docs/hpc-nto1-plan.md */
 #include "layout_commit_aggregator.h"  /* Phase F of docs/hpc-nto1-plan.md */
+#include "layout_recall.h"  /* Mark Q5: recall layouts on truncate / unlink */
 
 #define ACCESS4_READ    0x00000001
 #define ACCESS4_LOOKUP  0x00000002
@@ -966,6 +967,51 @@ enum nfs4_status op_setattr(struct compound_data *cd,
 		layout_commit_aggregator_drop(cd->lcommit_agg,
 					      cd->current_fh.fileid);
 	}
+	/*
+	 * Mark Q5 P03 — layout-recall on truncate.
+	 *
+	 * RFC 8881 §12.5.5 / §18.30: a SETATTR that changes the file
+	 * size invalidates outstanding layouts on that file (a shrink
+	 * removes ranges; a grow can only add zeroed bytes, but
+	 * holders' caches still need to learn the new size).  We
+	 * therefore emit a best-effort whole-file CB_LAYOUTRECALL to
+	 * every other client holding a layout on this fileid AFTER
+	 * the catalogue size update succeeds.  Doing it post-write
+	 * keeps the holder-revoke and the on-disk truth aligned: a
+	 * failed cat_setattr leaves layouts intact for the next
+	 * attempt.
+	 *
+	 * Conditions:
+	 *   - cat_setattr succeeded (st == MDS_OK)
+	 *   - mask carried MDS_ATTR_SIZE
+	 *   - we observed the pre-mutation inode (sa_pre_valid) so
+	 *     we can confirm the mutation targeted a regular file and
+	 *     the size actually changed (the setattr_is_noop check
+	 *     above already short-circuits identical-size SETATTRs)
+	 *   - cd->lr is wired (NULL-safe — unit-test path leaves it
+	 *     unset)
+	 *
+	 * The byte-range helper's same-client filter
+	 * (req_clientid == holder.clientid) skips the requesting
+	 * client's own layout, so a client that truncates its own
+	 * file does not recall its own grant.  layout_type=0 falls
+	 * back to the coordinator's default (LAYOUT4_FLEX_FILES).
+	 */
+	if (st == MDS_OK &&
+	    (op->arg.setattr.mask & MDS_ATTR_SIZE) != 0 &&
+	    sa_pre_valid &&
+	    sa_pre_inode.type == MDS_FTYPE_REG &&
+	    op->arg.setattr.attrs.size != sa_pre_inode.size &&
+	    cd->lr != NULL) {
+		(void)layout_recall_byte_range_for_holders(
+			cd->lr,
+			cd->current_fh.fileid,
+			cd->clientid,
+			LAYOUTIOMODE4_RW,    /* recall ANY holder */
+			0, UINT64_MAX,        /* whole file */
+			0,                    /* layout_type → default */
+			NULL);
+	}
 	if (st == MDS_OK && sa_pre_valid) {
 		setattr_quota_post(cd, op, &sa_pre_inode);
 	}
@@ -1429,6 +1475,35 @@ enum nfs4_status op_remove(struct compound_data *cd,
 			 * NULL-safe; no-op when delegations are disabled.
 			 */
 			deleg_revoke_file(cd->dt, rm_fileid);
+			/*
+			 * Mark Q5 P04 — layout-recall on final unlink.
+			 *
+			 * RFC 8881 §10.4.1 / §18.25: removing the last
+			 * link to a file with outstanding layouts requires
+			 * the server to recall those layouts so holders
+			 * stop issuing I/O against a fileid whose
+			 * underlying data is being reclaimed by ds_gc.
+			 * Done post-cat_remove so a failed namespace
+			 * mutation leaves layouts intact.  Best-effort:
+			 * the byte-range helper revokes the holder's
+			 * layout-state row regardless of CB delivery
+			 * outcome — holders that miss the CB observe
+			 * NFS4ERR_BAD_STATEID on their next LAYOUT* and
+			 * reissue.  Skipped on non-final unlinks: nlink>1
+			 * means the file persists under another name and
+			 * existing layouts remain valid (RFC 8881 §8.2.4).
+			 * NULL-safe; cd->lr unset on the unit-test path.
+			 */
+			if (cd->lr != NULL) {
+				(void)layout_recall_byte_range_for_holders(
+					cd->lr,
+					rm_fileid,
+					cd->clientid,
+					LAYOUTIOMODE4_RW,
+					0, UINT64_MAX,
+					0,
+					NULL);
+			}
 		}
 	}
 	return mds_status_to_nfs4(st);

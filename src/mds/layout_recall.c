@@ -858,7 +858,15 @@ int layout_recall_byte_range_for_holders(struct layout_recall *lr,
     col.req_iomode      = req_iomode;
     col.req_offset      = req_offset;
     col.req_length      = req_length;
-    col.req_layout_type = req_layout_type;
+    /*
+     * Callers that do not have an active LAYOUTGET request
+     * (op_setattr / op_remove) pass 0; substitute the coordinator
+     * default so the CB carries a non-zero clora_type the kernel
+     * client can decode.
+     */
+    col.req_layout_type = (req_layout_type != 0)
+                              ? req_layout_type
+                              : lr->default_layout_type;
     col.cat             = lr->cat;
 
     st = mds_coord_layout_iter_file(lr->cat, fileid,

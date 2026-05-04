@@ -980,6 +980,16 @@ deleg_grant_done:
 	/* Populate result and update current_fh. */
 	r->inode = inode;
 	cd->current_fh.fileid = target_fid;
+	/* FH-encoded subtree ownership (suggested by Gaurav Gangalwar's
+	 * code review): every claim path on op_open ends up with `inode`
+	 * fully populated for the target file (CLAIM_NULL after
+	 * lookup-or-create, CLAIM_FH after compound_inode_get,
+	 * CLAIM_PREVIOUS after the reclaim read).  Stamp the local mds_id
+	 * and copy the inode's generation so the GETFH that typically
+	 * follows OPEN emits the v1 wire form with full routing /
+	 * freshness metadata. */
+	cd->current_fh.owner_mds_id = cd->mds_id;
+	cd->current_fh.generation = inode.generation;
 	cd->current_fh_set = true;
 	/* Seed snapshot with the opened file's inode. */
 	cd->current_inode = inode;
@@ -1242,6 +1252,13 @@ enum nfs4_status op_openattr(struct compound_data *cd,
 
 	/* Set current_fh to the xattr namespace for this file. */
 	cd->current_fh.fileid = inode.fileid | XATTR_FH_FLAG;
+	/* FH-encoded subtree ownership: xattr namespace handles wrap
+	 * a base fileid that lives on this MDS — stamp owner_mds_id so a
+	 * subsequent GETFH on the xattr handle still routes correctly.
+	 * Generation stays 0: the synthetic xattr-namespace handle is
+	 * not an inode in its own right and has no on-disk generation. */
+	cd->current_fh.owner_mds_id = cd->mds_id;
+	cd->current_fh.generation = 0;
 	cd->xattr_obj_set = false;
 	memset(cd->xattr_name, 0, sizeof(cd->xattr_name));
 	return NFS4_OK;

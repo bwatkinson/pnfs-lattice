@@ -1110,6 +1110,105 @@ static void test_fh_state_machine(void)
 }
 
 /* -----------------------------------------------------------------------
+ * test_fh_owner_stamped — Gaurav Gangalwar's FH-encoded subtree
+ * ownership.  Asserts:
+ *   1. cd.mds_id == 0 (test default) keeps owner_mds_id == 0 on every
+ *      FH the server produces, so the encoder still emits the v0 wire
+ *      form (8-byte legacy FH).  This is the bit-for-bit
+ *      backward-compat guard for existing test fixtures.
+ *   2. cd.mds_id != 0 stamps owner_mds_id on PUTROOTFH, LOOKUP,
+ *      CREATE, and OPEN(CLAIM_NULL+create), so PUTFH-starting
+ *      compounds and the cross-MDS routing dispatcher can recover
+ *      ownership directly from the FH instead of relying on
+ *      compound-local path tracking.  generation is captured on the
+ *      LOOKUP / CREATE paths from the freshly-read inode.
+ * ----------------------------------------------------------------------- */
+
+static void test_fh_owner_stamped(void)
+{
+	struct mds_catalogue *db;
+	struct compound_data cd;
+	struct nfs4_op ops[8];
+	struct nfs4_result res[8];
+	uint32_t n;
+	char *path;
+
+	db = open_test_db(&path);
+
+	/* (1) mds_id == 0 → owner_mds_id stays 0 on every produced FH. */
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	/* cd.mds_id left at 0. */
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_getfh();
+
+	n = compound_process(&cd, ops, res, 3);
+	ASSERT_EQ(n, (uint32_t)3);
+	ASSERT_EQ(res[2].status, NFS4_OK);
+	ASSERT_EQ(res[2].res.getfh.fh.fileid, (uint64_t)MDS_FILEID_ROOT);
+	ASSERT_EQ(res[2].res.getfh.fh.owner_mds_id, (uint32_t)0);
+
+	/* (2) mds_id != 0 → owner_mds_id stamped on PUTROOTFH.  Pick 7
+	 *     (any non-zero value works; 7 was chosen to be unmistakably
+	 *     non-default so a regression that drops the stamping is
+	 *     immediately obvious in the failure message). */
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	cd.mds_id = 7;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_getfh();
+
+	n = compound_process(&cd, ops, res, 3);
+	ASSERT_EQ(n, (uint32_t)3);
+	ASSERT_EQ(res[2].status, NFS4_OK);
+	ASSERT_EQ(res[2].res.getfh.fh.fileid, (uint64_t)MDS_FILEID_ROOT);
+	ASSERT_EQ(res[2].res.getfh.fh.owner_mds_id, (uint32_t)7);
+
+	/* (3) mds_id stamped on CREATE + the FH transition that follows. */
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	cd.mds_id = 7;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_create("owner_test_file", MDS_FTYPE_REG, 0644);
+	ops[3] = mk_getfh();
+
+	n = compound_process(&cd, ops, res, 4);
+	ASSERT_EQ(n, (uint32_t)4);
+	ASSERT_EQ(res[2].status, NFS4_OK);
+	ASSERT_EQ(res[3].status, NFS4_OK);
+	ASSERT_EQ(res[3].res.getfh.fh.owner_mds_id, (uint32_t)7);
+	ASSERT_EQ(res[3].res.getfh.fh.fileid,
+		  res[2].res.create.inode.fileid);
+	ASSERT_EQ(res[3].res.getfh.fh.generation,
+		  res[2].res.create.inode.generation);
+
+	/* (4) mds_id stamped on LOOKUP. */
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	cd.mds_id = 7;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_lookup("owner_test_file");
+	ops[3] = mk_getfh();
+
+	n = compound_process(&cd, ops, res, 4);
+	ASSERT_EQ(n, (uint32_t)4);
+	ASSERT_EQ(res[2].status, NFS4_OK);
+	ASSERT_EQ(res[3].status, NFS4_OK);
+	ASSERT_EQ(res[3].res.getfh.fh.owner_mds_id, (uint32_t)7);
+	ASSERT_NE(res[3].res.getfh.fh.fileid, (uint64_t)MDS_FILEID_ROOT);
+
+	close_test_db(db, path);
+}
+
+/* -----------------------------------------------------------------------
  * test_stop_on_error — error aborts remaining ops
  * ----------------------------------------------------------------------- */
 
@@ -3768,6 +3867,7 @@ int main(void)
 	RUN_TEST(test_link);
 	RUN_TEST(test_setattr);
 	RUN_TEST(test_fh_state_machine);
+	RUN_TEST(test_fh_owner_stamped);
 	RUN_TEST(test_stop_on_error);
 	RUN_TEST(test_nofilehandle);
 	RUN_TEST(test_putfh_invalid);

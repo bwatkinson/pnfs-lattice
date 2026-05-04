@@ -178,6 +178,13 @@ enum nfs4_status op_putrootfh(struct compound_data *cd,
 	(void)op;
 	(void)res;
 	cd->current_fh.fileid = MDS_FILEID_ROOT;
+	/* FH-encoded subtree ownership (suggested by Gaurav Gangalwar's
+	 * code review): stamp the local MDS id on every FH we hand out
+	 * so that PUTFH-starting compounds and longest-prefix path checks
+	 * can resolve the owning node directly from the FH.  Generation
+	 * is 0 for the root inode (no on-disk generation tracked). */
+	cd->current_fh.owner_mds_id = cd->mds_id;
+	cd->current_fh.generation = 0;
 	cd->current_fh_set = true;
 	(void)snprintf(cd->current_path, sizeof(cd->current_path), "/");
 	resolve_and_apply_shard(cd, cd->current_path);
@@ -409,6 +416,18 @@ enum nfs4_status op_lookup(struct compound_data *cd,
 					if (ts != NULL) {
 						apply_shard(cd, ts);
 						cd->current_fh.fileid = ext_fid;
+						/* FH-encoded subtree ownership: shards
+						 * are intra-MDS, so the FH still belongs
+						 * to this MDS even after a cross-shard
+						 * hop.  Stamp local mds_id; we do not have
+						 * the target inode's generation here
+						 * (the ext_dirent path returns no inode),
+						 * leave it 0 so the encoder treats it as
+						 * unspecified — consistent with v0
+						 * legacy behaviour for these synthetic
+						 * cross-shard handles. */
+						cd->current_fh.owner_mds_id = cd->mds_id;
+						cd->current_fh.generation = 0;
 						cd->current_fh_set = true;
 						/* Path tracking: append name. */
 						{
@@ -478,7 +497,14 @@ not_junction: ;
 	}
 
 	cd->current_fh.fileid = child.fileid;
-	cd->current_fh.owner_mds_id = 0; /* Default: local */
+	/* FH-encoded subtree ownership (suggested by Gaurav Gangalwar's
+	 * code review): stamp the local MDS id so PUTFH-starting compounds
+	 * and the cross-MDS routing block (compound.c MOVED dispatch) can
+	 * recover ownership directly from the FH instead of relying on
+	 * compound-local path tracking that does not survive across
+	 * COMPOUND boundaries.  Local LOOKUP — owner is this MDS.  The
+	 * child's generation comes from the catalogue read above. */
+	cd->current_fh.owner_mds_id = cd->mds_id;
 	cd->current_fh.generation = child.generation;
 	/* Seed snapshot with authoritative child inode from normal
 	 * dirent path (NOT ext_dirent synthetic inodes). */
@@ -1209,6 +1235,12 @@ enum nfs4_status op_create(struct compound_data *cd,
 
 	/* Per RFC 8881: CREATE changes the current FH to the new object. */
 	cd->current_fh.fileid = res->res.create.inode.fileid;
+	/* FH-encoded subtree ownership: the just-created inode lives on
+	 * this MDS — stamp owner_mds_id and copy the freshly-allocated
+	 * generation so the FH we emit on a subsequent GETFH carries
+	 * full v1 routing/freshness metadata. */
+	cd->current_fh.owner_mds_id = cd->mds_id;
+	cd->current_fh.generation = res->res.create.inode.generation;
 	cd->current_inode = res->res.create.inode;
 	cd->current_inode_valid = true;
 	compound_ro_txn_reset(cd);
@@ -2313,6 +2345,11 @@ enum nfs4_status op_lookupp(struct compound_data *cd,
 	}
 
 	cd->current_fh.fileid = inode.parent_fileid;
+	/* FH-encoded subtree ownership: the parent of a local inode is
+	 * itself local on this MDS.  Stamp owner_mds_id; generation is
+	 * filled in below once we have re-read the parent inode. */
+	cd->current_fh.owner_mds_id = cd->mds_id;
+	cd->current_fh.generation = 0;
 	/* Update current_path when known. */
 	if (cd->current_path[0] != '\0') {
 		char *slash;
@@ -2356,6 +2393,10 @@ enum nfs4_status op_lookupp(struct compound_data *cd,
 		}
 		cd->current_inode = parent;
 		cd->current_inode_valid = true;
+		/* Now that we have read the parent, stamp its generation
+		 * onto the current FH so subsequent GETFH emits the
+		 * correct v1 form. */
+		cd->current_fh.generation = parent.generation;
 	}
 
 	return NFS4_OK;

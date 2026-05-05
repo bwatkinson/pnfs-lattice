@@ -110,6 +110,9 @@ enum nfs4_status {
 	NFS4ERR_RETRY_UNCACHED_REP = 10068,
 	NFS4ERR_SEQ_FALSE_RETRY   = 10076,
 	NFS4ERR_LAYOUTUNAVAILABLE = 10058,
+	/* RFC 5661 §15.1.10.10 — client CB_LAYOUTRECALL response indicating
+	 * I/O in flight; server must NOT preemptively revoke. */
+	NFS4ERR_RECALLCONFLICT    = 10061,
 	/* RFC 5661 §15.1 numeric values are authoritative.  Earlier
 	 * revisions of this enum used the wrong codes for NAMETOOLONG
 	 * (was 10110) and REQ_TOO_BIG (was 10041 — which is actually

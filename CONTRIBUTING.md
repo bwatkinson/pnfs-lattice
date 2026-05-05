@@ -42,7 +42,7 @@ We follow the Linux kernel coding style with the following specifics:
 
 ## 2. Compiler Discipline
 
-All code **must** compile cleanly with:
+All code **must** compile cleanly with GCC 12.1 or later:
 
 ```
 -std=c11 -Wall -Wextra -Werror -Wshadow -Wstrict-prototypes

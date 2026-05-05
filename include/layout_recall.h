@@ -202,4 +202,17 @@ struct mds_shard;
 void layout_recall_set_shard(struct layout_recall *lr,
                              const struct mds_shard *shard);
 
+/* -----------------------------------------------------------------------
+ * Layout-stateid seqid tracker (compound_layout.c).
+ *
+ * These are defined in compound_layout.c and used by layout_recall.c
+ * for CB_LAYOUTRECALL stateid management.  Not static because they
+ * cross translation-unit boundaries within the same static library.
+ * ----------------------------------------------------------------------- */
+void layout_seqid_advance(const uint8_t other[12],
+                          bool *hit, uint32_t *next_seqid);
+void layout_seqid_record_at(const uint8_t other[12], uint32_t seqid);
+bool layout_seqid_peek(const uint8_t other[12], uint32_t *cur_seqid);
+void layout_seqid_remove(const uint8_t other[12]);
+
 #endif /* LAYOUT_RECALL_H */

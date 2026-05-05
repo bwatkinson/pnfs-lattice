@@ -210,13 +210,55 @@ static void layout_seqid_record_new(const uint8_t other[NFS4_OTHER_SIZE])
 }
 
 /*
+ * Upsert: set the in-memory tracker's seqid for @other to exactly
+ * @seqid.  Inserts a fresh entry if none exists; updates the existing
+ * entry's seqid if it does.  Used by layout_recall.c for
+ * CB_LAYOUTRECALL stateid management.
+ */
+void layout_seqid_record_at(const uint8_t other[NFS4_OTHER_SIZE],
+			    uint32_t seqid)
+{
+	uint32_t bucket;
+	uint32_t stripe;
+	struct layout_seqid_entry *e;
+
+	if (seqid == 0U) {
+		seqid = 1U;
+	}
+
+	(void)pthread_once(&g_layout_seqid_init_once, layout_seqid_init);
+
+	bucket = layout_seqid_hash(other);
+	stripe = bucket % LAYOUT_SEQID_STRIPES;
+	pthread_mutex_lock(&g_layout_seqid_locks[stripe]);
+	for (e = g_layout_seqid_buckets[bucket]; e != NULL; e = e->hash_next) {
+		if (memcmp(e->other, other, NFS4_OTHER_SIZE) == 0) {
+			if (seqid > e->seqid) {
+				e->seqid = seqid;
+			}
+			pthread_mutex_unlock(
+				&g_layout_seqid_locks[stripe]);
+			return;
+		}
+	}
+	e = calloc(1, sizeof(*e));
+	if (e != NULL) {
+		memcpy(e->other, other, NFS4_OTHER_SIZE);
+		e->seqid = seqid;
+		e->hash_next = g_layout_seqid_buckets[bucket];
+		g_layout_seqid_buckets[bucket] = e;
+	}
+	pthread_mutex_unlock(&g_layout_seqid_locks[stripe]);
+}
+
+/*
  * Look up @other in the table.  On hit, advance the stored seqid by
  * one (with 0xFFFFFFFF → 1 wrap per RFC 8881 §8.2.2) and return the
  * NEW seqid via @next_seqid; sets *@hit = true.  On miss, *@hit =
  * false and @next_seqid is untouched.
  */
-static void layout_seqid_advance(const uint8_t other[NFS4_OTHER_SIZE],
-				bool *hit, uint32_t *next_seqid)
+void layout_seqid_advance(const uint8_t other[NFS4_OTHER_SIZE],
+			  bool *hit, uint32_t *next_seqid)
 {
 	uint32_t bucket;
 	uint32_t stripe;
@@ -253,8 +295,8 @@ static void layout_seqid_advance(const uint8_t other[NFS4_OTHER_SIZE],
  * Returns true on hit (sets *cur_seqid); false on miss (caller decides
  * whether to treat that as BAD_STATEID or accept by other validation).
  */
-static bool layout_seqid_peek(const uint8_t other[NFS4_OTHER_SIZE],
-			      uint32_t *cur_seqid)
+bool layout_seqid_peek(const uint8_t other[NFS4_OTHER_SIZE],
+		       uint32_t *cur_seqid)
 {
 	uint32_t bucket;
 	uint32_t stripe;
@@ -283,7 +325,7 @@ static bool layout_seqid_peek(const uint8_t other[NFS4_OTHER_SIZE],
  * subsequent op presenting the now-returned stateid sees a clean
  * miss — the caller decides whether that is BAD_STATEID or a fresh
  * grant. */
-static void layout_seqid_remove(const uint8_t other[NFS4_OTHER_SIZE])
+void layout_seqid_remove(const uint8_t other[NFS4_OTHER_SIZE])
 {
 	uint32_t bucket;
 	uint32_t stripe;

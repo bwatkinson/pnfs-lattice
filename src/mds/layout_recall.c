@@ -24,10 +24,12 @@
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <unistd.h>
+#include <limits.h>  /* INT_MIN — sentinel for cb_status "not sent" */
 
 #include "layout_recall.h"
-#include "layout_types.h"  /* LAYOUT4_FLEX_FILES default */
+#include "compound_internal.h" /* layout_seqid_* */
 #include "mds_catalogue.h"
 #include "mds_coordination.h"
 #include "commit_queue.h"
@@ -194,6 +196,7 @@ static void attempt_cb_for_target(const struct cb_target *t,
      * report (bugs from mark/STRICT_ANALYSIS.md).  We therefore
      * advertise the coordinator's default layout_type rather than
      * the previous hard-coded LAYOUT4_NFSV4_1_FILES (1). */
+
     memset(&args, 0, sizeof(args));
     args.layout_type = layout_type;
     args.iomode = 3;       /* LAYOUTIOMODE4_ANY */
@@ -649,6 +652,7 @@ struct byte_range_holder {
     uint64_t            length;
     uint64_t            recall_offset;
     uint64_t            recall_length;
+    bool                send_cb;
     /*
      * Layout type echoed in CB_LAYOUTRECALL.clora_type for this
      * holder.  The catalogue layer does not persist per-grant
@@ -675,6 +679,10 @@ struct byte_range_collect_ctx {
     uint64_t                  req_length;
     uint32_t                  req_layout_type;
     struct mds_catalogue     *cat;
+    bool                      skip_req_client;
+    bool                      require_iomode_conflict;
+    bool                      require_range_overlap;
+    bool                      keep_duplicate_rows;
 };
 
 /*
@@ -696,18 +704,33 @@ static int byte_range_collect_cb(uint64_t clientid,
     uint64_t scratch_fileid = 0;
     uint32_t scratch_iomode = 0;
     uint32_t scratch_seqid = 0;
+    uint32_t latest_seqid = 0;
+    struct nfs4_stateid effective_stateid;
     enum mds_status st;
 
     if (c == NULL || stateid == NULL) {
         return 0;
     }
-    if (clientid == c->req_clientid) {
+    effective_stateid = *stateid;
+    /* DEBUG-RECALL: log every holder seen for this fileid. */
+    (void)fprintf(stderr,
+        "DBG-RECALL: iter fileid=%llu  holder_clientid=0x%llx "
+        "req_clientid=0x%llx holder_iomode=%u req_iomode=%u\n",
+        (unsigned long long)c->fileid,
+        (unsigned long long)clientid,
+        (unsigned long long)c->req_clientid,
+        iomode, c->req_iomode);
+    if (c->skip_req_client && clientid == c->req_clientid) {
+        (void)fprintf(stderr, "DBG-RECALL:  -> SKIP self\n");
         return 0; /* self — skip */
     }
-    if (!iomode_conflicts(iomode, c->req_iomode)) {
+    if (c->require_iomode_conflict &&
+        !iomode_conflicts(iomode, c->req_iomode)) {
+        (void)fprintf(stderr, "DBG-RECALL:  -> SKIP iomode-no-conflict\n");
         return 0;
     }
     if (c->count >= c->capacity) {
+        (void)fprintf(stderr, "DBG-RECALL:  -> STOP capacity reached\n");
         return 1; /* stop scan; defer surplus to next call */
     }
 
@@ -724,26 +747,103 @@ static int byte_range_collect_cb(uint64_t clientid,
              * whole-file recall to be safe. */
             hold_off = 0;
             hold_len = UINT64_MAX;
+        } else if (scratch_seqid > effective_stateid.seqid) {
+            effective_stateid.seqid = scratch_seqid;
         }
     } else {
         hold_off = 0;
         hold_len = UINT64_MAX;
     }
 
-    if (!range_intersect(c->req_offset, c->req_length,
-                          hold_off, hold_len,
-                          &inter_off, &inter_len)) {
-        return 0; /* disjoint ranges — no conflict */
+    if (layout_seqid_peek(effective_stateid.other, &latest_seqid) &&
+        latest_seqid > effective_stateid.seqid) {
+        (void)fprintf(stderr,
+            "DBG-RECALL:  -> stateid seqid clamp row=%u latest=%u\n",
+            effective_stateid.seqid, latest_seqid);
+        effective_stateid.seqid = latest_seqid;
+    }
+
+    (void)fprintf(stderr,
+        "DBG-RECALL:  -> stateid_lookup hold_off=%llu hold_len=%llu "
+        "req_off=%llu req_len=%llu\n",
+        (unsigned long long)hold_off, (unsigned long long)hold_len,
+        (unsigned long long)c->req_offset,
+        (unsigned long long)c->req_length);
+    if (c->require_range_overlap) {
+        if (!range_intersect(c->req_offset, c->req_length,
+                              hold_off, hold_len,
+                              &inter_off, &inter_len)) {
+            (void)fprintf(stderr, "DBG-RECALL:  -> SKIP disjoint range\n");
+            return 0; /* disjoint ranges — no conflict */
+        }
+    } else {
+        inter_off = c->req_offset;
+        inter_len = c->req_length;
+    }
+    (void)fprintf(stderr,
+        "DBG-RECALL:  -> ACCEPT inter_off=%llu inter_len=%llu\n",
+        (unsigned long long)inter_off, (unsigned long long)inter_len);
+
+    /*
+     * Dedupe by clientid (Mark's MDS_BUGS_2026-05-04 Bug A defensive
+     * guard).  Step 3 of layout_pick_stateid prevents new duplicate
+     * rows from being persisted on the grant path; this guard handles
+     * the rows that were already persisted by older daemon builds and
+     * have not yet been cycled out by client LAYOUTRETURN / lease
+     * expiry.  Without this dedupe the helper would issue one CB per
+     * legacy row, and at least N-1 of them would carry a stateid the
+     * client no longer recognises (rejected with NFS4ERR_OLD_STATEID
+     * / NFS4ERR_BAD_STATEID).
+     *
+     * Behaviour: if a holder entry already exists for this clientid,
+     * keep the row with the highest stateid->seqid — most recent
+     * grant.  Discard older rows: their stateids are dead from the
+     * client's perspective.
+     */
+    bool send_cb = true;
+    for (uint32_t k = 0; k < c->count; k++) {
+        if (c->holders[k].clientid != clientid) {
+            continue;
+        }
+        if (!c->keep_duplicate_rows) {
+            if (effective_stateid.seqid > c->holders[k].stateid.seqid) {
+                c->holders[k].stateid       = effective_stateid;
+                c->holders[k].iomode        = iomode;
+                c->holders[k].offset        = hold_off;
+                c->holders[k].length        = hold_len;
+                c->holders[k].recall_offset = inter_off;
+                c->holders[k].recall_length = inter_len;
+                c->holders[k].send_cb       = true;
+                c->holders[k].layout_type   = c->req_layout_type;
+                (void)fprintf(stderr,
+                    "DBG-RECALL:  -> DEDUP replaced "
+                    "holder[%u] (higher seqid)\n", k);
+            } else {
+                (void)fprintf(stderr,
+                    "DBG-RECALL:  -> DEDUP kept "
+                    "holder[%u] (existing seqid >=)\n", k);
+            }
+            return 0;
+        }
+
+        if (effective_stateid.seqid > c->holders[k].stateid.seqid) {
+            if (c->holders[k].send_cb) {
+                c->holders[k].send_cb = false;
+            }
+        } else if (c->holders[k].send_cb) {
+            send_cb = false;
+        }
     }
 
     c->holders[c->count].clientid       = clientid;
     c->holders[c->count].fileid         = c->fileid;
-    c->holders[c->count].stateid        = *stateid;
+    c->holders[c->count].stateid        = effective_stateid;
     c->holders[c->count].iomode         = iomode;
     c->holders[c->count].offset         = hold_off;
     c->holders[c->count].length         = hold_len;
     c->holders[c->count].recall_offset  = inter_off;
     c->holders[c->count].recall_length  = inter_len;
+    c->holders[c->count].send_cb        = send_cb;
     c->holders[c->count].layout_type    = c->req_layout_type;
     c->count++;
     return 0;
@@ -753,10 +853,42 @@ static int byte_range_collect_cb(uint64_t clientid,
  * Per-holder CB context.  Only one holder is sent per
  * session_for_each_with_cb_for_clientid() invocation — the iterator
  * stops at the first session it visits for the holder's clientid.
+ *
+ * RFC 5661 §20.4.2.1 / §15.1.10.10 — the kernel client may answer a
+ * CB_LAYOUTRECALL with NFS4ERR_DELAY or NFS4ERR_RECALLCONFLICT to mean
+ * "I have I/O in flight, I will send LAYOUTRETURN as soon as it
+ * drains."  These are transient responses, NOT terminal failures, and
+ * the server MUST NOT preemptively revoke the layout-state row — if
+ * it does, the client's subsequent LAYOUTCOMMIT/LAYOUTRETURN hits
+ * NFS4ERR_BAD_STATEID and the kernel can spin on retransmits (this is
+ * exactly the P05_disjoint_ranges hang in Mark's harness).  cb_status
+ * is filled in by byte_range_cb_one_holder so the dispatch loop can
+ * skip the revoke on those transient codes.
+ *
+ * Encoding:
+ *   cb_status == 0          — client accepted the recall (NFS4_OK);
+ *                              the client will send LAYOUTRETURN.
+ *                              Skip revoke.
+ *   cb_status > 0           — NFS4ERR_* status from the client.
+ *                              Skip revoke for DELAY (10008) and
+ *                              RECALLCONFLICT (10061); revoke for any
+ *                              other terminal status (e.g. BADSESSION,
+ *                              NOMATCHING_LAYOUT, BADHANDLE,
+ *                              BAD_STATEID, OLD_STATEID).
+ *   cb_status < 0           — negative errno from the transport
+ *                              (-EIO, -ETIMEDOUT, -ENOTCONN, -EINVAL):
+ *                              the CB never reached the client or the
+ *                              reply was malformed.  Revoke.
+ *   cb_status == CB_NOT_SENT — sentinel set by the iterator when
+ *                              there is no live backchannel for this
+ *                              clientid (no session, no cb_conn, dup
+ *                              failed).  Revoke.
  */
+#define CB_NOT_SENT  (INT_MIN)
 struct byte_range_one_cb_ctx {
     const struct byte_range_holder *holder;
     uint32_t                        timeout_ms;
+    int                             cb_status;
 };
 
 static int byte_range_cb_one_holder(const struct session_cb_snap *snap,
@@ -764,26 +896,63 @@ static int byte_range_cb_one_holder(const struct session_cb_snap *snap,
 {
     struct byte_range_one_cb_ctx *c = ctx;
     struct nfs4_cb_layoutrecall_args args;
+    struct nfs4_stateid recall_stateid;
+    uint32_t recall_seqid = 0;
+    bool seqid_hit = false;
     int fd;
     int dup_fd;
     int rc;
 
     if (snap == NULL || c == NULL || c->holder == NULL) {
+        (void)fprintf(stderr, "DBG-RECALL: cb_one_holder NULL arg snap=%p ctx=%p\n", (void*)snap, (void*)c);
         return 0;
     }
+    (void)fprintf(stderr,
+        "DBG-RECALL: cb_one_holder snap.clientid=0x%llx holder.clientid=0x%llx cb_conn=%p\n",
+        (unsigned long long)snap->clientid,
+        (unsigned long long)c->holder->clientid,
+        (void*)snap->cb_conn);
     /* Defensive: per-clientid iterator already filters by clientid,
      * but a same-process race could in theory invoke this from the
      * global iterator path — keep the explicit check. */
     if (c->holder->clientid != snap->clientid) {
+        (void)fprintf(stderr, "DBG-RECALL:  -> SKIP clientid mismatch\n");
         return 0;
     }
     fd = rpc_conn_get_fd(snap->cb_conn);
+    (void)fprintf(stderr, "DBG-RECALL:  -> rpc_conn_get_fd = %d\n", fd);
     if (fd < 0) {
+        (void)fprintf(stderr, "DBG-RECALL:  -> SKIP no backchannel fd\n");
+        /* No live backchannel — caller must revoke; we cannot
+         * deliver the recall.  The kernel will discover the
+         * revoke on its next op against the layout stateid. */
+        c->cb_status = CB_NOT_SENT;
         return 0;
     }
     dup_fd = dup(fd);
     if (dup_fd < 0) {
+        (void)fprintf(stderr, "DBG-RECALL:  -> SKIP dup failed errno=%d\n", errno);
+        c->cb_status = CB_NOT_SENT;
         return 0;
+    }
+    /*
+     * RFC 8881 §12.5.3: CB_LAYOUTRECALL is one of the operations
+     * that advances the layout stateid seqid.  The holder row carries
+     * the latest seqid issued by LAYOUTGET/LAYOUTRETURN; the recall
+     * itself must send the next value, otherwise Linux rejects the CB
+     * with NFS4ERR_OLD_STATEID and never returns the layout.
+     */
+    recall_stateid = c->holder->stateid;
+    layout_seqid_record_at(recall_stateid.other, recall_stateid.seqid);
+    layout_seqid_advance(recall_stateid.other, &seqid_hit, &recall_seqid);
+    if (seqid_hit) {
+        recall_stateid.seqid = recall_seqid;
+    } else {
+        recall_stateid.seqid++;
+        if (recall_stateid.seqid == 0) {
+            recall_stateid.seqid = 1;
+        }
+        layout_seqid_record_at(recall_stateid.other, recall_stateid.seqid);
     }
 
     memset(&args, 0, sizeof(args));
@@ -791,21 +960,27 @@ static int byte_range_cb_one_holder(const struct session_cb_snap *snap,
     args.iomode      = c->holder->iomode;
     args.recall_type = LAYOUTRECALL4_FILE;
     args.fileid      = c->holder->fileid;
-    args.stateid     = c->holder->stateid;
+    args.stateid     = recall_stateid;
     args.offset      = c->holder->recall_offset;
     args.length      = c->holder->recall_length;
 
+    (void)fprintf(stderr,
+        "DBG-RECALL:  -> sending CB_LAYOUTRECALL fd=%d cb_prog=%u "
+        "slot_seq=%u layout_seq=%u\n",
+        dup_fd, snap->cb_prog, snap->slot_seq_id, args.stateid.seqid);
     rc = nfs4_cb_layoutrecall_fd(dup_fd, snap->session_id,
                                  snap->cb_prog,
                                  snap->slot_seq_id,
                                  1, snap->minorversion,
                                  &snap->cb_sec,
                                  &args, c->timeout_ms);
+    (void)fprintf(stderr, "DBG-RECALL:  -> nfs4_cb_layoutrecall_fd rc=%d\n", rc);
+    c->cb_status = rc;
     if (rc != 0) {
         (void)fprintf(stderr,
             "layout_recall: byte-range CB_LAYOUTRECALL "
             "clientid=%llu fileid=%llu off=%llu len=%llu "
-            "rc=%d \u2014 revoking\n",
+            "rc=%d\n",
             (unsigned long long)c->holder->clientid,
             (unsigned long long)c->holder->fileid,
             (unsigned long long)args.offset,
@@ -825,6 +1000,223 @@ static int byte_range_cb_one_holder(const struct session_cb_snap *snap,
     return 1;
 }
 
+static int byte_range_collect_holders(struct layout_recall *lr,
+                                      uint64_t fileid,
+                                      uint64_t req_clientid,
+                                      uint32_t req_iomode,
+                                      uint64_t req_offset,
+                                      uint64_t req_length,
+                                      uint32_t req_layout_type,
+                                      bool skip_req_client,
+                                      bool require_iomode_conflict,
+                                      bool require_range_overlap,
+                                      bool keep_duplicate_rows,
+                                      struct byte_range_holder *holders,
+                                      uint32_t holder_capacity,
+                                      uint32_t *holder_count_out)
+{
+    struct byte_range_collect_ctx col;
+    enum mds_status st;
+
+    if (holder_count_out != NULL) {
+        *holder_count_out = 0;
+    }
+    if (lr == NULL || holders == NULL || holder_count_out == NULL) {
+        return -EINVAL;
+    }
+    if (lr->cat == NULL) {
+        return 0;
+    }
+
+    memset(&col, 0, sizeof(col));
+    col.holders                 = holders;
+    col.capacity                = holder_capacity;
+    col.fileid                  = fileid;
+    col.req_clientid            = req_clientid;
+    col.req_iomode              = req_iomode;
+    col.req_offset              = req_offset;
+    col.req_length              = req_length;
+    col.req_layout_type         = (req_layout_type != 0)
+                                      ? req_layout_type
+                                      : lr->default_layout_type;
+    col.cat                     = lr->cat;
+    col.skip_req_client         = skip_req_client;
+    col.require_iomode_conflict = require_iomode_conflict;
+    col.require_range_overlap   = require_range_overlap;
+    col.keep_duplicate_rows     = keep_duplicate_rows;
+
+    st = mds_coord_layout_iter_file(lr->cat, fileid,
+                                     byte_range_collect_cb, &col);
+    (void)fprintf(stderr,
+        "DBG-RECALL: iter_file rc=%d  collected=%u\n",
+        (int)st, col.count);
+    if (st != MDS_OK && st != MDS_ERR_NOTFOUND) {
+        return -EIO;
+    }
+
+    *holder_count_out = col.count;
+    return 0;
+}
+
+static void byte_range_dispatch_cb_each(struct layout_recall *lr,
+                                        const struct byte_range_holder *holders,
+                                        uint32_t holder_count,
+                                        int *cb_status)
+{
+    uint32_t i;
+
+    if (cb_status == NULL) {
+        return;
+    }
+    for (i = 0; i < holder_count; i++) {
+        cb_status[i] = CB_NOT_SENT;
+    }
+    if (lr == NULL || holders == NULL) {
+        return;
+    }
+
+    (void)fprintf(stderr, "DBG-RECALL: dispatch lr->st=%p col.count=%u\n",
+        (void *)lr->st, holder_count);
+    if (lr->st == NULL) {
+        return;
+    }
+
+    for (i = 0; i < holder_count; i++) {
+        struct byte_range_one_cb_ctx one_ctx = {
+            .holder = &holders[i],
+            .timeout_ms = lr->revoke_ms,
+            .cb_status = CB_NOT_SENT,
+        };
+        int n;
+
+        if (!holders[i].send_cb) {
+            (void)fprintf(stderr,
+                "DBG-RECALL:  -> SKIP duplicate CB holder[%u] "
+                "clientid=0x%llx fileid=%llu\n",
+                i,
+                (unsigned long long)holders[i].clientid,
+                (unsigned long long)holders[i].fileid);
+            continue;
+        }
+
+        (void)fprintf(stderr,
+            "DBG-RECALL: session_for_each_with_cb_for_clientid "
+            "holder[%u].clientid=0x%llx\n",
+            i, (unsigned long long)holders[i].clientid);
+        n = session_for_each_with_cb_for_clientid(
+            lr->st, holders[i].clientid,
+            byte_range_cb_one_holder, &one_ctx);
+        (void)fprintf(stderr,
+            "DBG-RECALL:  -> session iterator returned n=%d "
+            "cb_status=%d\n", n, one_ctx.cb_status);
+        cb_status[i] = one_ctx.cb_status;
+    }
+}
+
+static bool byte_range_cb_status_transient(int cb_status)
+{
+    return (cb_status == 0) ||
+           (cb_status == (int)NFS4ERR_DELAY) ||
+           (cb_status == (int)NFS4ERR_RECALLCONFLICT);
+}
+
+static void byte_range_revoke_holders(struct layout_recall *lr,
+                                      const struct byte_range_holder *holders,
+                                      uint32_t holder_count,
+                                      const int *cb_status,
+                                      bool revoke_transient)
+{
+    uint32_t i;
+
+    if (lr == NULL || holders == NULL) {
+        return;
+    }
+
+    for (i = 0; i < holder_count; i++) {
+        const int s = (cb_status != NULL) ? cb_status[i] : CB_NOT_SENT;
+
+        if (!revoke_transient && byte_range_cb_status_transient(s)) {
+            (void)fprintf(stderr,
+                "DBG-RECALL:  -> SKIP revoke holder[%u] "
+                "clientid=0x%llx fileid=%llu cb_status=%d "
+                "(transient \\u2014 awaiting LAYOUTRETURN)\n",
+                i,
+                (unsigned long long)holders[i].clientid,
+                (unsigned long long)holders[i].fileid, s);
+            continue;
+        }
+
+        (void)fprintf(stderr,
+            "DBG-RECALL:  -> revoke holder[%u] "
+            "clientid=0x%llx fileid=%llu cb_status=%d%s\n",
+            i,
+            (unsigned long long)holders[i].clientid,
+            (unsigned long long)holders[i].fileid, s,
+            revoke_transient ? " (forced)" : "");
+        revoke_layout(lr, holders[i].stateid.other,
+                      holders[i].clientid, holders[i].fileid, 0);
+        layout_seqid_remove(holders[i].stateid.other);
+    }
+}
+
+int layout_recall_revoke_all_for_unlink(struct layout_recall *lr,
+                                        uint64_t fileid,
+                                        uint32_t *recalled_out)
+{
+    struct byte_range_holder holders[LAYOUT_BYTE_RANGE_MAX_HOLDERS];
+    int cb_status[LAYOUT_BYTE_RANGE_MAX_HOLDERS];
+    uint32_t holder_count = 0;
+    int rc;
+
+    if (recalled_out != NULL) {
+        *recalled_out = 0;
+    }
+    if (lr == NULL) {
+        return -EINVAL;
+    }
+    if (lr->cat == NULL) {
+        return 0;
+    }
+
+    /*
+     * Final unlink is stronger than ordinary byte-range conflict
+     * recall: every layout for the file is invalid once the final
+     * namespace entry is removed.  Do not skip the requester, do not
+     * filter by iomode, and do not preserve rows when the client
+     * reports NFS4_OK / NFS4ERR_DELAY / NFS4ERR_RECALLCONFLICT.
+     *
+     * The callback is still useful: Linux gets a normal FILE recall
+     * while PUTFH can still resolve the object.  The authoritative
+     * row delete below is what prevents a later LAYOUTRETURN from
+     * driving PUTFH on a now-stale fileid into migration recovery.
+     */
+    (void)fprintf(stderr,
+        "DBG-RECALL: unlink-helper-entry fileid=%llu\n",
+        (unsigned long long)fileid);
+    rc = byte_range_collect_holders(lr, fileid, 0,
+                                    LAYOUTIOMODE4_ANY,
+                                    0, UINT64_MAX,
+                                    0,
+                                    false, false, false, true,
+                                    holders,
+                                    LAYOUT_BYTE_RANGE_MAX_HOLDERS,
+                                    &holder_count);
+    if (rc != 0) {
+        return rc;
+    }
+    if (holder_count == 0) {
+        return 0;
+    }
+
+    byte_range_dispatch_cb_each(lr, holders, holder_count, cb_status);
+    byte_range_revoke_holders(lr, holders, holder_count, cb_status, true);
+
+    if (recalled_out != NULL) {
+        *recalled_out = holder_count;
+    }
+    return 0;
+}
+
 int layout_recall_byte_range_for_holders(struct layout_recall *lr,
                                          uint64_t fileid,
                                          uint64_t req_clientid,
@@ -835,9 +1227,9 @@ int layout_recall_byte_range_for_holders(struct layout_recall *lr,
                                          uint32_t *recalled_out)
 {
     struct byte_range_holder holders[LAYOUT_BYTE_RANGE_MAX_HOLDERS];
-    struct byte_range_collect_ctx col;
-    enum mds_status st;
-    uint32_t i;
+    int cb_status[LAYOUT_BYTE_RANGE_MAX_HOLDERS];
+    uint32_t holder_count = 0;
+    int rc;
 
     if (recalled_out != NULL) {
         *recalled_out = 0;
@@ -850,31 +1242,27 @@ int layout_recall_byte_range_for_holders(struct layout_recall *lr,
         return 0;
     }
 
-    memset(&col, 0, sizeof(col));
-    col.holders         = holders;
-    col.capacity        = LAYOUT_BYTE_RANGE_MAX_HOLDERS;
-    col.fileid          = fileid;
-    col.req_clientid    = req_clientid;
-    col.req_iomode      = req_iomode;
-    col.req_offset      = req_offset;
-    col.req_length      = req_length;
-    /*
-     * Callers that do not have an active LAYOUTGET request
-     * (op_setattr / op_remove) pass 0; substitute the coordinator
-     * default so the CB carries a non-zero clora_type the kernel
-     * client can decode.
-     */
-    col.req_layout_type = (req_layout_type != 0)
-                              ? req_layout_type
-                              : lr->default_layout_type;
-    col.cat             = lr->cat;
-
-    st = mds_coord_layout_iter_file(lr->cat, fileid,
-                                     byte_range_collect_cb, &col);
-    if (st != MDS_OK && st != MDS_ERR_NOTFOUND) {
-        return -EIO;
+    /* DEBUG-RECALL: log every helper invocation. */
+    (void)fprintf(stderr,
+        "DBG-RECALL: helper-entry fileid=%llu req_clientid=0x%llx "
+        "req_iomode=%u req_off=%llu req_len=%llu req_layout_type=%u\n",
+        (unsigned long long)fileid,
+        (unsigned long long)req_clientid,
+        req_iomode,
+        (unsigned long long)req_offset,
+        (unsigned long long)req_length,
+        req_layout_type);
+    rc = byte_range_collect_holders(lr, fileid, req_clientid,
+                                    req_iomode, req_offset, req_length,
+                                    req_layout_type,
+                                    true, true, true, false,
+                                    holders,
+                                    LAYOUT_BYTE_RANGE_MAX_HOLDERS,
+                                    &holder_count);
+    if (rc != 0) {
+        return rc;
     }
-    if (col.count == 0) {
+    if (holder_count == 0) {
         return 0;
     }
 
@@ -884,34 +1272,45 @@ int layout_recall_byte_range_for_holders(struct layout_recall *lr,
      * created session for the holder (Q2(a) of Mark's bug report).
      * The iterator commits the slot-0 sequenceid advance under the
      * session-table lock when our callback returns 1.
+     *
+     * Track each holder's CB outcome in a parallel array so the
+     * revoke loop below can suppress the preemptive row-delete on
+     * transient client responses (NFS4_OK, NFS4ERR_DELAY,
+     * NFS4ERR_RECALLCONFLICT) per RFC 5661 §20.4.2.1.  When the
+     * client agrees to (or is mid-way through) returning the layout
+     * the natural LAYOUTRETURN cleans up the row; revoking here
+     * before the LAYOUTRETURN arrives would race with that op and
+     * give the client NFS4ERR_BAD_STATEID, which it cannot recover
+     * from without a full session reset.
      */
-    if (lr->st != NULL) {
-        for (i = 0; i < col.count; i++) {
-            struct byte_range_one_cb_ctx one_ctx = {
-                .holder = &holders[i],
-                .timeout_ms = lr->revoke_ms,
-            };
-            (void)session_for_each_with_cb_for_clientid(
-                lr->st, holders[i].clientid,
-                byte_range_cb_one_holder, &one_ctx);
-        }
-    }
+    byte_range_dispatch_cb_each(lr, holders, holder_count, cb_status);
 
     /*
-     * Authoritative revoke: drop each holder's layout-state row.
-     * v1 full-revokes the whole grant whenever the intersection is
-     * non-empty.  Splitting the holder's row into two adjacent
-     * ranges is a Phase 2 follow-up; the on-wire CB is already
-     * byte-range correct, which is what the kernel client cares
-     * about.
+     * Conditional revoke (RFC 5661 §20.4.2.1).
+     *
+     * Drop the holder's layout-state row only when the recall did
+     * NOT land cleanly:
+     *   – CB_NOT_SENT (no backchannel / dup fail / lr->st == NULL)
+     *   – negative errno (transport-level failure: -EIO, -ETIMEDOUT,
+     *     -ENOTCONN, -EINVAL)
+     *   – a non-transient NFS4ERR_* (BADSESSION, BAD_STATEID,
+     *     OLD_STATEID, BADHANDLE, etc.)
+     *
+     * Skip the revoke on transient successes:
+     *   – NFS4_OK            — client agreed to return
+     *   – NFS4ERR_DELAY      — client busy, will return shortly
+     *   – NFS4ERR_RECALLCONFLICT — client has I/O in flight, will
+     *                                send LAYOUTRETURN when it drains
+     *
+     * In the skip path, the natural LAYOUTRETURN drops the row; the
+     * peer's LAYOUTGET that triggered this recall serialises on the
+     * holder's outstanding I/O via the kernel's normal recall-pending
+     * machinery rather than via a preemptive server-side BAD_STATEID.
      */
-    for (i = 0; i < col.count; i++) {
-        revoke_layout(lr, holders[i].stateid.other,
-                      holders[i].clientid, holders[i].fileid, 0);
-    }
+    byte_range_revoke_holders(lr, holders, holder_count, cb_status, false);
 
     if (recalled_out != NULL) {
-        *recalled_out = col.count;
+        *recalled_out = holder_count;
     }
     return 0;
 }

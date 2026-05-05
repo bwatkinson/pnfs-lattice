@@ -1471,6 +1471,44 @@ enum nfs4_status op_remove(struct compound_data *cd,
 	compound_notify_or_recall_dir(cd, cd->current_fh.fileid,
 				      NOTIFY4_REMOVE_ENTRY,
 				      op->arg.remove.name, NULL);
+	if (rm_final_data_unlink && rm_fileid != 0) {
+		/*
+		 * Mark Q5 P04 — layout-recall on final unlink.
+		 *
+		 * Revoke layouts BEFORE cat_remove() drops the final
+		 * namespace entry.  Linux answers CB_LAYOUTRECALL by
+		 * sending LAYOUTRETURN; that compound starts with PUTFH
+		 * on the recalled fileid.  If we remove the inode first,
+		 * the holder sees NFS4ERR_STALE on that PUTFH and enters
+		 * migration recovery instead of returning the layout,
+		 * leaving the peer's unlink path permanently wedged.
+		 *
+		 * layout_recall_revoke_all_for_unlink() is intentionally
+		 * stronger than the ordinary byte-range conflict helper:
+		 * it sends best-effort callbacks while PUTFH can still
+		 * resolve the object, then unconditionally drops every
+		 * layout-state row for this fileid.  If catalogue recall
+		 * enumeration fails, fail closed with DELAY rather than
+		 * removing the namespace entry while stale layouts remain.
+		 */
+		if (cd->lr != NULL) {
+			int lrc = layout_recall_revoke_all_for_unlink(
+				cd->lr, rm_fileid, NULL);
+			if (lrc != 0) {
+				return NFS4ERR_DELAY;
+			}
+		}
+
+		/*
+		 * Free any in-memory delegation grants that were recorded
+		 * for this fileid by a prior op_open.  This is done before
+		 * cat_remove() for the same final-unlink invalidation
+		 * boundary; it is NULL-safe but keep the guard explicit.
+		 */
+		if (cd->dt != NULL) {
+			deleg_revoke_file(cd->dt, rm_fileid);
+		}
+	}
 
 	st = cat_remove(cd, cd->current_fh.fileid,
 			op->arg.remove.name);
@@ -1498,44 +1536,6 @@ enum nfs4_status op_remove(struct compound_data *cd,
 		 * we miss. */
 		if (rm_final_data_unlink && rm_fileid != 0) {
 			enqueue_gc_for_final_unlink(cd, rm_fileid);
-			/*
-			 * Free any in-memory delegation grants that were
-			 * recorded for this fileid by a prior op_open.
-			 * Without this, struct deleg_entry leaks ~80 B per
-			 * grant under open/unlink workloads and the daemon
-			 * RSS climbs unboundedly (heaptrack #2 leak site).
-			 * NULL-safe; no-op when delegations are disabled.
-			 */
-			deleg_revoke_file(cd->dt, rm_fileid);
-			/*
-			 * Mark Q5 P04 — layout-recall on final unlink.
-			 *
-			 * RFC 8881 §10.4.1 / §18.25: removing the last
-			 * link to a file with outstanding layouts requires
-			 * the server to recall those layouts so holders
-			 * stop issuing I/O against a fileid whose
-			 * underlying data is being reclaimed by ds_gc.
-			 * Done post-cat_remove so a failed namespace
-			 * mutation leaves layouts intact.  Best-effort:
-			 * the byte-range helper revokes the holder's
-			 * layout-state row regardless of CB delivery
-			 * outcome — holders that miss the CB observe
-			 * NFS4ERR_BAD_STATEID on their next LAYOUT* and
-			 * reissue.  Skipped on non-final unlinks: nlink>1
-			 * means the file persists under another name and
-			 * existing layouts remain valid (RFC 8881 §8.2.4).
-			 * NULL-safe; cd->lr unset on the unit-test path.
-			 */
-			if (cd->lr != NULL) {
-				(void)layout_recall_byte_range_for_holders(
-					cd->lr,
-					rm_fileid,
-					cd->clientid,
-					LAYOUTIOMODE4_RW,
-					0, UINT64_MAX,
-					0,
-					NULL);
-			}
 		}
 	}
 	return mds_status_to_nfs4(st);

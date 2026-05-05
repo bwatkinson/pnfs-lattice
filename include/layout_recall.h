@@ -74,6 +74,31 @@ int layout_recall_for_ds(struct layout_recall *lr, uint32_t ds_id);
 int layout_recall_for_file(struct layout_recall *lr, uint64_t fileid);
 
 /**
+ * Recall and revoke every layout for a final unlink.
+ *
+ * Final unlink is different from an ordinary byte-range conflict:
+ * once the last namespace entry is removed, no outstanding layout for
+ * that fileid may remain valid.  This helper sends best-effort
+ * whole-file CB_LAYOUTRECALL4_FILE callbacks while the fileid is still
+ * resolvable, then unconditionally removes every matching layout-state
+ * row regardless of callback status, including NFS4_OK,
+ * NFS4ERR_DELAY, and NFS4ERR_RECALLCONFLICT.
+ *
+ * Keep this separate from layout_recall_byte_range_for_holders(), whose
+ * normal layoutget conflict semantics intentionally preserve layout
+ * rows for transient callback responses so the client's natural
+ * LAYOUTRETURN can complete.
+ *
+ * @param lr            Recall coordinator handle.
+ * @param fileid        File being finally unlinked.
+ * @param recalled_out  Optional: receives number of layout rows found.
+ * @return 0 on success, -errno on catalogue failure.
+ */
+int layout_recall_revoke_all_for_unlink(struct layout_recall *lr,
+                                        uint64_t fileid,
+                                        uint32_t *recalled_out);
+
+/**
  * Byte-range conflict-recall on op_layoutget.
  *
  * Recalls only the holders whose existing layout overlaps the
@@ -89,8 +114,11 @@ int layout_recall_for_file(struct layout_recall *lr, uint64_t fileid);
  * client may upgrade or extend its own layout without recalling itself.
  *
  * Best-effort and idempotent.  CB delivery failure (no backchannel,
- * timeout, send error) is non-fatal; the catalogue revoke runs
- * regardless so the requesting LAYOUTGET can proceed.
+ * timeout, send error, terminal NFS4ERR_*) is non-fatal; the catalogue
+ * revoke runs for those cases so the requesting LAYOUTGET can proceed.
+ * Transient client statuses (NFS4_OK, NFS4ERR_DELAY, and
+ * NFS4ERR_RECALLCONFLICT) intentionally preserve the layout row so the
+ * client's natural LAYOUTRETURN can complete without BAD_STATEID.
  *
  * @param lr             Recall coordinator handle.
  * @param fileid         File targeted by the LAYOUTGET.
@@ -112,9 +140,9 @@ int layout_recall_for_file(struct layout_recall *lr, uint64_t fileid);
  *                       client cannot decode — Mark's bug.
  *
  *                       Pass 0 for callers that do not have an
- *                       active LAYOUTGET request (op_setattr on
- *                       SIZE, op_remove on final unlink); the helper
- *                       then substitutes the coordinator-level
+ *                       active LAYOUTGET request (for example
+ *                       op_setattr on SIZE); the helper then
+ *                       substitutes the coordinator-level
  *                       default set by
  *                       layout_recall_set_default_layout_type()
  *                       (default LAYOUT4_FLEX_FILES).

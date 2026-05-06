@@ -49,22 +49,21 @@ if(ENABLE_RONDB)
 endif()
 
 # ---------------------------------------------------------------------------
-# Toolchain gate -- GCC >= 12.1 is mandatory.
+# Toolchain gate -- GCC >= 11.1 is mandatory.
 #
-# GCC 13.1+ has improved -Wreturn-type coverage at -O0, but the project
-# compiles cleanly on GCC 12.x with -Werror at -O2 (CI default).  The
-# gate was lowered from 13.1 to 12.1 to support users on Ubuntu 22.04
-# (ships GCC 12) and Fedora 37/38.  GCC 14 and 15 are fully supported.
+# GCC 11.x ships with Rocky/RHEL 9, GCC 14.x with Rocky/RHEL 10.
+# The gate was lowered from 13.1 to 11.1 to cover both Rocky 9 and 10.
+# GCC 12, 14, and 15 are fully supported.
 # ---------------------------------------------------------------------------
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
-    if(CMAKE_C_COMPILER_VERSION VERSION_LESS "12.1")
+    if(CMAKE_C_COMPILER_VERSION VERSION_LESS "11.1")
         message(FATAL_ERROR
-            "pnfs-mds requires GCC >= 12.1 (found ${CMAKE_C_COMPILER_VERSION}). "
+            "pnfs-mds requires GCC >= 11.1 (found ${CMAKE_C_COMPILER_VERSION}). "
             "See docs/architecture.md section 20 for details.")
     endif()
 else()
     message(WARNING
-        "pnfs-mds is only tested with GCC >= 12.1 "
+        "pnfs-mds is only tested with GCC >= 11.1 "
         "(found ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION})")
 endif()
 
@@ -98,8 +97,11 @@ if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     add_compile_options(
         -Wno-error=maybe-uninitialized
         -Wno-error=unused-but-set-variable
-        -Wno-error=use-after-free
     )
+    # -Wuse-after-free was added in GCC 12; older versions reject the flag.
+    if(NOT CMAKE_C_COMPILER_VERSION VERSION_LESS "12.0")
+        add_compile_options(-Wno-error=use-after-free)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

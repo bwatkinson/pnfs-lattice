@@ -17,21 +17,19 @@ enum nfs_auth_mode {
 };
 
 /* -----------------------------------------------------------------------
- * Toolchain gate -- GCC >= 12.1 is mandatory.
+ * Toolchain gate -- GCC >= 11.1 is mandatory.
  *
- * GCC 13.1+ has improved -Wreturn-type coverage at -O0, but the
- * project compiles and passes CI cleanly on GCC 12.x with -Werror
- * at -O2.  The gate was lowered to 12.1 to support Ubuntu 22.04
- * (ships GCC 12) and Fedora 37/38.  GCC 14 and 15 are fully
- * supported.
+ * GCC 11.x ships with Rocky/RHEL 9, GCC 14.x with Rocky/RHEL 10.
+ * The gate was lowered to 11.1 to cover both Rocky 9 and 10.
+ * GCC 12, 14, and 15 are fully supported.
  * ----------------------------------------------------------------------- */
 #if defined(__GNUC__) && !defined(__clang__)
 # define PNFS_GCC_VERSION (__GNUC__ * 10000 + __GNUC_MINOR__ * 100)
-# if PNFS_GCC_VERSION < 120100
-_Static_assert(0, "pnfs-mds requires GCC >= 12.1 -- see docs/architecture.md S20");
+# if PNFS_GCC_VERSION < 110100
+_Static_assert(0, "pnfs-mds requires GCC >= 11.1 -- see docs/architecture.md section 20");
 # endif
 #elif !defined(__clang__)
-# error "pnfs-mds requires GCC >= 12.1"
+# error "pnfs-mds requires GCC >= 11.1"
 #endif
 
 #include <stdint.h>

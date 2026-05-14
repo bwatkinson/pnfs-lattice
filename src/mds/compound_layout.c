@@ -906,7 +906,30 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 	 * clientid filter, but we early-out here to avoid the catalogue
 	 * round trip for the common renew path.
 	 */
-	if (cd->lr != NULL) {
+	/*
+	 * When transient_state_cache=on, this MDS does not persist
+	 * layout grants to NDB (every `mds_coord_layout_grant` call
+	 * site below is gated on `!cd->skip_transient_ndb`).  As a
+	 * direct consequence the `layout_state` table -- which is
+	 * the only thing layout_recall_byte_range_for_holders ->
+	 * mds_coord_layout_iter_file scans -- is empty from this
+	 * MDS's perspective, so the recall scan is a guaranteed-
+	 * miss NDB round-trip on the LAYOUTGET hot path (measured
+	 * at ~37 ms p50 on the lab cluster, ~100% of LAYOUTGET's
+	 * total latency).  Skip the scan when the same flag that
+	 * gates the writes is set; that keeps reads and writes
+	 * consistent and trims LAYOUTGET from ~42 ms back to ~1 ms
+	 * for the create-write-close pattern an untar issues.
+	 *
+	 * Caveat for heterogeneous deployments: if a different MDS
+	 * in the cluster runs with transient_state_cache=off and
+	 * writes its grants to NDB, those holders are invisible to
+	 * us here.  Today's lab + production configs run the same
+	 * flag across all MDSes, so the trade-off is currently
+	 * vacuous.  If/when we mix modes we should fall back to the
+	 * full scan whenever `cd->skip_transient_ndb` is false.
+	 */
+	if (cd->lr != NULL && !cd->skip_transient_ndb) {
 		uint32_t recalled = 0;
 		uint32_t req_iomode_for_recall = a->iomode;
 
@@ -1104,7 +1127,31 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 			entries = calloc(1, sizeof(*entries));
 			if (entries != NULL) {
 				entries[0].ds_id = cd->stripe_cached_ds_id;
-				entries[0].nfs_fh_len = 0; /* FH pending */
+				/*
+				 * Populate the captured NFS file handle when
+				 * op_open's fused create surfaced one
+				 * (Fix 3 of the May-13 perf pass).  With a
+				 * real FH in place, layout_entries_ready_for_grant
+				 * below returns true and we both (a) skip the
+				 * cat_stripe_map_get NDB round-trip the slow
+				 * path would issue and (b) avoid the
+				 * layout_revoke_unready_grant DELAY round-trip
+				 * the legacy DS_PENDING path takes.  When no FH
+				 * was captured (community / proxy-less build)
+				 * the cache leaves nfs_fh_len at 0 and we fall
+				 * through to that legacy DS_PENDING flow.
+				 */
+				if (cd->stripe_cached_nfs_fh_len > 0 &&
+				    cd->stripe_cached_nfs_fh_len <=
+					sizeof(entries[0].nfs_fh)) {
+					entries[0].nfs_fh_len =
+						cd->stripe_cached_nfs_fh_len;
+					memcpy(entries[0].nfs_fh,
+					       cd->stripe_cached_nfs_fh,
+					       cd->stripe_cached_nfs_fh_len);
+				} else {
+					entries[0].nfs_fh_len = 0; /* FH pending */
+				}
 
 				/*
 				 * Reuse the CQ pregrant stateid if OPEN(CREATE)
@@ -2196,10 +2243,29 @@ enum nfs4_status op_layoutcommit(struct compound_data *cd,
 	}
 
 	/* Validate the committed layout stateid (RFC 8881 S18.6).
-	 * Best-effort: if layout_grant persistence failed (RonDB mode),
-	 * the stateid won't be found.  Accept the LAYOUTCOMMIT anyway
-	 * so the file size gets updated. */
-	{
+	 *
+	 * Two modes:
+	 *
+	 *   transient_state_cache=off: consult NDB via
+	 *     coord_layout_get_by_stateid (which today is an
+	 *     unindexed `layout_state` scan by stateid_other --
+	 *     ~9 ms p50 in the lab) and accept NOTFOUND as a
+	 *     best-effort success.
+	 *
+	 *   transient_state_cache=on:  every `mds_coord_layout_grant`
+	 *     call site is gated off in this mode, so the layout_state
+	 *     table is always empty for our own grants -- the NDB
+	 *     scan is guaranteed to return NOTFOUND and the daemon
+	 *     would proceed regardless.  Skipping the scan removes
+	 *     ~9 ms from every LAYOUTCOMMIT (~75% of its total
+	 *     latency in the lab cluster).
+	 *
+	 * Same caveat as the LAYOUTGET recall gate above: this
+	 * trade-off assumes a homogeneous fleet (all MDSes share
+	 * the same flag).  Mixed-mode deployments would lose the
+	 * cross-MDS validation when the local flag is on.
+	 */
+	if (!cd->skip_transient_ndb) {
 		uint64_t lc_clientid = 0, lc_fileid = 0;
 		enum mds_status lc_st;
 
@@ -2323,17 +2389,55 @@ enum nfs4_status op_layoutcommit(struct compound_data *cd,
 			return NFS4_OK;
 		}
 
-		/* Update file size if the client reported a new
-		 * last-write offset. */
-		if (a->new_offset) {
-			if (a->last_write_offset == UINT64_MAX) {
-				return NFS4ERR_INVAL;
-			}
-			uint64_t new_size = a->last_write_offset + 1;
+		/*
+		 * Coalesced metadata write for LAYOUTCOMMIT.
+		 *
+		 * The old implementation issued up to three separate
+		 * cat_setattr calls per LAYOUTCOMMIT:
+		 *   1. SIZE update (when client reports growth)
+		 *   2. DS_PENDING flag clear (first commit after CREATE)
+		 *   3. MTIME update (when client supplied time_modify)
+		 * Each cat_setattr is internally a 2-trip NDB RMW, and
+		 * the old code also inserted two intermediate cat_getattr
+		 * re-reads between them, so the worst-case path issued
+		 * roughly 8 NDB round-trips for one LAYOUTCOMMIT.  Under
+		 * an untar workload (which sends size + mtime on every
+		 * file) we measured ~2 cat_setattrs per commit averaged,
+		 * dominating LAYOUTCOMMIT's ~12 ms p50 cost.
+		 *
+		 * Merge the three updates into a single masked cat_setattr
+		 * so the catalogue performs one R-M-W transaction with all
+		 * fields applied at once.  Failure semantics are preserved:
+		 *   - SIZE was historically mandatory: any write failure
+		 *     here, when SIZE participates, still surfaces
+		 *     NFS4ERR_IO to the client.
+		 *   - DS_PENDING and MTIME were historically best-effort
+		 *     (the old code called (void) cat_setattr and ignored
+		 *     errors).  When neither SIZE participates, a write
+		 *     failure is swallowed exactly as before.
+		 *
+		 * Bonus correctness fix: the old DS_PENDING clear used
+		 * mask=0, which catalogue_rondb_ns_setattr does not honour
+		 * for the flags field (it only copies attrs->flags into
+		 * the read-back inode when mask & MDS_ATTR_FLAGS is set).
+		 * The in-memory bit-clear was therefore being silently
+		 * dropped on every flush.  The merged mask below includes
+		 * MDS_ATTR_FLAGS, so DS_PENDING is now actually persisted
+		 * cleared on the first LAYOUTCOMMIT after CREATE.
+		 */
+		{
+			uint32_t merged_mask = 0;
+			bool size_grew = false;
+			uint64_t new_size = lc_inode.size;
+			uint64_t old_size = lc_inode.size;
 
-			if (new_size > lc_inode.size) {
-				/* Quota: check byte growth. */
-				{
+			if (a->new_offset) {
+				if (a->last_write_offset == UINT64_MAX) {
+					return NFS4ERR_INVAL;
+				}
+				new_size = a->last_write_offset + 1;
+
+				if (new_size > lc_inode.size) {
 					enum nfs4_status lc_nst;
 					lc_nst = quota_check_bytes(
 						cd, lc_inode.uid,
@@ -2342,55 +2446,45 @@ enum nfs4_status op_layoutcommit(struct compound_data *cd,
 					if (lc_nst != NFS4_OK) {
 						return lc_nst;
 					}
+					lc_inode.size = new_size;
+					merged_mask |= MDS_ATTR_SIZE;
+					size_grew = true;
 				}
-				uint64_t old_size = lc_inode.size;
-				lc_inode.size = new_size;
+			}
+
+			if (lc_inode.flags & MDS_IFLAG_DS_PENDING) {
+				lc_inode.flags &= ~MDS_IFLAG_DS_PENDING;
+				merged_mask |= MDS_ATTR_FLAGS;
+			}
+
+			if (a->time_modify_set) {
+				lc_inode.mtime = a->time_modify;
+				merged_mask |= MDS_ATTR_MTIME;
+			}
+
+			if (merged_mask != 0) {
 				st = cat_setattr(cd,
 					cd->current_fh.fileid,
-					&lc_inode, MDS_ATTR_SIZE);
+					&lc_inode, merged_mask);
 				if (st != MDS_OK) {
-					return NFS4ERR_IO;
+					if (size_grew) {
+						return NFS4ERR_IO;
+					}
+					/* DS_PENDING / mtime: best-effort. */
+				} else {
+					compound_inode_invalidate(cd,
+						cd->current_fh.fileid);
+					if (size_grew) {
+						quota_submit_adjust(cd,
+							lc_inode.uid,
+							lc_inode.gid,
+							(int64_t)(new_size -
+								old_size),
+							0);
+						r->new_size = true;
+						r->new_size_value = new_size;
+					}
 				}
-				compound_inode_invalidate(cd,
-					cd->current_fh.fileid);
-				quota_submit_adjust(cd, lc_inode.uid,
-					lc_inode.gid,
-					(int64_t)(new_size - old_size), 0);
-				r->new_size = true;
-				r->new_size_value = new_size;
-			}
-		}
-
-		/* Clear DS_PENDING if still set.  Re-read after any
-		 * size mutation to get fresh flags. */
-		if (r->new_size) {
-			st = cat_getattr(cd,
-				cd->current_fh.fileid, &lc_inode);
-			if (st != MDS_OK) {
-				goto lc_mtime;
-			}
-		}
-		if (lc_inode.flags & MDS_IFLAG_DS_PENDING) {
-			lc_inode.flags &= ~MDS_IFLAG_DS_PENDING;
-			(void)cat_setattr(cd, cd->current_fh.fileid,
-					     &lc_inode, 0);
-			compound_inode_invalidate(cd,
-				cd->current_fh.fileid);
-		}
-
-	lc_mtime:
-		/* Apply client-supplied mtime (RFC 8881 S18.6).
-		 * Re-read if any prior mutation invalidated. */
-		if (a->time_modify_set) {
-			st = cat_getattr(cd,
-				cd->current_fh.fileid, &lc_inode);
-			if (st == MDS_OK) {
-				lc_inode.mtime = a->time_modify;
-				(void)cat_setattr(cd,
-					cd->current_fh.fileid,
-					&lc_inode, 0);
-				compound_inode_invalidate(cd,
-					cd->current_fh.fileid);
 			}
 		}
 	}

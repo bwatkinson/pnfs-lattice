@@ -5,6 +5,8 @@
  * rondb_stubs.c -- RonDB-specific fallback implementations for non-RonDB builds.
  */
 
+#include <string.h>
+
 #include "catalogue_rondb.h"
 
 /* NOLINTNEXTLINE(readability-non-const-parameter) */
@@ -43,7 +45,8 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
     uint64_t layout_offset, uint64_t layout_length,
     const struct nfs4_stateid *layout_stateid,
     uint32_t layout_mds_id,
-    bool *layout_ok)
+    bool *layout_ok,
+    struct mds_ds_map_entry *layout_entry_out)
 {
     (void)cat;
     (void)parent_fileid;
@@ -60,6 +63,9 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
     (void)layout_length;
     (void)layout_stateid;
     (void)layout_mds_id;
+    if (layout_entry_out != NULL) {
+        memset(layout_entry_out, 0, sizeof(*layout_entry_out));
+    }
 
     if (layout_ok != NULL) {
         *layout_ok = false;

@@ -683,51 +683,34 @@ enum mds_status catalogue_rondb_ns_setattr(struct mds_catalogue *cat,
 					   uint32_t mask)
 {
 	void *h = rondb_handle(cat);
-	struct mds_inode inode;
-	uint32_t shard = 0;
 	uint8_t buf[RONDB_INODE_MAX_SIZE];
-	uint32_t outlen = 0;
-	struct timespec now;
 	int rc;
 
 	if (h == NULL || attrs == NULL) {
 		return MDS_ERR_INVAL;
 	}
 
-	/* Read current inode. */
-	rc = rondb_shim_inode_get(h, fileid, buf, sizeof(buf),
-				  &outlen, 0 /* COMMITTED */);
-	if (rc == 1) {
-		return MDS_ERR_NOTFOUND;
-	}
-	if (rc != 0) {
+	/*
+	 * Fold the read, merge, and write into a single NDB transaction
+	 * via rondb_shim_inode_setattr_rmw.  The shim holds the
+	 * exclusive row lock from the read through the update, so the
+	 * lost-update window the legacy two-call sequence had between
+	 * its committed read and its later locked write is closed; the
+	 * caller's masked attributes always merge with the most recent
+	 * committed state.  This also saves the startTransaction /
+	 * closeTransaction pair the old unlocked read paid for.
+	 *
+	 * The shim consumes the caller's `attrs` only through the
+	 * `mask` bits, exactly as the pre-fold C code did, so semantics
+	 * for callers are unchanged.  We serialise `attrs` into a
+	 * scratch buffer because the shim's interface is the same byte
+	 * format the rest of the codebase uses for inode I/O.
+	 */
+	if (rondb_inode_serialize(attrs, 0, buf, sizeof(buf)) < 0) {
 		return MDS_ERR_IO;
 	}
-	if (rondb_inode_deserialize(buf, outlen, &inode, &shard) != 0) {
-		return MDS_ERR_IO;
-	}
-
-	/* Apply masked fields. */
-	clock_gettime(CLOCK_REALTIME, &now);
-	if (mask & 0x01U) { inode.mode = attrs->mode; } /* MDS_ATTR_MODE */
-	if (mask & 0x02U) { inode.uid = attrs->uid; }   /* MDS_ATTR_UID */
-	if (mask & 0x04U) { inode.gid = attrs->gid; }   /* MDS_ATTR_GID */
-	if (mask & 0x08U) { inode.size = attrs->size; }  /* MDS_ATTR_SIZE */
-	if (mask & 0x10U) { inode.atime = attrs->atime; } /* MDS_ATTR_ATIME */
-	if (mask & 0x20U) { inode.mtime = attrs->mtime; } /* MDS_ATTR_MTIME */
-	if (mask & 0x40U) { inode.atime = now; }          /* MDS_ATTR_ATIME_NOW */
-	if (mask & 0x80U) { inode.mtime = now; }          /* MDS_ATTR_MTIME_NOW */
-	if (mask & 0x100U) { inode.flags = attrs->flags; } /* MDS_ATTR_FLAGS */
-	inode.ctime = now;
-	inode.change++;
-
-	/* Write back atomically -- exclusive-lock read + update in one
-	 * NDB transaction prevents concurrent setattr lost-update race. */
-	if (rondb_inode_serialize(&inode, shard, buf, sizeof(buf)) < 0) {
-		return MDS_ERR_IO;
-	}
-	rc = rondb_shim_inode_setattr_atomic(h, fileid, buf,
-					     RONDB_INODE_FIXED_SIZE);
+	rc = rondb_shim_inode_setattr_rmw(h, fileid, mask, buf,
+					  RONDB_INODE_FIXED_SIZE);
 	if (rc == 1) {
 		return MDS_ERR_NOTFOUND;
 	}
@@ -2174,7 +2157,8 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
 	uint64_t layout_offset, uint64_t layout_length,
 	const struct nfs4_stateid *layout_stateid,
 	uint32_t layout_mds_id,
-	bool *layout_ok)
+	bool *layout_ok,
+	struct mds_ds_map_entry *layout_entry_out)
 {
 	void *h = rondb_handle(cat);
 	struct mds_inode child;
@@ -2186,6 +2170,9 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
 
 	if (layout_ok != NULL) {
 		*layout_ok = false;
+	}
+	if (layout_entry_out != NULL) {
+		memset(layout_entry_out, 0, sizeof(*layout_entry_out));
 	}
 	if (h == NULL || name == NULL || out == NULL) {
 		return MDS_ERR_INVAL;
@@ -2221,6 +2208,19 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
 			}
 			stripe_buf_len = 8 + ds_entry.nfs_fh_len;
 			stripe_count_for_create = 1;
+
+			/*
+			 * Surface the popped entry to the caller so a
+			 * follow-up LAYOUTGET in the same compound can
+			 * skip stripe_map_get's NDB read.  Only meaningful
+			 * when an FH was captured by ds_prealloc_pop --
+			 * pre-Phase-12 / proxy-less paths leave nfs_fh_len
+			 * at zero and the caller falls back to the legacy
+			 * DS_PENDING flow.
+			 */
+			if (layout_entry_out != NULL) {
+				*layout_entry_out = ds_entry;
+			}
 		}
 	}
 

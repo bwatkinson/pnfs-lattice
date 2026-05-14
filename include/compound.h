@@ -1694,11 +1694,25 @@ struct layout_recall     *lr;
 	 * the ds_id is stashed here.  LAYOUTGET checks this before
 	 * reading NDB, eliminating 2 NDB round-trips for new files.
 	 * Valid only within the same compound processing context.
+	 *
+	 * The NFS file-handle bytes are an optional payload: when
+	 * ds_prealloc_pop captured a real FH during the fused create
+	 * (catalogue_rondb_ns_create_with_layout surfaces it via its
+	 * layout_entry_out parameter), `stripe_cached_nfs_fh_len > 0`
+	 * and `stripe_cached_nfs_fh[]` carries the captured FH.  The
+	 * follow-up LAYOUTGET then populates entries[0] from this
+	 * cache and skips the otherwise-mandatory `cat_stripe_map_get`
+	 * NDB read.  When the FH was not captured (legacy DS_PENDING
+	 * path, proxy unavailable) `stripe_cached_nfs_fh_len` stays 0
+	 * and LAYOUTGET takes the existing DS_PENDING fast path that
+	 * defers FH capture to the async ds_prepare helper.
 	 */
 	bool                      stripe_cached;
 	uint64_t                  stripe_cached_fileid;
 	uint32_t                  stripe_cached_ds_id;
 	uint32_t                  stripe_cached_stripe_unit;
+	uint32_t                  stripe_cached_nfs_fh_len;
+	uint8_t                   stripe_cached_nfs_fh[MDS_NFS_FH_MAX];
 
 	/*
 	 * Layout pre-grant — fused CREATE + LAYOUTGET CQ commit.

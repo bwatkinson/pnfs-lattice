@@ -1056,12 +1056,22 @@ enum nfs4_status op_setattr(struct compound_data *cd,
 	 * file does not recall its own grant.  layout_type=0 falls
 	 * back to the coordinator's default (LAYOUT4_FLEX_FILES).
 	 */
+	/*
+	 * Under transient_state_cache=on the layout_state table is
+	 * empty from this MDS's perspective (every grant site is
+	 * gated on `!cd->skip_transient_ndb`), so the recall scan
+	 * is a guaranteed-miss NDB round-trip on the SETATTR-with-
+	 * size hot path.  Same trade-off as op_layoutget; see the
+	 * detailed rationale in compound_layout.c above the
+	 * matching call site.
+	 */
 	if (st == MDS_OK &&
 	    (op->arg.setattr.mask & MDS_ATTR_SIZE) != 0 &&
 	    sa_pre_valid &&
 	    sa_pre_inode.type == MDS_FTYPE_REG &&
 	    op->arg.setattr.attrs.size != sa_pre_inode.size &&
-	    cd->lr != NULL) {
+	    cd->lr != NULL &&
+	    !cd->skip_transient_ndb) {
 		(void)layout_recall_byte_range_for_holders(
 			cd->lr,
 			cd->current_fh.fileid,

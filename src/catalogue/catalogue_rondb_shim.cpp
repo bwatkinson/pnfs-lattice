@@ -2855,6 +2855,170 @@ int rondb_shim_inode_setattr_atomic(void *handle, uint64_t fileid,
     return 0;
 }
 
+/*
+ * Single-transaction read-modify-write setattr.
+ *
+ * Sequence:
+ *   1. startTransaction (TC-hinted to fileid's partition).
+ *   2. readTuple(LM_Exclusive) fetching every inode column.
+ *   3. execute(NoCommit) -- gets values, holds the row lock.
+ *   4. Apply caller's MDS_ATTR_* mask onto the read-back struct.
+ *   5. Bump ctime, increment change.
+ *   6. updateTuple with the merged values.
+ *   7. execute(Commit) -- releases lock.
+ *
+ * The lock is held continuously from step 2 through step 7, closing
+ * the lost-update window the legacy two-call form left open between
+ * its committed read and its locked write.  Mask handling mirrors
+ * catalogue_rondb_ns_setattr's pre-fold semantics bit-for-bit so the
+ * caller-visible contract is unchanged.
+ */
+int rondb_shim_inode_setattr_rmw(void *handle, uint64_t fileid,
+                                 uint32_t mask,
+                                 const uint8_t *attrs_buf,
+                                 uint32_t attrs_buflen)
+{
+    rondb_shim_handle *state = rondb_checked_handle(handle, nullptr);
+    NdbDictionary::Dictionary *dict;
+    const NdbDictionary::Table *tbl;
+    NdbTransaction *tx;
+    NdbOperation *rd_op, *wr_op;
+    NdbError err;
+    struct mds_inode attrs_in;
+    struct mds_inode merged;
+    uint32_t attrs_shard = 0;
+    uint32_t row_shard = 0;
+    struct timespec now;
+
+    if (state == nullptr || attrs_buf == nullptr ||
+        attrs_buflen < RONDB_INODE_FIXED_SIZE) {
+        return -1;
+    }
+    if (rondb_inode_deserialize(attrs_buf, attrs_buflen,
+                                &attrs_in, &attrs_shard) != 0) {
+        return -1;
+    }
+
+    dict = rondb_get_dictionary(state);
+    if (dict == nullptr) { return -1; }
+    tbl = dict->getTable(RONDB_TBL_INODES);
+    if (tbl == nullptr) { return -1; }
+
+    {
+        uint8_t pk_buf[8];
+        fdb_put_u64(pk_buf, fileid);
+        tx = rondb_get_ndb(state)->startTransaction(
+            tbl, (const char *)pk_buf, 8);
+    }
+    if (tx == nullptr) {
+        return rondb_report_error(
+            rondb_get_ndb(state)->getNdbError(),
+            "setattr_rmw startTx");
+    }
+
+    /* 1. Exclusive-lock read, fetching every inode column. */
+    rd_op = tx->getNdbOperation(tbl);
+    if (rd_op == nullptr) {
+        err = tx->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "setattr_rmw rdOp");
+    }
+    rd_op->readTuple(NdbOperation::LM_Exclusive);
+    (void)rondb_equal_u64(rd_op, RONDB_INO_COL_FILEID, fileid);
+
+    NdbRecAttr *a_type   = rd_op->getValue(RONDB_INO_COL_TYPE, nullptr);
+    NdbRecAttr *a_mode   = rd_op->getValue(RONDB_INO_COL_MODE, nullptr);
+    NdbRecAttr *a_nlink  = rd_op->getValue(RONDB_INO_COL_NLINK, nullptr);
+    NdbRecAttr *a_uid    = rd_op->getValue(RONDB_INO_COL_UID, nullptr);
+    NdbRecAttr *a_gid    = rd_op->getValue(RONDB_INO_COL_GID, nullptr);
+    NdbRecAttr *a_size   = rd_op->getValue(RONDB_INO_COL_FILE_SIZE, nullptr);
+    NdbRecAttr *a_sused  = rd_op->getValue(RONDB_INO_COL_SPACE_USED, nullptr);
+    NdbRecAttr *a_atsec  = rd_op->getValue(RONDB_INO_COL_ATIME_SEC, nullptr);
+    NdbRecAttr *a_atnsec = rd_op->getValue(RONDB_INO_COL_ATIME_NSEC, nullptr);
+    NdbRecAttr *a_mtsec  = rd_op->getValue(RONDB_INO_COL_MTIME_SEC, nullptr);
+    NdbRecAttr *a_mtnsec = rd_op->getValue(RONDB_INO_COL_MTIME_NSEC, nullptr);
+    NdbRecAttr *a_ctsec  = rd_op->getValue(RONDB_INO_COL_CTIME_SEC, nullptr);
+    NdbRecAttr *a_ctnsec = rd_op->getValue(RONDB_INO_COL_CTIME_NSEC, nullptr);
+    NdbRecAttr *a_change = rd_op->getValue(RONDB_INO_COL_CHANGE, nullptr);
+    NdbRecAttr *a_gen    = rd_op->getValue(RONDB_INO_COL_GENERATION, nullptr);
+    NdbRecAttr *a_flags  = rd_op->getValue(RONDB_INO_COL_FLAGS, nullptr);
+    NdbRecAttr *a_verf   = rd_op->getValue(RONDB_INO_COL_CREATE_VERF, nullptr);
+    NdbRecAttr *a_parent = rd_op->getValue(RONDB_INO_COL_PARENT, nullptr);
+    NdbRecAttr *a_shard  = rd_op->getValue(RONDB_INO_COL_HOME_SHARD, nullptr);
+
+    /* NoCommit so values land and the lock is still held for the
+     * follow-up updateTuple. */
+    if (tx->execute(NdbTransaction::NoCommit) == -1) {
+        err = tx->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        if (err.code == 626) { return 1; }
+        return rondb_report_error(err, "setattr_rmw rdExec");
+    }
+    if (rd_op->getNdbError().code == 626) {
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return 1;
+    }
+
+    /* 2. Materialise the read-back inode in a local struct. */
+    memset(&merged, 0, sizeof(merged));
+    merged.fileid        = fileid;
+    merged.type          = (enum mds_file_type)a_type->u_8_value();
+    merged.mode          = a_mode->u_32_value();
+    merged.nlink         = a_nlink->u_32_value();
+    merged.uid           = a_uid->u_64_value();
+    merged.gid           = a_gid->u_64_value();
+    merged.size          = a_size->u_64_value();
+    merged.space_used    = a_sused->u_64_value();
+    merged.atime.tv_sec  = (time_t)a_atsec->u_64_value();
+    merged.atime.tv_nsec = (long)a_atnsec->u_32_value();
+    merged.mtime.tv_sec  = (time_t)a_mtsec->u_64_value();
+    merged.mtime.tv_nsec = (long)a_mtnsec->u_32_value();
+    merged.ctime.tv_sec  = (time_t)a_ctsec->u_64_value();
+    merged.ctime.tv_nsec = (long)a_ctnsec->u_32_value();
+    merged.change        = a_change->u_64_value();
+    merged.generation    = a_gen->u_64_value();
+    merged.flags         = a_flags->u_32_value();
+    merged.create_verf   = a_verf->u_64_value();
+    merged.parent_fileid = a_parent->u_64_value();
+    row_shard            = a_shard->u_32_value();
+
+    /* 3. Apply mask -- mirrors catalogue_rondb_ns_setattr's pre-fold
+     *    branch list verbatim so callers see identical semantics. */
+    clock_gettime(CLOCK_REALTIME, &now);
+    if (mask & 0x01U)  { merged.mode  = attrs_in.mode;  }  /* MODE */
+    if (mask & 0x02U)  { merged.uid   = attrs_in.uid;   }  /* UID  */
+    if (mask & 0x04U)  { merged.gid   = attrs_in.gid;   }  /* GID  */
+    if (mask & 0x08U)  { merged.size  = attrs_in.size;  }  /* SIZE */
+    if (mask & 0x10U)  { merged.atime = attrs_in.atime; }  /* ATIME */
+    if (mask & 0x20U)  { merged.mtime = attrs_in.mtime; }  /* MTIME */
+    if (mask & 0x40U)  { merged.atime = now;            }  /* ATIME_NOW */
+    if (mask & 0x80U)  { merged.mtime = now;            }  /* MTIME_NOW */
+    if (mask & 0x100U) { merged.flags = attrs_in.flags; }  /* FLAGS */
+    merged.ctime = now;
+    merged.change++;
+
+    /* 4. Update with merged values inside the same transaction. */
+    wr_op = tx->getNdbOperation(tbl);
+    if (wr_op == nullptr) {
+        err = tx->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "setattr_rmw wrOp");
+    }
+    wr_op->updateTuple();
+    (void)rondb_equal_u64(wr_op, RONDB_INO_COL_FILEID, fileid);
+    rondb_set_inode_values(wr_op, &merged, row_shard);
+
+    if (tx->execute(NdbTransaction::Commit) == -1) {
+        err = tx->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        if (err.code == 626) { return 1; }
+        return rondb_report_error(err, "setattr_rmw wrExec");
+    }
+
+    rondb_get_ndb(state)->closeTransaction(tx);
+    return 0;
+}
+
 int rondb_shim_inode_del(void *handle, uint64_t fileid)
 {
     rondb_shim_handle *state = rondb_checked_handle(handle, nullptr);

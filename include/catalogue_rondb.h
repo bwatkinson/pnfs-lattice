@@ -120,10 +120,45 @@ int rondb_shim_inode_put(void *handle, uint64_t fileid,
 /** Atomic setattr: exclusive-lock read + update in one NDB transaction.
  *  Prevents concurrent setattr lost-update race (BUG-2).
  *  updated_buf is the fully-merged inode (mask already applied by caller).
- *  Returns 0 on success, 1 on NOTFOUND, -1 on error. */
+ *  Returns 0 on success, 1 on NOTFOUND, -1 on error.
+ *
+ *  DEPRECATED for the ns_setattr path -- callers should prefer
+ *  rondb_shim_inode_setattr_rmw below, which folds the (previously
+ *  separate) committed read into the same transaction as the locked
+ *  write.  The merged form eliminates one round-trip's worth of
+ *  startTransaction / closeTransaction overhead per setattr and, more
+ *  importantly, holds the exclusive row lock for the duration of the
+ *  read -- closing a real lost-update window that this older API
+ *  leaves open (caller's committed read could be invalidated by
+ *  another writer before the locked update lands here).  Retained for
+ *  any path that already has the fully-merged inode in hand.
+ */
 int rondb_shim_inode_setattr_atomic(void *handle, uint64_t fileid,
                                     const uint8_t *updated_buf,
                                     uint32_t buflen);
+
+/** Single-transaction read-modify-write setattr.
+ *
+ *  Reads the inode under an exclusive row lock, merges the masked
+ *  fields from `attrs_buf` into the read-back state, bumps ctime and
+ *  change, then writes the merged record -- all inside one NDB
+ *  transaction.  Eliminates the lost-update race that the older
+ *  inode_get + setattr_atomic sequence was subject to (the committed
+ *  read at the start of that sequence is not protected by the same
+ *  lock as the eventual write), and saves the startTransaction /
+ *  closeTransaction round-trip pair the old form paid for the
+ *  preceding unlocked read.
+ *
+ *  `mask` uses the MDS_ATTR_* bits from pnfs_mds.h.  `attrs_buf` is a
+ *  serialised `mds_inode`; only fields whose mask bit is set are
+ *  honoured -- everything else comes from the locked read.
+ *
+ *  Returns 0 on success, 1 on NOTFOUND, -1 on error.
+ */
+int rondb_shim_inode_setattr_rmw(void *handle, uint64_t fileid,
+                                 uint32_t mask,
+                                 const uint8_t *attrs_buf,
+                                 uint32_t attrs_buflen);
 
 /** Delete inode row. */
 int rondb_shim_inode_del(void *handle, uint64_t fileid);
@@ -769,7 +804,18 @@ enum mds_status catalogue_rondb_layoutget_fused(
 
 /** Phase 3: ns_create with optional layout pre-grant.
  *  When layout_clientid != 0, piggybacks layout_state + indexes into the
- *  same NDB transaction.  Sets *layout_ok to true if grant succeeded. */
+ *  same NDB transaction.  Sets *layout_ok to true if grant succeeded.
+ *
+ *  When `layout_entry_out` is non-NULL and a prealloc entry was popped
+ *  (DS placement happened), the popped entry is mirrored into
+ *  *layout_entry_out so the caller can stash DS_id + nfs_fh in its
+ *  per-compound stripe cache and let the immediately-following
+ *  LAYOUTGET skip the now-redundant stripe_map_get NDB read.  When the
+ *  pop produced no FH (proxy unavailable / pre-Phase-12 path) the
+ *  out's nfs_fh_len stays 0; the caller treats that as "no cache,
+ *  fall back to NDB" and the legacy DS_PENDING flow takes over.
+ *  Pass NULL for layout_entry_out to opt out (older callers).
+ */
 enum mds_status catalogue_rondb_ns_create_with_layout(
     struct mds_catalogue *cat,
     uint64_t parent_fileid, const char *name,
@@ -781,7 +827,8 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
     uint64_t layout_offset, uint64_t layout_length,
     const struct nfs4_stateid *layout_stateid,
     uint32_t layout_mds_id,
-    bool *layout_ok);
+    bool *layout_ok,
+    struct mds_ds_map_entry *layout_entry_out);
 
 /**
  * Run RonDB bootstrap via the catalogue handle.

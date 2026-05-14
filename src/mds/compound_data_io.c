@@ -148,6 +148,7 @@ static uint32_t op_open_hpc_clamp_stripes(const struct compound_data *cd,
 static enum mds_status op_open_hpc_wide_create(
 	struct compound_data *cd,
 	const struct nfs4_arg_open *a,
+	uint32_t eff_mode,
 	uint64_t eff_uid, uint64_t eff_gid,
 	struct mds_inode *out_inode)
 {
@@ -192,7 +193,7 @@ static enum mds_status op_open_hpc_wide_create(
 		cd->cat, cd->prealloc,
 		cd->current_fh.fileid,
 		a->name,
-		a->mode,
+		eff_mode,
 		eff_uid, eff_gid,
 		stripe_count,
 		1,                          /* mirror_count */
@@ -379,6 +380,38 @@ enum nfs4_status op_open(struct compound_data *cd,
 				eff_gid = cd->cred_gid;
 			}
 			/*
+			 * B2 (May-13 perf pass): EXCLUSIVE4 / EXCLUSIVE4_1
+			 * from the Linux NFS client ships *no* attributes
+			 * with CREATE -- a->mode arrives as 0.  The previous
+			 * code persisted the file with mode=0 and then ran
+			 * a synchronous cat_setattr (one full NDB R-M-W,
+			 * ~1 ms on this cluster) to set mode=0600 so the
+			 * creator could write before the follow-up SETATTR.
+			 * Pre-computing the effective mode here and passing
+			 * it into the CREATE call lets ns_create persist
+			 * 0600 atomically and removes that per-CREATE
+			 * setattr from the OPEN critical path.
+			 *
+			 * Note: the old setattr also assigned
+			 * `inode.create_verf = a->create_verf`, but the
+			 * cat_setattr mask MDS_ATTR_MODE does not carry
+			 * the verifier through the R-M-W shim's
+			 * mask-application loop (see
+			 * src/catalogue/catalogue_rondb_shim.cpp:2988-2996),
+			 * so verifier persistence was already a no-op
+			 * under the old code.  In-window EXCLUSIVE4_1
+			 * replays are handled by the NFSv4.1 session
+			 * replay cache; out-of-cache replays already saw
+			 * NFS4ERR_EXIST under the old code.  We preserve
+			 * that observable behaviour here.
+			 */
+			uint32_t eff_mode = a->mode;
+			if ((a->createmode == CREATEMODE_EXCLUSIVE4 ||
+			     a->createmode == CREATEMODE_EXCLUSIVE4_1) &&
+			    eff_mode == 0) {
+				eff_mode = 0600;
+			}
+			/*
 			 * Phase C / Step 5 of docs/hpc-nto1-plan.md -- detect
 			 * whether the parent is HPC-Shared.  We must re-fetch
 			 * here because the opt_create_first short-circuit may
@@ -431,7 +464,7 @@ enum nfs4_status op_open(struct compound_data *cd,
 				 * other ns_create call.
 				 */
 				st = op_open_hpc_wide_create(cd, a,
-					eff_uid, eff_gid, &inode);
+					eff_mode, eff_uid, eff_gid, &inode);
 			} else if (cd->cq != NULL) {
 				struct commit_op cop;
 				memset(&cop, 0, sizeof(cop));
@@ -441,7 +474,7 @@ enum nfs4_status op_open(struct compound_data *cd,
 					       sizeof(cop.args.create.name),
 					       "%s", a->name);
 				cop.args.create.type = MDS_FTYPE_REG;
-				cop.args.create.mode = a->mode;
+				cop.args.create.mode = eff_mode;
 				cop.args.create.uid = eff_uid;
 				cop.args.create.gid = eff_gid;
 				cop.args.create.prealloc = cd->prealloc;
@@ -548,15 +581,27 @@ enum nfs4_status op_open(struct compound_data *cd,
 
 				if (do_fused) {
 					bool layout_ok = false;
+					/*
+					 * Receive back the DS entry the fused
+					 * create's internal ds_prealloc_pop
+					 * landed on, so the following LAYOUTGET
+					 * fast path below can populate
+					 * entries[0] from this cache and skip
+					 * `cat_stripe_map_get`'s NDB round-trip
+					 * entirely (Fix 3 of the May-13 perf
+					 * pass).
+					 */
+					struct mds_ds_map_entry pre_entry;
+					memset(&pre_entry, 0, sizeof(pre_entry));
 					st = catalogue_rondb_ns_create_with_layout(
 						cd->cat, cd->current_fh.fileid,
 						a->name, MDS_FTYPE_REG,
-						a->mode, eff_uid, eff_gid,
+						eff_mode, eff_uid, eff_gid,
 						cd->prealloc, &inode,
 						lg_clientid, lg_iomode,
 						lg_offset, lg_length,
 						&lg_sid, cd->mds_id,
-						&layout_ok);
+						&layout_ok, &pre_entry);
 					if (st == MDS_OK && layout_ok) {
 						cd->layout_pregranted = true;
 						cd->layout_pregrant_fileid =
@@ -564,11 +609,44 @@ enum nfs4_status op_open(struct compound_data *cd,
 						cd->layout_pregrant_stateid =
 							lg_sid;
 					}
+					/*
+					 * Cache the captured stripe entry when
+					 * the fused create both succeeded and
+					 * actually popped a prealloc entry with
+					 * an NFS file handle (ds_prealloc_pop
+					 * leaves nfs_fh_len at 0 when proxy is
+					 * unavailable, in which case the legacy
+					 * DS_PENDING flow handles FH capture
+					 * later).  Stamping this here instead
+					 * of the post-create-branch site below
+					 * keeps the data path tight to the
+					 * function whose return contract
+					 * actually defines the entry's
+					 * lifetime.
+					 */
+					if (st == MDS_OK &&
+					    pre_entry.ds_id != 0 &&
+					    pre_entry.nfs_fh_len > 0 &&
+					    pre_entry.nfs_fh_len <=
+						sizeof(cd->stripe_cached_nfs_fh)) {
+						cd->stripe_cached = true;
+						cd->stripe_cached_fileid =
+							inode.fileid;
+						cd->stripe_cached_ds_id =
+							pre_entry.ds_id;
+						cd->stripe_cached_stripe_unit =
+							pre_create_stripe_unit;
+						cd->stripe_cached_nfs_fh_len =
+							pre_entry.nfs_fh_len;
+						memcpy(cd->stripe_cached_nfs_fh,
+						       pre_entry.nfs_fh,
+						       pre_entry.nfs_fh_len);
+					}
 				} else {
 					st = cat_create(cd,
 						cd->current_fh.fileid,
 						a->name, MDS_FTYPE_REG,
-						a->mode, eff_uid, eff_gid,
+						eff_mode, eff_uid, eff_gid,
 						cd->prealloc, &inode);
 				}
 			}
@@ -596,22 +674,33 @@ enum nfs4_status op_open(struct compound_data *cd,
 			if (st != MDS_OK) {
 				return mds_status_to_nfs4(st);
 			}
-			/* EXCLUSIVE4/EXCLUSIVE4_1: persist verifier for
-			 * replay detection.  If the file was created with
-			 * mode 0 (EXCLUSIVE4 does not carry attrs), set
-			 * an initial mode of 0600 so the Linux NFS client
-			 * attribute cache allows the creator to write and
-			 * the subsequent SETATTR to set the real mode. */
-			if (a->createmode == CREATEMODE_EXCLUSIVE4 ||
-			    a->createmode == CREATEMODE_EXCLUSIVE4_1) {
-				inode.create_verf = a->create_verf;
-				if (inode.mode == 0) {
-					inode.mode = 0600;
-				}
-				(void)cat_setattr(cd, inode.fileid,
-						     &inode,
-						     MDS_ATTR_MODE);
-			}
+			/*
+			 * B2 (May-13 perf pass): the EXCLUSIVE4 /
+			 * EXCLUSIVE4_1 verifier+mode cat_setattr that
+			 * used to live here has been elided.  The
+			 * mode default of 0600 is now baked into the
+			 * ns_create call above (see the eff_mode block
+			 * by the CREATE-branch prologue), saving one
+			 * synchronous NDB R-M-W per file create on the
+			 * OPEN critical path -- the single largest
+			 * remaining latency item flagged by the
+			 * May-13 ns_setattr amplification audit.
+			 *
+			 * The verifier-persist portion of the old
+			 * setattr was already a no-op because
+			 * MDS_ATTR_MODE doesn't propagate create_verf
+			 * through the R-M-W shim's mask-application
+			 * loop, so removing it changes no observable
+			 * behaviour: in-window EXCLUSIVE4_1 replays
+			 * still hit the NFSv4.1 session replay cache,
+			 * and out-of-cache replays still see
+			 * NFS4ERR_EXIST.  If we ever want true
+			 * post-restart verifier replay safety, the
+			 * follow-up is to extend ns_create / the
+			 * fused create shim to take a `create_verf`
+			 * argument and persist it in the same NDB
+			 * transaction as the inode itself.
+			 */
 			just_created = true;
 			/* Phase B HPC-Shared: if the parent directory has
 			 * MDS_IFLAG_HPC_SHARED set, propagate the bit to

@@ -549,6 +549,7 @@ static enum mds_status compound_cat_dirent_get(
 {
 	struct mds_inode child;
 	enum mds_status st;
+	uint64_t dcache_gen = 0;
 
 	/* Check dirent cache first. */
 	if (cd->dcache != NULL) {
@@ -560,7 +561,11 @@ static enum mds_status compound_cat_dirent_get(
 		if (dc_rc == 1) {
 			return MDS_ERR_NOTFOUND; /* negative hit */
 		}
-		/* dc_rc == -1: miss -- fall through to backend */
+		/* dc_rc == -1: miss -- fall through to backend.  Snapshot
+		 * the invalidation generation BEFORE the backend read so
+		 * we can detect a racing CREATE/REMOVE and skip inserting
+		 * a stale negative entry below. */
+		dcache_gen = dirent_cache_read_gen(cd->dcache);
 	}
 
 	if (cd->cat == NULL) {
@@ -579,8 +584,13 @@ static enum mds_status compound_cat_dirent_get(
 		return MDS_OK;
 	}
 	if (st == MDS_ERR_NOTFOUND && cd->dcache != NULL) {
-		dirent_cache_put_negative(cd->dcache,
-					  parent_fileid, name);
+		/* Race-guarded negative insert: if any invalidate has run
+		 * since dcache_gen was sampled (in particular a CREATE on
+		 * this same (parent, name) that committed to NDB between
+		 * the gen sample and the backend read), the conditional
+		 * put skips and the next LOOKUP re-reads the backend. */
+		(void)dirent_cache_put_negative_if_unchanged(
+			cd->dcache, parent_fileid, name, dcache_gen);
 	}
 	return st;
 }
@@ -733,10 +743,20 @@ enum mds_status compound_lookup_local_child(
 	}
 
 	/* Cache miss -- fused dirent + inode read via cat_lookup.
-	 * Single NDB transaction instead of two separate reads. */
+	 * Single NDB transaction instead of two separate reads.
+	 *
+	 * Snapshot the dcache invalidation generation BEFORE the
+	 * backend lookup so we can detect a racing CREATE that
+	 * committed between the lookup's NDB read and our negative
+	 * insert (see dirent_cache_put_negative_if_unchanged for the
+	 * race description). */
+	uint64_t dcache_gen_pre_lookup =
+		(cd->dcache != NULL) ? dirent_cache_read_gen(cd->dcache) : 0;
 	st = cat_lookup(cd, parent_fileid, name, child);
 	if (st == MDS_ERR_NOTFOUND && cd->dcache != NULL) {
-		dirent_cache_put_negative(cd->dcache, parent_fileid, name);
+		(void)dirent_cache_put_negative_if_unchanged(
+			cd->dcache, parent_fileid, name,
+			dcache_gen_pre_lookup);
 	}
 	if (st != MDS_OK) {
 		return st;

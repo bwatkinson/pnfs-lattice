@@ -1879,7 +1879,19 @@ enum nfs4_status op_rename(struct compound_data *cd,
 	 * target name already exists as a non-empty directory, the
 	 * server MUST fail with NFS4ERR_EXIST or NFS4ERR_NOTEMPTY.
 	 * Pynfs RNM16 testDirToFullDir.
+	 *
+	 * We also capture src_fileid (and dst_overwrite_fileid when
+	 * the destination name already resolves to a different inode)
+	 * so the post-rename branch below can invalidate the affected
+	 * child inodes in the icache.  Without those invalidations a
+	 * stale icache hit on the renamed inode keeps the pre-rename
+	 * parent_fileid alive, and a stale hit on the overwritten
+	 * inode pretends the unlinked-by-rename target still exists.
+	 * Both are sources of "file appears to still be there after
+	 * rename" symptoms under IOR-like concurrent workloads.
 	 */
+	uint64_t rnm_src_fileid = 0;
+	uint64_t rnm_dst_overwrite_fileid = 0;
 	{
 		struct mds_inode rnm_src;
 		struct mds_inode rnm_dst;
@@ -1891,6 +1903,14 @@ enum nfs4_status op_rename(struct compound_data *cd,
 		rnm_ds = compound_lookup_local_child(cd,
 			cd->current_fh.fileid,
 			op->arg.rename.dst_name, &rnm_dst);
+		if (rnm_ss == MDS_OK) {
+			rnm_src_fileid = rnm_src.fileid;
+		}
+		if (rnm_ds == MDS_OK &&
+		    (rnm_ss != MDS_OK ||
+		     rnm_dst.fileid != rnm_src_fileid)) {
+			rnm_dst_overwrite_fileid = rnm_dst.fileid;
+		}
 		if (rnm_ss == MDS_OK && rnm_ds == MDS_OK &&
 		    rnm_src.type == MDS_FTYPE_DIR &&
 		    rnm_dst.type == MDS_FTYPE_DIR &&
@@ -1944,6 +1964,27 @@ enum nfs4_status op_rename(struct compound_data *cd,
 		/* Invalidate BEFORE post-mutation re-read. */
 		compound_inode_invalidate(cd, cd->saved_fh.fileid);
 		compound_inode_invalidate(cd, cd->current_fh.fileid);
+
+		/*
+		 * The renamed inode's parent_fileid changed in NDB but
+		 * the icache entry still records the pre-rename parent.
+		 * Drop it so the next read re-fetches.
+		 *
+		 * If the rename overwrote an existing destination, that
+		 * inode either lost a link (nlink-- or removal) or was
+		 * unlinked entirely.  Either way its icache entry is
+		 * stale and would make the overwritten file appear to
+		 * still exist via a PUTFH on the captured fileid.  Same
+		 * class of bug as the op_remove icache leak addressed
+		 * in the previous commit.
+		 */
+		if (rnm_src_fileid != 0) {
+			compound_inode_invalidate(cd, rnm_src_fileid);
+		}
+		if (rnm_dst_overwrite_fileid != 0) {
+			compound_inode_invalidate(cd,
+				rnm_dst_overwrite_fileid);
+		}
 
 		/* Read post-rename change counters. */
 		struct mds_inode src_post, dst_post;

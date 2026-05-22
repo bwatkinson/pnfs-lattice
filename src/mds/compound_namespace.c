@@ -2210,6 +2210,18 @@ enum nfs4_status op_link(struct compound_data *cd,
 		struct mds_inode link_parent_post;
 		compound_inode_invalidate(cd, cd->current_fh.fileid);
 		compound_inode_invalidate(cd, cd->saved_fh.fileid);
+		/*
+		 * Invalidate the dirent cache for the new link's name in
+		 * the link parent.  Without this, a prior negative entry
+		 * ("this name does not exist in this dir") survives the
+		 * cat_link and shadows the newly-created link for the
+		 * negative-cache TTL window -- same class of bug as the
+		 * op_create dirent_invalidate that lives at the end of
+		 * the create path.  Mirror the existing op_create /
+		 * op_remove / op_rename invalidate calls.
+		 */
+		compound_dirent_invalidate(cd, cd->current_fh.fileid,
+					   op->arg.link.name);
 		if (cat_getattr(cd, cd->current_fh.fileid,
 				   &link_parent_post) == MDS_OK) {
 			res->res.change_info.after = link_parent_post.change;

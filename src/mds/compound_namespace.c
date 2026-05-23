@@ -1563,6 +1563,24 @@ enum nfs4_status op_remove(struct compound_data *cd,
 		/* Invalidate dirent cache for removed entry. */
 		compound_dirent_invalidate(cd, cd->current_fh.fileid,
 					   op->arg.remove.name);
+		/*
+		 * Drop the removed child's inode from the global icache.
+		 * Without this, a subsequent PUTFH on the removed fileid
+		 * (the client may still hold the FH from an earlier OPEN
+		 * or GETFH and use it before getting ESTALE the
+		 * "natural" way) reads the stale alive inode out of
+		 * the icache instead of touching NDB, and downstream
+		 * GETATTR / OPEN observe the file as still present.
+		 * This is the IOR "file cannot be deleted" symptom:
+		 * the unlink returns 0 but a verifying stat still
+		 * succeeds against the stale cache.  rm_fileid is
+		 * captured pre-mutation from cat_lookup above, so it
+		 * is the correct child id even after cat_remove has
+		 * dropped the dirent.
+		 */
+		if (rm_fileid != 0) {
+			compound_inode_invalidate(cd, rm_fileid);
+		}
 		struct mds_inode parent_post;
 		/* Invalidate BEFORE post-mutation re-read. */
 		compound_inode_invalidate(cd, cd->current_fh.fileid);
@@ -1573,7 +1591,7 @@ enum nfs4_status op_remove(struct compound_data *cd,
 		}
 
 		/* Final unlink of a regular file: schedule DS-side
-		 * data cleanup via the GC queue.  Best-effort —
+		 * data cleanup via the GC queue.  Best-effort --
 		 * failures here do not affect the client-visible
 		 * remove status; the next pass picks up any rows
 		 * we miss. */
@@ -1861,7 +1879,19 @@ enum nfs4_status op_rename(struct compound_data *cd,
 	 * target name already exists as a non-empty directory, the
 	 * server MUST fail with NFS4ERR_EXIST or NFS4ERR_NOTEMPTY.
 	 * Pynfs RNM16 testDirToFullDir.
+	 *
+	 * We also capture src_fileid (and dst_overwrite_fileid when
+	 * the destination name already resolves to a different inode)
+	 * so the post-rename branch below can invalidate the affected
+	 * child inodes in the icache.  Without those invalidations a
+	 * stale icache hit on the renamed inode keeps the pre-rename
+	 * parent_fileid alive, and a stale hit on the overwritten
+	 * inode pretends the unlinked-by-rename target still exists.
+	 * Both are sources of "file appears to still be there after
+	 * rename" symptoms under IOR-like concurrent workloads.
 	 */
+	uint64_t rnm_src_fileid = 0;
+	uint64_t rnm_dst_overwrite_fileid = 0;
 	{
 		struct mds_inode rnm_src;
 		struct mds_inode rnm_dst;
@@ -1873,6 +1903,14 @@ enum nfs4_status op_rename(struct compound_data *cd,
 		rnm_ds = compound_lookup_local_child(cd,
 			cd->current_fh.fileid,
 			op->arg.rename.dst_name, &rnm_dst);
+		if (rnm_ss == MDS_OK) {
+			rnm_src_fileid = rnm_src.fileid;
+		}
+		if (rnm_ds == MDS_OK &&
+		    (rnm_ss != MDS_OK ||
+		     rnm_dst.fileid != rnm_src_fileid)) {
+			rnm_dst_overwrite_fileid = rnm_dst.fileid;
+		}
 		if (rnm_ss == MDS_OK && rnm_ds == MDS_OK &&
 		    rnm_src.type == MDS_FTYPE_DIR &&
 		    rnm_dst.type == MDS_FTYPE_DIR &&
@@ -1926,6 +1964,27 @@ enum nfs4_status op_rename(struct compound_data *cd,
 		/* Invalidate BEFORE post-mutation re-read. */
 		compound_inode_invalidate(cd, cd->saved_fh.fileid);
 		compound_inode_invalidate(cd, cd->current_fh.fileid);
+
+		/*
+		 * The renamed inode's parent_fileid changed in NDB but
+		 * the icache entry still records the pre-rename parent.
+		 * Drop it so the next read re-fetches.
+		 *
+		 * If the rename overwrote an existing destination, that
+		 * inode either lost a link (nlink-- or removal) or was
+		 * unlinked entirely.  Either way its icache entry is
+		 * stale and would make the overwritten file appear to
+		 * still exist via a PUTFH on the captured fileid.  Same
+		 * class of bug as the op_remove icache leak addressed
+		 * in the previous commit.
+		 */
+		if (rnm_src_fileid != 0) {
+			compound_inode_invalidate(cd, rnm_src_fileid);
+		}
+		if (rnm_dst_overwrite_fileid != 0) {
+			compound_inode_invalidate(cd,
+				rnm_dst_overwrite_fileid);
+		}
 
 		/* Read post-rename change counters. */
 		struct mds_inode src_post, dst_post;
@@ -2151,6 +2210,18 @@ enum nfs4_status op_link(struct compound_data *cd,
 		struct mds_inode link_parent_post;
 		compound_inode_invalidate(cd, cd->current_fh.fileid);
 		compound_inode_invalidate(cd, cd->saved_fh.fileid);
+		/*
+		 * Invalidate the dirent cache for the new link's name in
+		 * the link parent.  Without this, a prior negative entry
+		 * ("this name does not exist in this dir") survives the
+		 * cat_link and shadows the newly-created link for the
+		 * negative-cache TTL window -- same class of bug as the
+		 * op_create dirent_invalidate that lives at the end of
+		 * the create path.  Mirror the existing op_create /
+		 * op_remove / op_rename invalidate calls.
+		 */
+		compound_dirent_invalidate(cd, cd->current_fh.fileid,
+					   op->arg.link.name);
 		if (cat_getattr(cd, cd->current_fh.fileid,
 				   &link_parent_post) == MDS_OK) {
 			res->res.change_info.after = link_parent_post.change;

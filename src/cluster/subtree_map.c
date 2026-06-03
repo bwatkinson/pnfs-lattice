@@ -504,9 +504,9 @@ enum mds_status subtree_map_init_rondb(struct mds_catalogue *cat,
     lc.loaded = 0;
     st = catalogue_rondb_partition_map_list(cat, pm_load_cb, &lc);
     if (st != MDS_OK) {
-        (void)fprintf(stderr,
-            "WARN: partition_map load failed (%d), "
-            "seeding root entry\n", (int)st);
+        MDS_LOG_WARN(LOG_COMP_CLUSTER,
+            "partition_map load failed (%d), "
+            "seeding root entry", (int)st);
     }
 
     /* Ensure root "/" exists. */
@@ -533,9 +533,9 @@ enum mds_status subtree_map_init_rondb(struct mds_catalogue *cat,
         (void)register_node(m, self_id, self_hostname);
     }
 
-    (void)fprintf(stderr,
-        "INFO: subtree_map_init_rondb: loaded %u entries from "
-        "partition_map\n", lc.loaded);
+    MDS_LOG_INFO(LOG_COMP_CLUSTER,
+        "subtree_map_init_rondb: loaded %u entries from "
+        "partition_map", lc.loaded);
 
     *out = m;
     return MDS_OK;

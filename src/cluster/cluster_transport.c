@@ -4038,8 +4038,8 @@ void cluster_transport_server_set_config(struct cluster_server *srv,
             }
         }
         if (srv->admin_allowed_host_count > 0) {
-            (void)fprintf(stderr,
-                "INFO: admin_allowed_hosts: %u host(s) permitted\n",
+            MDS_LOG_INFO(LOG_COMP_CLUSTER,
+                "admin_allowed_hosts: %u host(s) permitted",
                 (unsigned)srv->admin_allowed_host_count);
         }
     }

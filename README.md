@@ -1,14 +1,28 @@
-# pNFS Active-Active MDS
+# Lattice: Elastic Metadata Services for pNFS
 
-**Copyright (c) 2026 PeakAIO. Licensed under MIT (see `LICENSE-MIT`); a single file, `src/catalogue/catalogue_rondb_shim.cpp`, is GPL-2.0 (see `LICENSE-GPL-2.0`). See `LICENSING.md` for details.**
+**Copyright (c) 2026 PEAK:AIO. Licensed under MIT, except for `src/catalogue/catalogue_rondb_shim.cpp`, which is licensed under GPL-2.0-only. See `LICENSING.md` for details.**
 
-A pNFS metadata server for high-performance computing and AI/ML storage.
-Multiple MDS daemons share a single RonDB cluster as the metadata authority,
-serving concurrent NFSv4.1/4.2 namespace operations with row-level atomicity.
-Flex file layouts (RFC 8435) with loosely coupled generic data servers;
-TCP and RDMA endpoint support. Generic (loosely coupled) DSes only.
+Lattice is an open source, scale out metadata and coordination architecture for NFSv4.2, pNFS Flex Files and future distributed storage services.
 
-> The previous LMDB-only codebase is preserved under the `lmdb-final` git tag.
+Initiated by PEAK:AIO and shaped through technical collaboration with Los Alamos National Laboratory and CMU, Lattice provides a user space metadata server architecture designed for high performance computing, AI/ML storage and large scale namespace workloads.
+
+The project addresses limitations in traditional pNFS metadata designs by separating metadata authority, protocol coordination and data service placement. Multiple MDS daemons can share a RonDB metadata authority, allowing metadata services to scale beyond a single fixed server model while still preserving a clear source of truth.
+
+Primary focus: an elastic, ephemeral, user space pNFS metadata server for high performance computing and AI/ML storage.
+
+
+## Project Status
+
+Lattice is an early open source release intended for research, development, testing and collaboration.
+
+It is not yet recommended for production use without independent validation, security review and operational testing in your own environment.
+
+At any given time, there may be improvements, fixes and new features under active development in separate branches. These are not part of the released code until they have been reviewed, approved and passed QA.
+
+The software is provided as is, without warranty. Use is at your own risk. See the licence files for the full terms.
+
+
+
 
 ## Architecture
 
@@ -46,6 +60,8 @@ store in RonDB mode — the cluster is the single source of truth.
 Clients reach the correct MDS via NFSv4 `fs_locations` referrals
 (NFS4ERR_MOVED).  Data servers are standard unpatched knfsd instances,
 registered with TCP and/or RDMA endpoints.
+
+(Additional sharding options in QA and to be added)
 
 ### Data Flow
 
@@ -92,12 +108,6 @@ Schema tables: `inodes`, `dirents`, `stripe_map`, `layout_state`,
 `ds_registry`, `config_kv`, `node_registry`, `fileid_counter`,
 `partition_map`.
 
-### LMDB (removed)
-
-The LMDB single-writer backend has been removed from the production path.
-All metadata writes now dispatch directly through the RonDB catalogue
-vtable with native concurrent transactions.  The LMDB-era codebase is
-preserved under the `lmdb-final` git tag for reference.
 
 ### Pluggable Catalogue Layer
 
@@ -210,7 +220,7 @@ export PNFS_LAB_SSH_PASSWORD='...'   # only if SSH key auth is unavailable
 
 The target user must have passwordless sudo on every lab host.
 
-### Example: 3-Node RonDB Production Cluster
+### Example: 3-Node Style RonDB Lab Topology
 
 ```
 Node A (10.0.0.50) — MDS + RonDB data node
@@ -328,18 +338,6 @@ schema_name    = pnfs_mds
 
 See `docs/architecture.md` for the full configuration reference.
 
-## Testing
-
-53 test targets registered in CMake/CTest, covering namespace operations,
-compound dispatch, sessions, open/lock state, NFSv4.2 operations, XDR
-codec, DS registry, admin CLI, delegation, cluster transport, failover,
-migration, and daemon lifecycle.  All 53 tests pass.
-
-The production binary contains no LMDB implementation code (the legacy
-writer thread and single-writer commit queue were removed alongside the
-RonDB migration).  Unit tests that need a lightweight in-process
-catalogue use `tests/catalogue_memdb.c` — a small memdb with no external
-dependency.
 
 ### Running Tests
 
@@ -370,9 +368,7 @@ flex-file layouts pointing clients directly to the DSes for I/O.
 
 - **Flex file layouts** — per-stripe NFS file handles for parallel I/O
 - **TCP and RDMA endpoints** — dual-transport advertisement in GETDEVICEINFO
-- **Placement** — round-robin, capacity-weighted, tier-aware
-- **Storage tiering** — hot/warm/cold with automatic promotion/demotion
-- **Rebalancing** — background stripe redistribution
+- **Placement** — round-robin, stripe
 - **GC** — asynchronous data file cleanup after metadata deletion
 
 ## Cluster Features
@@ -423,33 +419,6 @@ Key optimisations:
 - **NFSv4.1 delegations** — READ/WRITE grants on OPEN
 - **Concurrency hardened** — verified 16 tasks, 336K ops, zero crashes
 
-### Benchmark Results (RonDB, single MDS, 2 DS, 2026-04-10)
-
-**Single client (mdtest, nconnect=8):**
-
-| Operation | ops/sec |
-|-----------|---------|
-| File creation | 127 |
-| Directory creation | 202 |
-| File stat | 317 |
-| File removal | 365 |
-
-**8 parallel tasks (mdtest, nconnect=8, 7,440 files):**
-
-| Operation | aggregate ops/sec |
-|-----------|------------------|
-| File creation | 1,911 |
-| Directory creation | 3,024 |
-| File removal | 2,443 |
-
-**16 parallel tasks (mdtest, nconnect=16, 336,800 ops — stress test):**
-
-| Operation | aggregate ops/sec |
-|-----------|------------------|
-| File creation | 2,094 |
-| Directory creation | 3,507 |
-| File removal | 2,541 |
-| Directory removal | 2,373 |
 
 ## Remaining Hardening
 

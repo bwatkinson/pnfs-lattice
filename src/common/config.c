@@ -311,6 +311,15 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
     /* Stripe lease duration (default 30s). */
     cfg->stripe_lease_duration_ms = 30000;
 
+    /* Logging defaults: stderr output, INFO global verbosity, and every
+     * component inheriting the global level (-1 sentinel).  memset()
+     * above zeroed log_level_global to LOG_FATAL, so set INFO here. */
+    cfg->log_file[0] = '\0';
+    cfg->log_level_global = LOG_INFO;
+    for (int i = 0; i < LOG_COMP_COUNT; i++) {
+        cfg->log_level_by_component[i] = -1;
+    }
+
     fp = fopen(path, "r");
     if (fp == NULL) {
         return MDS_ERR_IO;
@@ -1067,6 +1076,35 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
                 (void)fprintf(stderr,
                     "WARN: stripe_lease_duration_ms=%lu out of range "
                     "(0..300000)\n", v);
+            }
+
+        /* Logging (src/common/log.c).  These keys are consumed by
+         * main.c after mds_log_init(); the parser only records intent.
+         * Unknown tokens warn and leave the default in place. */
+        } else if (strcmp(key, "log_file") == 0) {
+            (void)snprintf(cfg->log_file, sizeof(cfg->log_file), "%s", val);
+        } else if (strcmp(key, "log_level") == 0) {
+            int lvl = mds_log_level_from_str(val);
+            if (lvl >= 0) {
+                cfg->log_level_global = lvl;
+            } else {
+                (void)fprintf(stderr,
+                    "WARN: invalid log_level '%s' "
+                    "(expected fatal|error|warn|info|debug|trace); "
+                    "keeping default\n", val);
+            }
+        } else if (strncmp(key, "log_level.", 10) == 0) {
+            const char *comp_name = key + 10;
+            int comp = mds_log_component_from_str(comp_name);
+            int lvl = mds_log_level_from_str(val);
+            if (comp >= 0 && lvl >= 0) {
+                cfg->log_level_by_component[comp] = lvl;
+            } else {
+                (void)fprintf(stderr,
+                    "WARN: invalid log_level.%s='%s' "
+                    "(component mds|fsal|cluster|repl|cat|bpf|nfs, "
+                    "level fatal|error|warn|info|debug|trace); ignored\n",
+                    comp_name, val);
             }
 
         } else {

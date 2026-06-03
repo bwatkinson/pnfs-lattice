@@ -97,6 +97,12 @@ hosts).
 - `auto_split_min_children` — min children eligible.  Default: 4.
 ## Sharding
 - `shard_enabled` — bool master switch.  Default: false.
+## Logging
+The daemon routes diagnostics through a leveled, component-aware logger (`src/common/log.c`).  Output defaults to stderr at `info`, which reproduces the historical behaviour (every pre-existing diagnostic is emitted at `info` or above).
+- `log_file` — path for diagnostics output.  Empty/unset → stderr.  A path is opened in **append** mode; if it cannot be opened the logger falls back to stderr.  Each record carries a UTC timestamp, component, and level.
+- `log_level` — global verbosity applied to every component.  One of `fatal`, `error`, `warn`, `info` (default), `debug`, `trace` (case-insensitive).  A component emits a record only when its level is at or above the record's severity (e.g. `warn` passes fatal/error/warn and drops info/debug/trace).
+- `log_level.<component>` — per-component override.  `<component>` is one of `mds`, `fsal`, `cluster`, `repl`, `cat`, `bpf`, `nfs` (case-insensitive).  Components without an override inherit `log_level`.  Example: `log_level.cat = debug`.
+Unknown level or component tokens are warned about and ignored (the default is kept).
 ## What is not (yet) in config
 These knobs exist as hardcoded constants and can be promoted on request:
 - `DS_HEALTH_DEFAULT_INTERVAL` — alias for `ds_heartbeat_ms` today.

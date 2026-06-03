@@ -37,6 +37,10 @@ _Static_assert(0, "pnfs-mds requires GCC >= 11.1 -- see docs/architecture.md sec
 #include <pthread.h>
 #include <time.h>
 #include <stdio.h>
+/* Component-based leveled logging interface: enum log_level,
+ * enum log_component, the mds_log* prototypes, and the MDS_LOG_*
+ * macros.  Implementation lives in src/common/log.c. */
+#include "mds_log.h"
 
 /* -----------------------------------------------------------------------
  * Version
@@ -861,6 +865,18 @@ struct mds_config {
      * stripe must wait or retry.  0 disables.  Default 30000 (30s).
      */
     uint32_t            stripe_lease_duration_ms;
+
+    /*
+     * Logging (src/common/log.c).  log_file is the diagnostics output
+     * path; an empty string sends output to stderr.  log_level_global
+     * is the default verbosity (an enum log_level value) applied to
+     * every component at startup; log_level_by_component[i] overrides
+     * component i when >= 0, or inherits the global when -1.
+     * Defaults: stderr, LOG_INFO, all components inheriting.
+     */
+    char                log_file[MDS_MAX_PATH];
+    int                 log_level_global;
+    int                 log_level_by_component[LOG_COMP_COUNT];
 };
 /* NOLINTEND(clang-analyzer-optin.performance.Padding) */
 
@@ -874,33 +890,12 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg);
 
 
 /* -----------------------------------------------------------------------
- * Compiler attributes
+ * Logging
+ * -----------------------------------------------------------------------
+ * The logging interface (enum log_level, enum log_component, the
+ * mds_log* prototypes, and the MDS_LOG_* convenience macros) lives in
+ * mds_log.h, included near the top of this header.
  * ----------------------------------------------------------------------- */
-
-#if defined(__GNUC__) || defined(__clang__)
-# define MDS_PRINTF(fmt_idx, arg_idx) \
-    __attribute__((format(printf, fmt_idx, arg_idx)))
-#else
-# define MDS_PRINTF(fmt_idx, arg_idx)
-#endif
-
-/* -----------------------------------------------------------------------
- * Logging  (src/common/log.c)
- * ----------------------------------------------------------------------- */
-
-/** Initialise logging; path == NULL sends output to stderr. */
-void mds_log_init(const char *path);
-
-/** Set per-component log level.  Component/level values use the
- *  internal enums in log.c. */
-void mds_log_set_level(int component, int level);
-
-/** Emit a timestamped log line if level is enabled for component. */
-void mds_log(int component, int level, const char *fmt, ...)
-    MDS_PRINTF(3, 4);
-
-/** Flush and close the log file. */
-void mds_log_shutdown(void);
 
 /* -----------------------------------------------------------------------
  * Error helpers  (src/common/error.c)

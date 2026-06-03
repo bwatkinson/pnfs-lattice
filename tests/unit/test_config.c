@@ -341,6 +341,61 @@ static void test_admin_allowed_hosts_overflow(void)
     unlink(path);
 }
 
+/* -------------------------------------------------------------------
+ * Logging keys
+ * ------------------------------------------------------------------- */
+
+static void test_log_defaults(void)
+{
+    char path[128];
+    struct mds_config cfg;
+    ASSERT_EQ(write_tmp_ini("", path), 0);
+    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
+    /* Default: stderr (empty path), INFO global, every component
+     * inheriting the global level (-1 sentinel). */
+    ASSERT_EQ((int)cfg.log_file[0], 0);
+    ASSERT_EQ(cfg.log_level_global, (int)LOG_INFO);
+    for (int i = 0; i < LOG_COMP_COUNT; i++) {
+        ASSERT_EQ(cfg.log_level_by_component[i], -1);
+    }
+    unlink(path);
+}
+
+static void test_log_keys_parse(void)
+{
+    char path[128];
+    struct mds_config cfg;
+    ASSERT_EQ(write_tmp_ini(
+        "log_file = /tmp/pnfs-mds-test.log\n"
+        "log_level = debug\n"
+        "log_level.cat = trace\n"
+        "log_level.NFS = warn\n",   /* component token is case-insensitive */
+        path), 0);
+    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
+    ASSERT_TRUE(strcmp(cfg.log_file, "/tmp/pnfs-mds-test.log") == 0);
+    ASSERT_EQ(cfg.log_level_global, (int)LOG_DEBUG);
+    ASSERT_EQ(cfg.log_level_by_component[LOG_COMP_CAT], (int)LOG_TRACE);
+    ASSERT_EQ(cfg.log_level_by_component[LOG_COMP_NFS], (int)LOG_WARN);
+    /* A component without an override still inherits (-1). */
+    ASSERT_EQ(cfg.log_level_by_component[LOG_COMP_MDS], -1);
+    unlink(path);
+}
+
+static void test_log_unknown_tokens_ignored(void)
+{
+    char path[128];
+    struct mds_config cfg;
+    ASSERT_EQ(write_tmp_ini(
+        "log_level = bogus\n"          /* invalid level -> keep default */
+        "log_level.cat = nonsense\n"   /* invalid level -> ignored */
+        "log_level.bogus = debug\n",   /* invalid component -> ignored */
+        path), 0);
+    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
+    ASSERT_EQ(cfg.log_level_global, (int)LOG_INFO);
+    ASSERT_EQ(cfg.log_level_by_component[LOG_COMP_CAT], -1);
+    unlink(path);
+}
+
 int main(void)
 {
     fprintf(stdout, "test_config (RonDB-native)\n");
@@ -370,6 +425,11 @@ int main(void)
     RUN_TEST(test_admin_allowed_hosts_default_empty);
     RUN_TEST(test_admin_allowed_hosts_parse);
     RUN_TEST(test_admin_allowed_hosts_overflow);
+
+    /* Logging keys. */
+    RUN_TEST(test_log_defaults);
+    RUN_TEST(test_log_keys_parse);
+    RUN_TEST(test_log_unknown_tokens_ignored);
 
     fprintf(stdout, "\n  %d/%d tests passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

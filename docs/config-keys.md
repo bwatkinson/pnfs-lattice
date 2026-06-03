@@ -98,6 +98,12 @@ hosts).
 ## Sharding
 - `shard_enabled` — bool master switch.  Default: false.
 - `hide_referral_junctions` — bool.  Default: false.  Cosmetic only.  When true, the `/shardN` referral junction directories are omitted from READDIR replies at the namespace **root only**.  `LOOKUP` still resolves them (so `cd /mnt/pnfs/shardN` works); this just hides them from `ls /mnt/pnfs`.  Hiding is an exact subtree-map match, so ordinary files and directories are never affected.  Caveat: tools that enumerate the root (`find`, `rsync`, `rm -rf /mnt/pnfs`, backup) will not descend into the hidden shards.
+## Logging
+The daemon routes diagnostics through a leveled, component-aware logger (`src/common/log.c`).  Output defaults to stderr at `info`, which reproduces the historical behaviour (every pre-existing diagnostic is emitted at `info` or above).
+- `log_file` — path for diagnostics output.  Empty/unset → stderr.  A path is opened in **append** mode; if it cannot be opened the logger falls back to stderr.  Each record carries a UTC timestamp, component, and level.
+- `log_level` — global verbosity applied to every component.  One of `fatal`, `error`, `warn`, `info` (default), `debug`, `trace` (case-insensitive).  A component emits a record only when its level is at or above the record's severity (e.g. `warn` passes fatal/error/warn and drops info/debug/trace).
+- `log_level.<component>` — per-component override.  `<component>` is one of `mds`, `fsal`, `cluster`, `repl`, `cat`, `bpf`, `nfs` (case-insensitive).  Components without an override inherit `log_level`.  Example: `log_level.cat = debug`.
+Unknown level or component tokens are warned about and ignored (the default is kept).
 ## What is not (yet) in config
 These knobs exist as hardcoded constants and can be promoted on request:
 - `DS_HEALTH_DEFAULT_INTERVAL` — alias for `ds_heartbeat_ms` today.

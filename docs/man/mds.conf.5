@@ -720,6 +720,45 @@ directories are never affected.  Tools that enumerate the root
 .BR find ,
 .BR rsync )
 will not descend into the hidden shards.
+.SS "Logging"
+The daemon routes diagnostics through a leveled, component-aware logger.
+Output defaults to stderr at
+.BR info ,
+which reproduces the historical behaviour (every pre-existing
+diagnostic is emitted at info or above).
+.TP
+.B log_file
+.I path
+(default empty \(em stderr).
+Diagnostics output path.  A non-empty path is opened in
+.B append
+mode; if it cannot be opened the logger falls back to stderr.  Each
+record carries a UTC timestamp, component, and level.
+.TP
+.B log_level
+.I level
+(default
+.BR info ).
+Global verbosity applied to every component.  One of
+.BR fatal ", " error ", " warn ", " info ", " debug ", " trace
+(case-insensitive).  A component emits a record only when its
+configured level is at or above the record's severity.
+.TP
+.B log_level.<component>
+.I level
+Per-component override.
+.I <component>
+is one of
+.BR mds ", " fsal ", " cluster ", " repl ", " cat ", " bpf ", " nfs
+(case-insensitive).  Components without an override inherit
+.BR log_level .
+Example:
+.RS 4
+.nf
+log_level.cat = debug
+.fi
+.RE
+Unknown level or component tokens are warned about and ignored.
 .SH EXAMPLES
 A minimal 2-MDS lab config for
 .IR mds1 :

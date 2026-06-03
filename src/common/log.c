@@ -9,29 +9,16 @@
 #include <stdarg.h>
 #include <time.h>
 #include <string.h>
+#include <ctype.h>
 #include <pthread.h>
 
 #include "pnfs_mds.h"
 
-enum log_level {
-    LOG_FATAL = 0,
-    LOG_ERROR,
-    LOG_WARN,
-    LOG_INFO,
-    LOG_DEBUG,
-    LOG_TRACE,
-};
-
-enum log_component {
-    LOG_COMP_MDS = 0,
-    LOG_COMP_FSAL,
-    LOG_COMP_CLUSTER,
-    LOG_COMP_REPL,
-    LOG_COMP_CAT,
-    LOG_COMP_BPF,
-    LOG_COMP_NFS,
-    LOG_COMP_COUNT,
-};
+/*
+ * enum log_level and enum log_component are defined in mds_log.h
+ * (included via pnfs_mds.h) so that call sites, the config parser, and
+ * this implementation all share one definition.
+ */
 
 static const char *level_names[] = {
     "FATAL", "ERROR", "WARN", "INFO", "DEBUG", "TRACE",
@@ -66,8 +53,52 @@ void mds_log_set_level(int component, int level)
     }
 }
 
+/* Case-insensitive equality for short config tokens (no locale deps). */
+static int log_token_equal(const char *a, const char *b)
+{
+    while (*a != '\0' && *b != '\0') {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+int mds_log_level_from_str(const char *s)
+{
+    if (s == NULL) {
+        return -1;
+    }
+    for (size_t i = 0; i < sizeof(level_names) / sizeof(level_names[0]); i++) {
+        if (log_token_equal(s, level_names[i])) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+int mds_log_component_from_str(const char *s)
+{
+    if (s == NULL) {
+        return -1;
+    }
+    for (int i = 0; i < LOG_COMP_COUNT; i++) {
+        if (log_token_equal(s, comp_names[i])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 void mds_log(int component, int level, const char *fmt, ...)
 {
+    if (log_file == NULL) {
+        /* Logging not initialised yet -- drop the record rather than
+         * dereference a NULL FILE*.  Keeps any pre-init call site safe. */
+        return;
+    }
     if (component < 0 || component >= LOG_COMP_COUNT) {
         return;
     }

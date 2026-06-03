@@ -339,9 +339,9 @@ enum mds_status failover_promote(struct failover_ctx *ctx)
         st = cluster_membership_promote_standby(
             ctx->membership, ctx->self_id);
         if (st != MDS_OK) {
-            (void)fprintf(stderr,
-                    "WARN: promote_standby publish failed: %d "
-                    "(proceeding anyway -- subtrees already taken)\n",
+            MDS_LOG_WARN(LOG_COMP_CLUSTER,
+                    "promote_standby publish failed: %d "
+                    "(proceeding anyway -- subtrees already taken)",
                     (int)st);
         }
     }

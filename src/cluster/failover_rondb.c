@@ -178,23 +178,23 @@ static void *watchdog_fn(void *arg)
 			continue;
 		}
 
-		(void)fprintf(stderr,
+		MDS_LOG_INFO(LOG_COMP_CLUSTER,
 			"failover_rondb: partner %u heartbeat stale > %u ms, "
-			"attempting promotion\n",
+			"attempting promotion",
 			(unsigned)wd->partner_id,
 			(unsigned)wd->stale_timeout_ms);
 
 		st = failover_promote(wd->fo);
 		if (st == MDS_OK) {
-			(void)fprintf(stderr,
+			MDS_LOG_INFO(LOG_COMP_CLUSTER,
 				"failover_rondb: promotion succeeded; "
-				"watchdog exiting\n");
+				"watchdog exiting");
 			break;
 		}
 
-		(void)fprintf(stderr,
+		MDS_LOG_INFO(LOG_COMP_CLUSTER,
 			"failover_rondb: promotion refused (st=%d); "
-			"will retry next tick\n",
+			"will retry next tick",
 			(int)st);
 		/* Loop and re-poll.  The precheck guards in
 		 * failover_promote (self-fencing, repl health, wire

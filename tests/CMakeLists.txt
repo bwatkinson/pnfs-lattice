@@ -62,6 +62,7 @@ add_executable(test_placement_policy unit/test_placement_policy.c)
 add_executable(test_mds_tls        unit/test_mds_tls.c)
 add_executable(test_mds_gss        unit/test_mds_gss.c)
 add_executable(test_config          unit/test_config.c)
+add_executable(test_log             unit/test_log.c)
 if(ENABLE_DS_PREALLOC)
     add_executable(test_ds_prealloc       unit/test_ds_prealloc.c)
     add_executable(test_ds_prealloc_batch unit/test_ds_prealloc_batch.c)
@@ -114,6 +115,7 @@ foreach(test_target
     test_cluster_membership
     test_drain
     test_config
+    test_log
     test_ds_prealloc
     test_ds_prealloc_batch
     test_open_exclusive

@@ -210,18 +210,18 @@ static void failover_on_partner_loss(
 	const struct cluster_member *removed, void *arg)
 {
 	struct failover_ctx *fo = arg;
-	(void)fprintf(stderr,
-		"INFO: partner %u (role=%d, lifecycle=%d) lost -- "
-		"attempting promotion\n",
+	MDS_LOG_INFO(LOG_COMP_MDS,
+		"partner %u (role=%d, lifecycle=%d) lost -- "
+		"attempting promotion",
 		removed->mds_id, (int)removed->role,
 		(int)removed->lifecycle);
 	enum mds_status st = failover_promote(fo);
 	if (st == MDS_OK) {
-		(void)fprintf(stderr,
-			"INFO: failover promotion succeeded\n");
+		MDS_LOG_INFO(LOG_COMP_MDS,
+			"failover promotion succeeded");
 	} else {
-		(void)fprintf(stderr,
-			"WARN: failover promotion failed: %d\n", (int)st);
+		MDS_LOG_WARN(LOG_COMP_MDS,
+			"failover promotion failed: %d", (int)st);
 	}
 }
 
@@ -301,6 +301,19 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
+	/* 1a0. Initialise logging now that config is parsed.  An empty
+	 * log_file routes to stderr; a path is opened in append mode.
+	 * Resolve each component's level as its per-component override
+	 * when set (>= 0), else the global level.  Every diagnostic after
+	 * this point flows through the leveled logger. */
+	mds_log_init(cfg.log_file[0] != '\0' ? cfg.log_file : NULL);
+	for (int comp = 0; comp < LOG_COMP_COUNT; comp++) {
+		int lvl = (cfg.log_level_by_component[comp] >= 0)
+			? cfg.log_level_by_component[comp]
+			: cfg.log_level_global;
+		mds_log_set_level(comp, lvl);
+	}
+
 	/* 1a. Initialise grace subsystem (must precede any RPC path). */
 	grace_init();
 
@@ -309,8 +322,8 @@ int main(int argc, char *argv[])
 	 * disabled, every observation site takes a one-load early-return
 	 * path; the dispatcher metrics in threadpool.c stay always-on. */
 	mds_op_metrics_set_enabled(cfg.metrics_op_enabled);
-	(void)fprintf(stderr,
-		"INFO: op_metrics=%s\n",
+	MDS_LOG_INFO(LOG_COMP_MDS,
+		"op_metrics=%s",
 		cfg.metrics_op_enabled ? "on" : "off");
 
 	/* 1b. Block SIGINT/SIGTERM before any worker threads.
@@ -326,17 +339,17 @@ int main(int argc, char *argv[])
 #ifdef HAVE_RONDB
 	if (cfg.catalogue_backend == MDS_BACKEND_RONDB &&
 	    cfg.inline_enabled) {
-		(void)fprintf(stderr,
-			"FATAL: catalogue_backend=rondb requires "
-			"inline_enabled=false.\n");
+		MDS_LOG_FATAL(LOG_COMP_MDS,
+			"catalogue_backend=rondb requires "
+			"inline_enabled=false.");
 		return EXIT_FAILURE;
 	}
 #endif
 
 	rc = mds_catalogue_open(&cfg, &cat);
 	if (rc != MDS_OK) {
-		(void)fprintf(stderr,
-			"Failed to open metadata catalogue: %d\n",
+		MDS_LOG_ERROR(LOG_COMP_MDS,
+			"Failed to open metadata catalogue: %d",
 			(int)rc);
 		return EXIT_FAILURE;
 	}
@@ -362,9 +375,9 @@ int main(int argc, char *argv[])
 			 */
 			rc = mds_rondb_bootstrap(cat);
 			if (rc != MDS_OK) {
-				(void)fprintf(stderr,
-					"INFO: initial bootstrap returned %d, "
-					"entering probe-retry loop...\n",
+				MDS_LOG_INFO(LOG_COMP_MDS,
+					"initial bootstrap returned %d, "
+					"entering probe-retry loop...",
 					(int)rc);
 			}
 			for (attempt = 0; attempt < bootstrap_max_retries;
@@ -373,31 +386,31 @@ int main(int argc, char *argv[])
 					break; /* Schema ready. */
 				}
 				if (attempt == 0) {
-					(void)fprintf(stderr,
-						"INFO: RonDB probe failed after "
+					MDS_LOG_INFO(LOG_COMP_MDS,
+						"RonDB probe failed after "
 						"initial bootstrap, retrying "
-						"bootstrap...\n");
+						"bootstrap...");
 					rc = mds_rondb_bootstrap(cat);
 					if (rc == MDS_OK) {
 						break;
 					}
-					(void)fprintf(stderr,
-						"WARN: bootstrap returned %d, "
+					MDS_LOG_WARN(LOG_COMP_MDS,
+						"bootstrap returned %d, "
 						"another MDS may be "
 						"bootstrapping -- retrying "
-						"probe...\n", (int)rc);
+						"probe...", (int)rc);
 				} else {
-					(void)fprintf(stderr,
-						"INFO: probe retry %d/%d...\n",
+					MDS_LOG_INFO(LOG_COMP_MDS,
+						"probe retry %d/%d...",
 						attempt,
 						bootstrap_max_retries);
 				}
 				sleep(2);
 			}
 			if (attempt >= bootstrap_max_retries) {
-				(void)fprintf(stderr,
-					"FATAL: RonDB schema not ready "
-					"after %d attempts\n",
+				MDS_LOG_FATAL(LOG_COMP_MDS,
+					"RonDB schema not ready "
+					"after %d attempts",
 					bootstrap_max_retries);
 				mds_catalogue_close(cat);
 				return EXIT_FAILURE;
@@ -419,13 +432,13 @@ int main(int argc, char *argv[])
 						  cfg.self.nfs_port,
 						  cfg.self.grpc_port);
 		if (rc != MDS_OK) {
-			(void)fprintf(stderr,
-				"WARN: RonDB node registry register failed: %d\n",
+			MDS_LOG_WARN(LOG_COMP_MDS,
+				"RonDB node registry register failed: %d",
 				(int)rc);
 		} else {
-			(void)fprintf(stderr,
-				"INFO: RonDB node %u registered "
-				"(boot_epoch=%llu)\n",
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"RonDB node %u registered "
+				"(boot_epoch=%llu)",
 				(unsigned)cfg.self.id,
 				(unsigned long long)rondb_boot_epoch);
 		}
@@ -442,35 +455,35 @@ int main(int argc, char *argv[])
 			if (pthread_create(&rondb_hb_thread, NULL,
 					   rondb_hb_fn, &rondb_hb_arg_g) == 0) {
 				rondb_hb_running = true;
-				(void)fprintf(stderr,
-					"INFO: RonDB heartbeat thread "
-					"started (5s interval)\n");
+				MDS_LOG_INFO(LOG_COMP_MDS,
+					"RonDB heartbeat thread "
+					"started (5s interval)");
 			} else {
-				(void)fprintf(stderr,
-					"WARN: RonDB heartbeat thread "
-					"start failed\n");
+				MDS_LOG_WARN(LOG_COMP_MDS,
+					"RonDB heartbeat thread "
+					"start failed");
 			}
 		}
 
 		/* Phase 9C: start changefeed poller if image mode enabled. */
 		if (cfg.catalog_image_mode != MDS_IMAGE_OFF) {
 			if (catalog_image_create(&rondb_image) != 0) {
-				(void)fprintf(stderr,
-					"WARN: catalog_image_create failed\n");
+				MDS_LOG_WARN(LOG_COMP_MDS,
+					"catalog_image_create failed");
 				rondb_image = NULL;
 			} else {
 				if (catalogue_rondb_poller_start(
 					    cat, rondb_image,
 					    cfg.self.id, 50) != 0) {
-					(void)fprintf(stderr,
-						"WARN: changefeed poller "
-						"start failed\n");
+					MDS_LOG_WARN(LOG_COMP_MDS,
+						"changefeed poller "
+						"start failed");
 					catalog_image_destroy(rondb_image);
 					rondb_image = NULL;
 				} else {
-					(void)fprintf(stderr,
-						"INFO: changefeed poller "
-						"started (image_mode=%d)\n",
+					MDS_LOG_INFO(LOG_COMP_MDS,
+						"changefeed poller "
+						"started (image_mode=%d)",
 						(int)cfg.catalog_image_mode);
 				}
 			}
@@ -490,8 +503,8 @@ int main(int argc, char *argv[])
 				cfg.node_key_file,
 				true, cfg.require_mtls,
 				&cluster_tls) != 0) {
-			(void)fprintf(stderr,
-				"WARN: cluster TLS init failed\n");
+			MDS_LOG_WARN(LOG_COMP_MDS,
+				"cluster TLS init failed");
 		}
 
 		/* Client context for outbound connections (replication, etcd). */
@@ -500,8 +513,8 @@ int main(int argc, char *argv[])
 				cfg.node_key_file,
 				false, false,
 				&cluster_tls_client) != 0) {
-			(void)fprintf(stderr,
-				"WARN: cluster TLS client init failed\n");
+			MDS_LOG_WARN(LOG_COMP_MDS,
+				"cluster TLS client init failed");
 		}
 	}
 
@@ -512,11 +525,11 @@ int main(int argc, char *argv[])
 	if (health_monitor_init(NULL, cfg.repl_health_interval_ms,
 				cfg.repl_refuse_writes_on_resync,
 				&hm) != 0) {
-		(void)fprintf(stderr, "WARN: health_monitor_init failed\n");
+		MDS_LOG_WARN(LOG_COMP_MDS, "health_monitor_init failed");
 		hm = NULL;
 	}
 	if (hm != NULL && health_monitor_start(hm) != 0) {
-		(void)fprintf(stderr, "WARN: health_monitor_start failed\n");
+		MDS_LOG_WARN(LOG_COMP_MDS, "health_monitor_start failed");
 		health_monitor_destroy(hm);
 		hm = NULL;
 	}
@@ -529,8 +542,8 @@ int main(int argc, char *argv[])
 		rc = subtree_map_init_rondb(cat, cfg.self.id,
 					   cfg.self.hostname, &smap);
 		if (rc != MDS_OK) {
-			(void)fprintf(stderr,
-				"subtree_map_init_rondb failed: %d\n",
+			MDS_LOG_ERROR(LOG_COMP_MDS,
+				"subtree_map_init_rondb failed: %d",
 				(int)rc);
 			exit_code = EXIT_FAILURE;
 			goto cleanup;
@@ -540,8 +553,8 @@ int main(int argc, char *argv[])
 		rc = cluster_membership_init(&cfg, smap, NULL,
 					     &membership);
 		if (rc != MDS_OK) {
-			(void)fprintf(stderr,
-				"cluster_membership_init failed: %d\n",
+			MDS_LOG_ERROR(LOG_COMP_MDS,
+				"cluster_membership_init failed: %d",
 				(int)rc);
 			exit_code = EXIT_FAILURE;
 			goto cleanup;
@@ -570,14 +583,14 @@ int main(int argc, char *argv[])
 					smap, spath, mds_id, host,
 					SUBTREE_ACTIVE, 1);
 				if (ast == MDS_OK) {
-					(void)fprintf(stderr,
-						"INFO: seeded partition "
-						"%s -> MDS %u\n",
+					MDS_LOG_INFO(LOG_COMP_MDS,
+						"seeded partition "
+						"%s -> MDS %u",
 						spath, (unsigned)mds_id);
 				} else if (ast != MDS_ERR_EXISTS) {
-					(void)fprintf(stderr,
-						"WARN: partition seed "
-						"%s failed: %d\n",
+					MDS_LOG_WARN(LOG_COMP_MDS,
+						"partition seed "
+						"%s failed: %d",
 						spath, (int)ast);
 				}
 			}
@@ -650,8 +663,8 @@ int main(int argc, char *argv[])
 				}
 #pragma GCC diagnostic pop
 				if (mds_cat_ds_put(cat, NULL, &info) == MDS_OK) {
-					(void)fprintf(stderr,
-						"INFO: seeded DS %u: %s\n",
+					MDS_LOG_INFO(LOG_COMP_MDS,
+						"seeded DS %u: %s",
 						di, cfg.ds_specs[di]);
 				}
 			}
@@ -701,9 +714,9 @@ int main(int argc, char *argv[])
 				if (changed) {
 					(void)mds_cat_ds_put(cat, NULL,
 							     &fix_list[fi]);
-					(void)fprintf(stderr,
-						"INFO: fixed DS %u "
-						"(port=%u, state=%s)\n",
+					MDS_LOG_INFO(LOG_COMP_MDS,
+						"fixed DS %u "
+						"(port=%u, state=%s)",
 						(unsigned)fix_list[fi].ds_id,
 						(unsigned)fix_list[fi].port,
 						(fix_list[fi].state ==
@@ -724,9 +737,9 @@ int main(int argc, char *argv[])
 				       &bad_fid, &bad_type) == MDS_OK) {
 			(void)mds_cat_ns_remove(cat, NULL,
 						MDS_FILEID_ROOT, "/");
-			(void)fprintf(stderr,
-				"INFO: removed stale '/' junction "
-				"(fid=%llu)\n",
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"removed stale '/' junction "
+				"(fid=%llu)",
 				(unsigned long long)bad_fid);
 		}
 	}
@@ -754,14 +767,14 @@ int main(int argc, char *argv[])
 				cat, MDS_FILEID_ROOT, jname,
 				je.owner_mds_id);
 			if (jst == MDS_OK) {
-				(void)fprintf(stderr,
-					"INFO: created junction /%s -> MDS %u\n",
+				MDS_LOG_INFO(LOG_COMP_MDS,
+					"created junction /%s -> MDS %u",
 					jname, (unsigned)je.owner_mds_id);
 			} else if (jst == MDS_ERR_EXISTS) {
 				/* Junction already exists -- no action needed. */
 			} else {
-				(void)fprintf(stderr,
-					"WARN: failed to create junction /%s: %d\n",
+				MDS_LOG_WARN(LOG_COMP_MDS,
+					"failed to create junction /%s: %d",
 					jname, (int)jst);
 			}
 		}
@@ -771,7 +784,7 @@ int main(int argc, char *argv[])
 	{
 		enum mds_status pst = mds_proxy_ctx_create(&proxy);
 		if (pst != MDS_OK) {
-			(void)fprintf(stderr, "mds_proxy_ctx_create failed: %d\n",
+			MDS_LOG_ERROR(LOG_COMP_MDS, "mds_proxy_ctx_create failed: %d",
 				(int)pst);
 			proxy = NULL;
 		} else {
@@ -862,14 +875,14 @@ int main(int argc, char *argv[])
 		if (ds_prealloc_init_ex(cat, proxy, effective_policy,
 					cfg.prealloc_pool_size,
 					&ds_pa) != 0) {
-			(void)fprintf(stderr,
-				"WARN: ds_prealloc_init failed, "
-				"falling back to inline\n");
+			MDS_LOG_WARN(LOG_COMP_MDS,
+				"ds_prealloc_init failed, "
+				"falling back to inline");
 			ds_pa = NULL;
 		} else {
-			(void)fprintf(stderr,
-				"INFO: DS pre-alloc pool active "
-				"(pool_size=%u, policy=%d)\n",
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"DS pre-alloc pool active "
+				"(pool_size=%u, policy=%d)",
 				(unsigned)cfg.prealloc_pool_size,
 				(int)effective_policy);
 		}
@@ -887,9 +900,9 @@ int main(int argc, char *argv[])
 
 	/* 5a2. Init DS registry in-memory cache. */
 	if (ds_cache_create(cat, &ds_cache) != 0) {
-		(void)fprintf(stderr,
-			"WARN: ds_cache_create failed, "
-			"falling back to direct reads\n");
+		MDS_LOG_WARN(LOG_COMP_MDS,
+			"ds_cache_create failed, "
+			"falling back to direct reads");
 		ds_cache = NULL;
 	}
 
@@ -930,9 +943,9 @@ int main(int argc, char *argv[])
 				      cfg.ds_capacity_poll_ms,
 				      cfg.placement_capacity_weighting,
 				      &ds_cap) != 0) {
-			(void)fprintf(stderr,
-				"WARN: ds_capacity_start failed; "
-				"falling back to admin weights / uniform\n");
+			MDS_LOG_WARN(LOG_COMP_MDS,
+				"ds_capacity_start failed; "
+				"falling back to admin weights / uniform");
 			ds_cap = NULL;
 		} else if (ds_cap != NULL) {
 			const char *mode_name =
@@ -940,10 +953,10 @@ int main(int argc, char *argv[])
 				 CAP_WEIGHT_PROPORTIONAL)
 					? "proportional"
 					: "off";
-			(void)fprintf(stderr,
-				"INFO: DS capacity probe active "
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"DS capacity probe active "
 				"(poll=%u ms, mount_fmt=%s, "
-				"capacity_weighting=%s)\n",
+				"capacity_weighting=%s)",
 				(unsigned)cfg.ds_capacity_poll_ms,
 				cfg.ds_mount_path_fmt, mode_name);
 		}
@@ -955,11 +968,11 @@ int main(int argc, char *argv[])
 		if (ds_prepare_create(cat, proxy, cfg.ds_count,
 				      cfg.ds_prepare_queue_depth,
 				      &ds_prep) == 0) {
-			(void)fprintf(stderr,
-				"INFO: DS async-prepare queue active\n");
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"DS async-prepare queue active");
 		} else {
-			(void)fprintf(stderr,
-				"WARN: ds_prepare_create failed\n");
+			MDS_LOG_WARN(LOG_COMP_MDS,
+				"ds_prepare_create failed");
 			ds_prep = NULL;
 		}
 	}
@@ -982,15 +995,15 @@ int main(int argc, char *argv[])
 				   cfg.ds_gc_batch_size,
 				   &ds_gc) == 0 &&
 		    ds_gc != NULL) {
-			(void)fprintf(stderr,
-				"INFO: DS GC drainer active "
-				"(poll=5000 ms, workers=%u, batch=%u)\n",
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"DS GC drainer active "
+				"(poll=5000 ms, workers=%u, batch=%u)",
 				(unsigned)cfg.ds_gc_workers,
 				(unsigned)cfg.ds_gc_batch_size);
 		} else if (ds_gc == NULL) {
-			(void)fprintf(stderr,
-				"WARN: ds_gc_start failed; "
-				"DS-side cleanup will not run\n");
+			MDS_LOG_WARN(LOG_COMP_MDS,
+				"ds_gc_start failed; "
+				"DS-side cleanup will not run");
 		}
 	}
 
@@ -1004,8 +1017,8 @@ int main(int argc, char *argv[])
 						    cfg.cluster_max_conns,
 						    cat, smap, cluster_tls, &ct_srv);
 		if (rc != MDS_OK) {
-			(void)fprintf(stderr,
-				"cluster_transport_server_start failed: %d\n",
+			MDS_LOG_ERROR(LOG_COMP_MDS,
+				"cluster_transport_server_start failed: %d",
 				(int)rc);
 			exit_code = EXIT_FAILURE;
 			goto cleanup;
@@ -1037,8 +1050,8 @@ int main(int argc, char *argv[])
 
 			enum mds_status fo_st = failover_init(&fo_cfg, &fo_ctx);
 			if (fo_st != MDS_OK) {
-				(void)fprintf(stderr,
-					"WARN: failover_init failed: %d\n",
+				MDS_LOG_WARN(LOG_COMP_MDS,
+					"failover_init failed: %d",
 					(int)fo_st);
 				fo_ctx = NULL;
 			} else {
@@ -1066,14 +1079,14 @@ int main(int argc, char *argv[])
 					wd_cfg.partner_id = self_m.failover_partner_id;
 					if (failover_watchdog_start(&wd_cfg,
 								    &fo_wd) == MDS_OK) {
-						(void)fprintf(stderr,
-							"INFO: RonDB failover watchdog "
-							"active (partner=%u)\n",
+						MDS_LOG_INFO(LOG_COMP_MDS,
+							"RonDB failover watchdog "
+							"active (partner=%u)",
 							(unsigned)self_m.failover_partner_id);
 					} else {
-						(void)fprintf(stderr,
-							"WARN: failover_watchdog_start "
-							"failed (partner=%u)\n",
+						MDS_LOG_WARN(LOG_COMP_MDS,
+							"failover_watchdog_start "
+							"failed (partner=%u)",
 							(unsigned)self_m.failover_partner_id);
 						fo_wd = NULL;
 					}
@@ -1098,7 +1111,7 @@ int main(int argc, char *argv[])
 			session_table_set_cq(session_tbl, cq);
 		}
 	} else {
-		(void)fprintf(stderr, "WARN: session_table_init failed\n");
+		MDS_LOG_WARN(LOG_COMP_MDS, "session_table_init failed");
 	}
 
 	/* 6c. Layout recall coordinator + DS health monitor.
@@ -1121,9 +1134,9 @@ int main(int argc, char *argv[])
 		 * authoritative-revoke-only mode. */
 		layout_recall_set_session_table(lr, session_tbl);
 		if (cfg.ds_heartbeat_ms == 0) {
-			(void)fprintf(stderr,
-				"INFO: DS health monitoring disabled "
-				"(ds_heartbeat_ms=0)\n");
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"DS health monitoring disabled "
+				"(ds_heartbeat_ms=0)");
 		} else if (ds_health_init(cat, cq, cfg.ds_heartbeat_ms,
 					  cfg.ds_health_fail_threshold,
 					  ds_fail_recall_cb, lr, &ds_hm) == 0) {
@@ -1136,20 +1149,20 @@ int main(int argc, char *argv[])
 			}
 			ds_health_start(ds_hm);
 		} else {
-			(void)fprintf(stderr, "WARN: ds_health_init failed\n");
+			MDS_LOG_WARN(LOG_COMP_MDS, "ds_health_init failed");
 		}
 	} else {
-		(void)fprintf(stderr, "WARN: layout_recall_init failed\n");
+		MDS_LOG_WARN(LOG_COMP_MDS, "layout_recall_init failed");
 	}
 
 	/* 6d. Open state table (shared with resilver for writer fencing). */
 	if (lock_table_init(cfg.self.id, &lock_tbl) != 0) {
-		(void)fprintf(stderr, "lock_table_init failed\n");
+		MDS_LOG_ERROR(LOG_COMP_MDS, "lock_table_init failed");
 		return EXIT_FAILURE;
 	}
 
 	if (open_state_table_init(cfg.self.id, &ot) != 0) {
-		(void)fprintf(stderr, "WARN: open_state_table_init failed\n");
+		MDS_LOG_WARN(LOG_COMP_MDS, "open_state_table_init failed");
 		ot = NULL;
 	}
 
@@ -1161,35 +1174,35 @@ int main(int argc, char *argv[])
 			open_state_table_set_cat(ot, cat, rondb_boot_epoch);
 			if (cfg.transient_state_cache) {
 				open_state_table_set_skip_ndb(ot, true);
-				(void)fprintf(stderr,
-					"INFO: transient_state_cache=on "
-					"(open/layout NDB writes skipped)\n");
+				MDS_LOG_INFO(LOG_COMP_MDS,
+					"transient_state_cache=on "
+					"(open/layout NDB writes skipped)");
 			}
 		}
 		if (lock_tbl != NULL) {
 			lock_table_set_cat(lock_tbl, cat, rondb_boot_epoch);
 		}
-		(void)fprintf(stderr,
-			"INFO: shared protocol state active "
-			"(open+lock write-through to RonDB)\n");
+		MDS_LOG_INFO(LOG_COMP_MDS,
+			"shared protocol state active "
+			"(open+lock write-through to RonDB)");
 	}
 #endif
 
 	/* 6e. Resilver worker (admin-triggered, not auto-started). */
 	if (resilver_init(cat, cq, proxy, ot, &rw) != 0) {
-		(void)fprintf(stderr, "WARN: resilver_init failed\n");
+		MDS_LOG_WARN(LOG_COMP_MDS, "resilver_init failed");
 		rw = NULL;
 	}
 
 	/* 6f. Rebalance worker (admin-triggered, not auto-started). */
 	if (rebalance_init(cat, cq, proxy, ot, &rbw) != 0) { /* catalogue escape hatch */
-		(void)fprintf(stderr, "WARN: rebalance_init failed\n");
+		MDS_LOG_WARN(LOG_COMP_MDS, "rebalance_init failed");
 		rbw = NULL;
 	}
 
 	/* 6g. I/O tracker for tiering heat signal. */
 	if (io_tracker_init(4096, &iot) != 0) {
-		(void)fprintf(stderr, "WARN: io_tracker_init failed\n");
+		MDS_LOG_WARN(LOG_COMP_MDS, "io_tracker_init failed");
 		iot = NULL;
 	}
 
@@ -1199,7 +1212,7 @@ int main(int argc, char *argv[])
 	/* 6h. Tiering worker (admin-triggered, not auto-started). */
 	if (iot != NULL) {
 		if (tiering_init(cat, cq, proxy, ot, iot, &tw) != 0) {
-			(void)fprintf(stderr, "WARN: tiering_init failed\n");
+			MDS_LOG_WARN(LOG_COMP_MDS, "tiering_init failed");
 			tw = NULL;
 		}
 	}
@@ -1221,16 +1234,16 @@ int main(int argc, char *argv[])
 		if (split_evaluator_start(smap, cat, NULL, &se_cfg,
 					  &split_eval) == 0 &&
 		    split_eval != NULL) {
-			(void)fprintf(stderr,
-				"INFO: split evaluator active "
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"split evaluator active "
 				"(threshold=%lu, interval=%us, "
-				"auto_exec=%s)\n",
+				"auto_exec=%s)",
 				(unsigned long)cfg.auto_split_threshold,
 				(unsigned)cfg.auto_split_interval,
 				cfg.auto_split_execute ? "yes" : "no");
 		} else {
-			(void)fprintf(stderr,
-				"WARN: split_evaluator_start failed\n");
+			MDS_LOG_WARN(LOG_COMP_MDS,
+				"split_evaluator_start failed");
 			split_eval = NULL;
 		}
 	}
@@ -1295,13 +1308,13 @@ int main(int argc, char *argv[])
 				: (cfg.placement_policy == PLACEMENT_CAPACITY)
 					? "capacity"
 				: "rr";
-			(void)fprintf(stderr,
-				"INFO: placement_policy=%s (dispatcher "
-				"active)\n", pname);
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"placement_policy=%s (dispatcher "
+				"active)", pname);
 		} else {
-			(void)fprintf(stderr,
-				"INFO: placement_policy_enabled=false "
-				"(legacy RR path)\n");
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"placement_policy_enabled=false "
+				"(legacy RR path)");
 		}
 		rpc_cfg.write_verf = (uint64_t)time(NULL);
 		rpc_cfg.cat        = cat;
@@ -1322,14 +1335,14 @@ int main(int argc, char *argv[])
 			if (mds_gss_init(cfg.krb5_keytab_path,
 			                 cfg.krb5_principal,
 			                 &gss_tbl) != 0) {
-				(void)fprintf(stderr,
-					"FATAL: GSS init failed for "
-					"nfs_auth_mode=%d\n",
+				MDS_LOG_FATAL(LOG_COMP_MDS,
+					"GSS init failed for "
+					"nfs_auth_mode=%d",
 					(int)cfg.nfs_auth_mode);
 				goto cleanup;
 			}
-			(void)fprintf(stderr,
-				"INFO: nfs_auth_mode=%d, GSS ready\n",
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"nfs_auth_mode=%d, GSS ready",
 				(int)cfg.nfs_auth_mode);
 		}
 		rpc_cfg.min_auth = cfg.nfs_auth_mode;
@@ -1339,9 +1352,9 @@ int main(int argc, char *argv[])
 	 * worker_threads == 0 or 1 -> inline processing (tp = NULL). */
 	if (cfg.worker_threads > 1) {
 		if (threadpool_create(cfg.worker_threads, &rpc_tp) != 0) {
-			(void)fprintf(stderr,
-				"WARN: threadpool_create(%u) failed, "
-				"falling back to inline dispatch\n",
+			MDS_LOG_WARN(LOG_COMP_MDS,
+				"threadpool_create(%u) failed, "
+				"falling back to inline dispatch",
 				(unsigned)cfg.worker_threads);
 			rpc_tp = NULL;
 		}
@@ -1393,14 +1406,14 @@ int main(int argc, char *argv[])
 			if (inode_cache_init(icache_size, &icache) == 0) {
 				inode_cache_set_ttl_ms(icache,
 						       cache_pos_ttl_ms);
-				(void)fprintf(stderr,
-					"INFO: inode cache active "
-					"(max=%u entries, ttl=%ums)\n",
+				MDS_LOG_INFO(LOG_COMP_MDS,
+					"inode cache active "
+					"(max=%u entries, ttl=%ums)",
 					(unsigned)icache_size,
 					(unsigned)cache_pos_ttl_ms);
 			} else {
-				(void)fprintf(stderr,
-					"WARN: inode_cache_init failed\n");
+				MDS_LOG_WARN(LOG_COMP_MDS,
+					"inode_cache_init failed");
 			}
 			rpc_cfg.icache = icache;
 
@@ -1426,15 +1439,15 @@ int main(int argc, char *argv[])
 					      &dcache) == 0) {
 				dirent_cache_set_pos_ttl_ms(dcache,
 							    cache_pos_ttl_ms);
-				(void)fprintf(stderr,
-					"INFO: dirent cache active "
-					"(max=%u, neg_ttl=%ums, pos_ttl=%ums)\n",
+				MDS_LOG_INFO(LOG_COMP_MDS,
+					"dirent cache active "
+					"(max=%u, neg_ttl=%ums, pos_ttl=%ums)",
 					(unsigned)dcache_size,
 					(unsigned)neg_ttl,
 					(unsigned)cache_pos_ttl_ms);
 			} else {
-				(void)fprintf(stderr,
-					"WARN: dirent_cache_init failed\n");
+				MDS_LOG_WARN(LOG_COMP_MDS,
+					"dirent_cache_init failed");
 			}
 		rpc_cfg.dcache = dcache;
 		}
@@ -1456,14 +1469,14 @@ int main(int argc, char *argv[])
 			uint32_t lcache_size = cfg.layout_cache_size > 0
 				? cfg.layout_cache_size : 1024;
 			if (layout_cache_init(lcache_size, &lcache) == 0) {
-				(void)fprintf(stderr,
-					"INFO: HPC layout cache active "
-					"(max=%u entries)\n",
+				MDS_LOG_INFO(LOG_COMP_MDS,
+					"HPC layout cache active "
+					"(max=%u entries)",
 					(unsigned)lcache_size);
 			} else {
-				(void)fprintf(stderr,
-					"WARN: layout_cache_init failed; "
-					"falling back to catalogue reads\n");
+				MDS_LOG_WARN(LOG_COMP_MDS,
+					"layout_cache_init failed; "
+					"falling back to catalogue reads");
 			}
 			rpc_cfg.lcache = lcache;
 		}
@@ -1490,18 +1503,18 @@ int main(int argc, char *argv[])
 					&s_lcommit_flush_ctx);
 				if (layout_commit_aggregator_start(
 						lcommit_agg) != 0) {
-					(void)fprintf(stderr,
-						"WARN: layout_commit_aggregator_"
+					MDS_LOG_WARN(LOG_COMP_MDS,
+						"layout_commit_aggregator_"
 						"start failed; tearing down "
-						"aggregator\n");
+						"aggregator");
 					layout_commit_aggregator_destroy(
 						lcommit_agg);
 					lcommit_agg = NULL;
 				} else {
-					(void)fprintf(stderr,
-						"INFO: HPC layout_commit "
+					MDS_LOG_INFO(LOG_COMP_MDS,
+						"HPC layout_commit "
 						"aggregator active "
-						"(buckets=%u, flush=%ums)\n",
+						"(buckets=%u, flush=%ums)",
 						(unsigned)(agg_size != 0 ?
 							agg_size :
 							LCA_DEFAULT_MAX_BUCKETS),
@@ -1510,10 +1523,10 @@ int main(int argc, char *argv[])
 							LCA_DEFAULT_FLUSH_INTERVAL_MS));
 				}
 			} else {
-				(void)fprintf(stderr,
-					"WARN: layout_commit_aggregator_init "
+				MDS_LOG_WARN(LOG_COMP_MDS,
+					"layout_commit_aggregator_init "
 					"failed; falling back to synchronous "
-					"LAYOUTCOMMIT\n");
+					"LAYOUTCOMMIT");
 			}
 			rpc_cfg.lcommit_agg = lcommit_agg;
 		}
@@ -1535,8 +1548,8 @@ int main(int argc, char *argv[])
 		if (cfg.file_delegations_enabled) {
 			struct deleg_table *dt = NULL;
 			if (deleg_table_init(cfg.self.id, &dt) == 0) {
-				(void)fprintf(stderr,
-					"INFO: delegation table active\n");
+				MDS_LOG_INFO(LOG_COMP_MDS,
+					"delegation table active");
 #ifdef HAVE_RONDB
 				if (cfg.catalogue_backend == MDS_BACKEND_RONDB) {
 					deleg_table_set_cat(dt, cat,
@@ -1559,14 +1572,14 @@ int main(int argc, char *argv[])
 				}
 				rpc_cfg.dt = dt;
 			} else {
-				(void)fprintf(stderr,
-					"WARN: deleg_table_init failed\n");
+				MDS_LOG_WARN(LOG_COMP_MDS,
+					"deleg_table_init failed");
 			}
 		} else {
-			(void)fprintf(stderr,
-				"INFO: file_delegations_enabled=false "
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"file_delegations_enabled=false "
 				"(deleg table not wired; OPEN never grants"
-				" file delegations)\n");
+				" file delegations)");
 		}
 
 		/* Directory delegation table (RFC 8881 S10.9). */
@@ -1577,22 +1590,22 @@ int main(int argc, char *argv[])
 			if (cfg.dir_delegations_enabled) {
 				if (dir_deleg_table_init(cfg.self.id,
 							 &ddt) == 0) {
-					(void)fprintf(stderr,
-						"INFO: directory delegation "
-						"table active\n");
+					MDS_LOG_INFO(LOG_COMP_MDS,
+						"directory delegation "
+						"table active");
 					dir_deleg_table_set_session_table(
 						ddt, session_tbl);
 					rpc_cfg.ddt = ddt;
 				} else {
-					(void)fprintf(stderr,
-						"WARN: dir_deleg_table_init "
-						"failed\n");
+					MDS_LOG_WARN(LOG_COMP_MDS,
+						"dir_deleg_table_init "
+						"failed");
 				}
 			}
 		}
 
 		if (rpc_server_create(&rpc_cfg, &rpc_srv[0]) != 0) {
-			(void)fprintf(stderr, "rpc_server_create failed\n");
+			MDS_LOG_ERROR(LOG_COMP_MDS, "rpc_server_create failed");
 			exit_code = EXIT_FAILURE;
 			goto cleanup;
 		}
@@ -1616,17 +1629,17 @@ int main(int argc, char *argv[])
 			rpc_cfg.port = rpc_server_port(rpc_srv[0]);
 			for (uint32_t li = 1; li < target; li++) {
 				if (rpc_server_create(&rpc_cfg, &rpc_srv[li]) != 0) {
-					(void)fprintf(stderr,
-						"WARN: RPC listener %u/%u bind failed, "
-						"using %u listener(s)\n",
+					MDS_LOG_WARN(LOG_COMP_MDS,
+						"RPC listener %u/%u bind failed, "
+						"using %u listener(s)",
 						(unsigned)(li + 1), (unsigned)target,
 						(unsigned)li);
 					break;
 				}
 				rpc_listener_count = li + 1;
 			}
-			(void)fprintf(stderr,
-				"INFO: %u RPC listener(s) on port %u\n",
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"%u RPC listener(s) on port %u",
 				(unsigned)rpc_listener_count,
 				(unsigned)bound_port);
 		}
@@ -1638,9 +1651,9 @@ int main(int argc, char *argv[])
 			if (pthread_create(&rpc_threads[li], NULL,
 					   rpc_listener_thread,
 					   rpc_srv[li]) != 0) {
-				(void)fprintf(stderr,
-					"WARN: pthread_create for listener %u "
-					"failed\n", (unsigned)li);
+				MDS_LOG_WARN(LOG_COMP_MDS,
+					"pthread_create for listener %u "
+					"failed", (unsigned)li);
 				rpc_server_destroy(rpc_srv[li]);
 				rpc_srv[li] = NULL;
 			} else {
@@ -1649,8 +1662,8 @@ int main(int argc, char *argv[])
 		}
 
 		if (started_count == 0) {
-			(void)fprintf(stderr,
-				"FATAL: no RPC listener threads started\n");
+			MDS_LOG_FATAL(LOG_COMP_MDS,
+				"no RPC listener threads started");
 			exit_code = EXIT_FAILURE;
 			goto cleanup;
 		}
@@ -1708,9 +1721,9 @@ int main(int argc, char *argv[])
 	 * in mds.conf.  See docs/mountd-compat.md. */
 	if (cfg.mountd_compat_enabled) {
 		if (mountd_compat_start(&cfg, &mountd_compat) != 0) {
-			(void)fprintf(stderr,
-				"WARN: mountd_compat_start failed; "
-				"showmount -e will not work\n");
+			MDS_LOG_WARN(LOG_COMP_MDS,
+				"mountd_compat_start failed; "
+				"showmount -e will not work");
 			mountd_compat = NULL;
 		}
 	}
@@ -1741,7 +1754,7 @@ cleanup:
 	if (exit_code == EXIT_SUCCESS) {
 		(void)fprintf(stdout, "pnfs-mds shutting down.\n");
 	} else {
-		(void)fprintf(stderr, "pnfs-mds startup failed, cleaning up.\n");
+		MDS_LOG_ERROR(LOG_COMP_MDS, "pnfs-mds startup failed, cleaning up.");
 	}
 
 	/* Phase 1: stop RPC listeners. */
@@ -1800,8 +1813,8 @@ cleanup:
 			rondb_image = NULL;
 		}
 		(void)catalogue_rondb_mds_deregister(cat, cfg.self.id);
-		(void)fprintf(stderr,
-			"INFO: RonDB node %u deregistered\n",
+		MDS_LOG_INFO(LOG_COMP_MDS,
+			"RonDB node %u deregistered",
 			(unsigned)cfg.self.id);
 	}
 #endif
@@ -1854,6 +1867,10 @@ cleanup:
 	}
 	mds_tls_ctx_destroy(cluster_tls);
 	mds_tls_ctx_destroy(cluster_tls_client);
+
+	/* Flush and close the log file last so shutdown diagnostics above
+	 * are durable.  No-op when logging to stderr. */
+	mds_log_shutdown();
 
 	return exit_code;
 }

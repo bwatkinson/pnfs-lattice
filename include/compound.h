@@ -1380,7 +1380,6 @@ struct nfs4_res_layoutget {
 	uint32_t              ff_mirror_count;
 	struct nfs4_ff_mirror *ff_mirrors; /* heap, sized ff_mirror_count */
 	uint32_t              ff_flags;
-	uint32_t              stripe_lease_duration_ms;
 
 	/*
 	 * Phase C / Step 6 — wire-form selector.

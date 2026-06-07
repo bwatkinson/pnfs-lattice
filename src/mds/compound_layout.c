@@ -36,13 +36,6 @@
 #include "lease_table.h"    /* stripe lease table (Phase 2) */
 #include "mds_op_metrics.h" /* CAT_TIMED-equivalent for direct fused call */
 
-/* FF_FLAGS_STRIPE_LEASE lives in layout_types.h, but that header's
- * enum layout_iomode collides with compound.h's #define macros of the
- * same names.  Duplicate the single constant here to avoid the clash. */
-#ifndef FF_FLAGS_STRIPE_LEASE
-#define FF_FLAGS_STRIPE_LEASE 0x00000010
-#endif
-
 
 /* -----------------------------------------------------------------------
  * pNFS layout handlers
@@ -1970,12 +1963,15 @@ fill_layoutget_result:
 	if (r->layout_type == LAYOUT4_FLEX_FILES) {
 		r->ff_flags = 0;
 
-		/* Stripe lease: set flag + duration and acquire the lease. */
+		/* Stripe lease: acquire the in-memory lease only.
+		 * The historical FF_FLAGS_STRIPE_LEASE wire flag and the
+		 * trailing ffl_stripe_lease_duration_ms XDR field were a
+		 * PEAK-only extension of RFC 8435 Flex Files v1; removed
+		 * so the LAYOUTGET reply is bit-for-bit RFC compliant.
+		 * Cross-client coordination still happens server-side
+		 * via stripe_lease_check_conflict at LAYOUTGET entry. */
 		if (cd->slt != NULL &&
 		    cd->cfg_stripe_lease_duration_ms > 0) {
-			r->ff_flags |= FF_FLAGS_STRIPE_LEASE;
-			r->stripe_lease_duration_ms =
-				cd->cfg_stripe_lease_duration_ms;
 			(void)stripe_lease_acquire(
 				cd->slt,
 				cd->current_fh.fileid,

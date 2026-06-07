@@ -71,7 +71,7 @@ detect_iface() {
 
 # -- mount/umount ------------------------------------------------------
 ensure_mount() {
-    local opts="${1:-vers=4.1,rsize=1048576,wsize=1048576}"
+    local opts="${1:-vers=4.2,rsize=1048576,wsize=1048576}"
     if mountpoint -q "$MOUNT"; then
         log "already mounted: $MOUNT"
         return 0

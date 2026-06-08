@@ -1029,8 +1029,14 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 	 * so the requesting client retries after a backoff.
 	 *
 	 * Same-client requests are allowed (renewal path). */
-	if (cd->slt != NULL && cd->cfg_stripe_lease_duration_ms > 0) {
-		/* Patch 0005: per-DS-stripe lease keying.  Decompose the
+	if (cd->slt != NULL && cd->cfg_stripe_lease_duration_ms > 0 &&
+	    (inode.flags & MDS_IFLAG_HPC_SHARED) != 0) {
+		/* Patch 0006: per-stripe lease arbitration is gated by
+		 * MDS_IFLAG_HPC_SHARED on the inode -- non-HPC files never
+		 * enter the SLT, preserving baseline (non-arbitrated)
+		 * behaviour for regular workloads.
+		 *
+		 * Patch 0005: per-DS-stripe lease keying.  Decompose the
 		 * logical lease range into per-stripe slices and conflict-
 		 * check each one against the lease table.  Slicing fails
 		 * closed -- on error we return TRYLATER. */
@@ -2005,8 +2011,12 @@ fill_layoutget_result:
 		 * Cross-client coordination still happens server-side
 		 * via stripe_lease_check_conflict at LAYOUTGET entry. */
 		if (cd->slt != NULL &&
-		    cd->cfg_stripe_lease_duration_ms > 0) {
-			/* Patch 0005: per-DS-stripe lease keying.  Acquire one
+		    cd->cfg_stripe_lease_duration_ms > 0 &&
+		    (inode.flags & MDS_IFLAG_HPC_SHARED) != 0) {
+			/* Patch 0006: HPC-gated.  Only HPC_SHARED files enter
+			 * the SLT (matches the conflict-check gate above).
+			 *
+			 * Patch 0005: per-DS-stripe lease keying.  Acquire one
 			 * lease entry per stripe slice; best-effort -- the
 			 * conflict check at LAYOUTGET entry already ruled out
 			 * cross-client collisions. */

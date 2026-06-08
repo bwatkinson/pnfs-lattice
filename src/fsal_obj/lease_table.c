@@ -24,6 +24,7 @@
 #include <pthread.h>
 
 #include "lease_table.h"
+#include "lease_stripe_map.h"
 
 #define SLT_SHARD_COUNT 16
 #define SLT_SHARD_MASK  (SLT_SHARD_COUNT - 1)
@@ -247,4 +248,37 @@ void stripe_lease_release_all_for(struct stripe_lease_table *tbl,
         }
         pthread_mutex_unlock(&sh->lock);
     }
+}
+
+uint64_t stripe_lease_prefix_conflict_free_length(
+    struct stripe_lease_table *tbl,
+    const struct stripe_slice *slices,
+    uint32_t nslices,
+    uint32_t stripe_unit,
+    uint64_t lease_offset,
+    uint64_t lease_length,
+    uint64_t fileid,
+    uint64_t clientid)
+{
+    if (tbl == NULL || slices == NULL || nslices == 0 ||
+        stripe_unit == 0 || lease_length == 0) {
+        return lease_length;
+    }
+    for (uint32_t i = 0; i < nslices; i++) {
+        const struct stripe_slice *sl = &slices[i];
+        if (stripe_lease_check_conflict(
+                tbl, fileid, clientid,
+                sl->stripe_index,
+                sl->ds_offset,
+                sl->ds_length)) {
+            uint64_t conflict_file_start =
+                (uint64_t)sl->stripe_index * (uint64_t)stripe_unit +
+                sl->ds_offset;
+            if (conflict_file_start <= lease_offset) {
+                return 0;
+            }
+            return conflict_file_start - lease_offset;
+        }
+    }
+    return lease_length;
 }

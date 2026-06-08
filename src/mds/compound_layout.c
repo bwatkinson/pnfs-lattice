@@ -1048,15 +1048,25 @@ enum nfs4_status op_layoutget(struct compound_data *cd,
 		if (_slt_n < 0) {
 			return NFS4ERR_LAYOUTTRYLATER;
 		}
-		for (int _slt_i = 0; _slt_i < _slt_n; _slt_i++) {
-			if (stripe_lease_check_conflict(
-				cd->slt,
-				cd->current_fh.fileid,
-				cd->clientid,
-				_slt_slices[_slt_i].stripe_index,
-				_slt_slices[_slt_i].ds_offset,
-				_slt_slices[_slt_i].ds_length)) {
-				return NFS4ERR_LAYOUTTRYLATER;
+		/* Patch 0007: contention-aware grant narrowing.
+		 * Find the longest conflict-free file-byte prefix.  If
+		 * 0 < prefix < lease_length, narrow lease+grant to the
+		 * prefix so the client gets a smaller-but-usable layout
+		 * instead of NFS4ERR_LAYOUTTRYLATER.  prefix == 0 keeps
+		 * the legacy TRYLATER behaviour. */
+		uint64_t _slt_prefix = stripe_lease_prefix_conflict_free_length(
+			cd->slt,
+			_slt_slices, (uint32_t)_slt_n,
+			_slt_unit,
+			lease_offset, lease_length,
+			cd->current_fh.fileid, cd->clientid);
+		if (_slt_prefix == 0) {
+			return NFS4ERR_LAYOUTTRYLATER;
+		}
+		if (_slt_prefix < lease_length) {
+			lease_length = _slt_prefix;
+			if (grant_length > _slt_prefix) {
+				grant_length = _slt_prefix;
 			}
 		}
 	}

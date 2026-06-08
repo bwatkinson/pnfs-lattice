@@ -23,6 +23,9 @@ bash tests/empirical/run_all.sh
 | `0003` | `dev@90f2b05` (auto-widen-lease-on-4k) | off | 8/8 pass | 2/2 pass | 4/4 pass | 171 pass / 8 expected (deleg off) / 2 lattice-divergence / 0 unexp |
 | `0004` | `dev@c578d06` (configurable-grant-cap) | off | 8/8 pass | 2/2 pass | 4/4 pass | 171 pass / 8 expected (deleg off) / 2 lattice-divergence / 0 unexp |
 | `0004_deleg` | `dev@c578d06` | on | n/a | n/a | n/a | 179 pass / 2 lattice-divergence / 0 unexp |
+| `0005` | `dev@251d558` (per-DS-stripe lease keying) | on | 8/8 pass | 2/2 pass | 4/4 pass | 179 pass / 2 lattice-divergence / 0 unexp |
+| `0006` | `dev@c0ff63c` (HPC-gated activation) | on | 8/8 pass | 2/2 pass | 4/4 pass | 179 pass / 2 lattice-divergence / 0 unexp |
+| `0007` | `dev@HEAD` (contention-aware grant narrowing) | on | 8/8 pass | 2/2 pass | 4/4 pass | 179 pass / 2 lattice-divergence / 0 unexp |
 
 The `_deleg` re-run of 0004 establishes byte-for-byte pynfs parity with
 the `baseline_lattice_main` run: 179 pass, 2 fail, 0 errors, 0

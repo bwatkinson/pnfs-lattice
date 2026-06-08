@@ -122,4 +122,41 @@ void stripe_lease_release_all_for(struct stripe_lease_table *tbl,
                                   uint64_t fileid,
                                   uint64_t clientid);
 
+
+struct stripe_slice;  /* defined in lease_stripe_map.h */
+
+/**
+ * @brief Longest conflict-free file-byte prefix of a slice vector.
+ *
+ * Walks the slice vector in stripe-index order (which is also the
+ * file-byte order within the first stripe-ring lap of the lease
+ * range).  For each slice queries stripe_lease_check_conflict() and
+ * returns the file-byte count, starting at @p lease_offset, that is
+ * conflict-free.
+ *
+ * Used by op_layoutget to proactively narrow a grant on partial
+ * contention -- rather than returning NFS4ERR_LAYOUTTRYLATER when
+ * any slice is held, the caller shrinks lease+grant length to this
+ * prefix and serves a smaller, immediately-usable layout.
+ *
+ * Returns:
+ *   0                  -- first slice already contended; caller
+ *                         should return NFS4ERR_LAYOUTTRYLATER.
+ *   == lease_length    -- entire range conflict-free; no change.
+ *   0 < x < lease_len  -- caller may narrow to x file bytes.
+ *
+ * NULL-safe: tbl==NULL, slices==NULL, nslices==0, stripe_unit==0
+ * or lease_length==0 all return lease_length (caller proceeds as
+ * if no contention).
+ */
+uint64_t stripe_lease_prefix_conflict_free_length(
+    struct stripe_lease_table *tbl,
+    const struct stripe_slice *slices,
+    uint32_t nslices,
+    uint32_t stripe_unit,
+    uint64_t lease_offset,
+    uint64_t lease_length,
+    uint64_t fileid,
+    uint64_t clientid);
+
 #endif /* LEASE_TABLE_H */

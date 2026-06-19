@@ -58,6 +58,10 @@ struct layout_recall;
 /** Maximum single RPC record size (1 MB). */
 #define RPC_MAX_RECORD_SIZE  (1U << 20)
 
+/** Default per-connection in-flight request cap (bounded pipelining).
+ *  Used when rpc_server_config.max_inflight_per_conn is 0. */
+#define RPC_DEFAULT_MAX_INFLIGHT  8
+
 /* Forward declarations for config member types. */
 struct mds_gss_table;
 struct commit_queue;
@@ -81,6 +85,11 @@ struct rpc_server_config {
     uint32_t    stripe_unit;    /**< Stripe unit (0 = 64 KiB default). */
     bool        auto_widen_lease_on_4k; /**< Widen generic 4 KiB leases. */
     uint32_t    max_conns;      /**< Max connections (0 = RPC_MAX_CONNS). */
+    /* Bounded request pipelining: max COMPOUNDs processed concurrently
+     * per connection (0 = RPC_DEFAULT_MAX_INFLIGHT).  Lets NFSv4.1
+     * session-slot parallelism use the worker pool instead of being
+     * serialized one-at-a-time per TCP connection. */
+    uint32_t    max_inflight_per_conn;
     /* Phase 1: placement policy for new files' layouts.  Ignored
      * unless placement_policy_enabled is true. */
     enum mds_placement_policy placement_policy;

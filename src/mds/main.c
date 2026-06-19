@@ -1365,6 +1365,7 @@ int main(int argc, char *argv[])
 		}
 	}
 	rpc_cfg.tp = rpc_tp;
+	rpc_cfg.max_inflight_per_conn = cfg.max_inflight_per_conn;
 	/* Publish the pool to the metrics renderer so /metrics
 	 * exports pnfs_mds_rpc_worker_* / pnfs_mds_rpc_queue_*
 	 * gauges and the queue-wait histogram. */

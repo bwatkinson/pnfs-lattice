@@ -71,6 +71,7 @@ struct test_ctx {
     struct session_table    *st;
     struct open_state_table *ot;
     struct rpc_server       *srv;
+    struct threadpool       *tp;   /* NULL for inline-path tests */
     pthread_t                thread;
 };
 
@@ -108,11 +109,47 @@ static void setup_test(struct test_ctx *ctx)
     usleep(50000); /* 50ms -- let server start epoll loop. */
 }
 
+/* Set up a server with a worker pool + bounded pipelining cap, so the
+ * threadpool dispatch path (not the inline path) is exercised. */
+static void setup_test_pooled(struct test_ctx *ctx, uint32_t max_inflight)
+{
+    struct rpc_server_config cfg;
+
+    memset(ctx, 0, sizeof(*ctx));
+
+    ctx->cat = open_test_catalogue();
+    if (ctx->cat == NULL) {
+        return;  /* Caller checks ctx->cat for NULL. */
+    }
+    assert(session_table_init(TEST_MDS_ID, 0, &ctx->st) == 0);
+    assert(open_state_table_init(TEST_MDS_ID, &ctx->ot) == 0);
+    assert(threadpool_create(4, &ctx->tp) == 0);
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.bind_addr = "127.0.0.1";
+    cfg.port = 0; /* Ephemeral port */
+    cfg.cat = ctx->cat;
+    cfg.tp = ctx->tp;
+    cfg.max_inflight_per_conn = max_inflight;
+
+    assert(rpc_server_create(&cfg, &ctx->srv) == 0);
+    assert(rpc_server_port(ctx->srv) != 0);
+
+    assert(pthread_create(&ctx->thread, NULL, server_thread,
+                          ctx->srv) == 0);
+    usleep(50000); /* 50ms -- let server start epoll loop. */
+}
+
 static void teardown_test(struct test_ctx *ctx)
 {
     rpc_server_stop(ctx->srv);
     pthread_join(ctx->thread, NULL);
     rpc_server_destroy(ctx->srv);
+    /* The pool must be destroyed only after the server (which uses it)
+     * is fully stopped + destroyed. */
+    if (ctx->tp != NULL) {
+        threadpool_destroy(ctx->tp);
+    }
     open_state_table_destroy(ctx->ot);
     session_table_destroy(ctx->st);
     mds_catalogue_close(ctx->cat);
@@ -168,6 +205,49 @@ static int send_and_recv(int fd, const uint8_t *req, uint32_t req_len,
     if (rlen > reply_max)
         return -1;
 
+    total_read = 0;
+    while (total_read < rlen) {
+        n = read(fd, reply + total_read, rlen - total_read);
+        if (n <= 0)
+            return -1;
+        total_read += (uint32_t)n;
+    }
+    *reply_len = rlen;
+    return 0;
+}
+
+/** Write one record-marked request without reading the reply. */
+static int send_record_only(int fd, const uint8_t *req, uint32_t req_len)
+{
+    uint32_t hdr = htonl(req_len | 0x80000000U);
+
+    if (write(fd, &hdr, 4) != 4)
+        return -1;
+    if (write(fd, req, req_len) != (ssize_t)req_len)
+        return -1;
+    return 0;
+}
+
+/** Read one record-marked reply (4-byte frag header + body). */
+static int recv_one_reply(int fd, uint8_t *reply, uint32_t reply_max,
+                          uint32_t *reply_len)
+{
+    uint8_t rhdr[4];
+    ssize_t n;
+    uint32_t total_read = 0;
+
+    while (total_read < 4) {
+        n = read(fd, rhdr + total_read, 4 - total_read);
+        if (n <= 0)
+            return -1;
+        total_read += (uint32_t)n;
+    }
+    uint32_t raw = ((uint32_t)rhdr[0] << 24) | ((uint32_t)rhdr[1] << 16) |
+                   ((uint32_t)rhdr[2] << 8)  | ((uint32_t)rhdr[3]);
+    uint32_t rlen = raw & 0x7FFFFFFFU;
+
+    if (rlen > reply_max)
+        return -1;
     total_read = 0;
     while (total_read < rlen) {
         n = read(fd, reply + total_read, rlen - total_read);
@@ -313,6 +393,97 @@ static void test_multiple_connections(void)
     teardown_test(&ctx);
 }
 
+/*
+ * Bounded request pipelining: send many NULL calls back-to-back on a
+ * single connection (without reading), then verify every reply comes
+ * back exactly once.  The cap (2) is intentionally smaller than the
+ * request count so the in-flight-cap disarm + completion re-arm path
+ * is exercised.  Replies may return out of order -- the client matches
+ * by XID -- so we only assert set membership.
+ */
+static void test_pipelined_requests(void)
+{
+    struct test_ctx ctx;
+    uint8_t req[256];
+    enum { PIPE_N = 16 };
+    int seen[PIPE_N];
+
+    setup_test_pooled(&ctx, 2);
+    if (ctx.cat == NULL) {
+        fprintf(stdout, "SKIP (no RonDB)\n");
+        tests_passed++;
+        return;
+    }
+
+    int fd = connect_to_server(&ctx);
+    ASSERT_TRUE(fd >= 0);
+
+    for (uint32_t i = 0; i < PIPE_N; i++) {
+        uint32_t req_len = build_null_call(req, sizeof(req), 0x3000 + i);
+        ASSERT_EQ(send_record_only(fd, req, req_len), 0);
+    }
+
+    for (uint32_t i = 0; i < PIPE_N; i++) {
+        seen[i] = 0;
+    }
+    for (uint32_t i = 0; i < PIPE_N; i++) {
+        uint8_t reply[4096];
+        uint32_t reply_len = 0;
+        ASSERT_EQ(recv_one_reply(fd, reply, sizeof(reply), &reply_len), 0);
+        ASSERT_TRUE(reply_len >= 4);
+        uint32_t r_xid = ((uint32_t)reply[0] << 24) |
+                         ((uint32_t)reply[1] << 16) |
+                         ((uint32_t)reply[2] << 8)  |
+                         ((uint32_t)reply[3]);
+        ASSERT_TRUE(r_xid >= 0x3000 && r_xid < 0x3000 + PIPE_N);
+        uint32_t idx = r_xid - 0x3000;
+        ASSERT_EQ(seen[idx], 0);  /* no duplicate reply */
+        seen[idx] = 1;
+    }
+    for (uint32_t i = 0; i < PIPE_N; i++) {
+        ASSERT_TRUE(seen[i]);  /* every request answered */
+    }
+
+    close(fd);
+    teardown_test(&ctx);
+}
+
+/*
+ * Deferred close: pipeline many requests then close the connection
+ * immediately without reading any reply.  This drives conn_begin_close
+ * (HUP) while requests may still be in flight on worker threads; the
+ * server must finalize the connection only after they drain, without
+ * crashing, leaking, or hanging on shutdown.
+ */
+static void test_close_during_pipeline(void)
+{
+    struct test_ctx ctx;
+    uint8_t req[256];
+
+    setup_test_pooled(&ctx, 4);
+    if (ctx.cat == NULL) {
+        fprintf(stdout, "SKIP (no RonDB)\n");
+        tests_passed++;
+        return;
+    }
+
+    int fd = connect_to_server(&ctx);
+    ASSERT_TRUE(fd >= 0);
+
+    for (uint32_t i = 0; i < 32; i++) {
+        uint32_t req_len = build_null_call(req, sizeof(req), 0x4000 + i);
+        if (send_record_only(fd, req, req_len) != 0) {
+            break;  /* peer reset is acceptable under abrupt close */
+        }
+    }
+    /* Abrupt close without draining replies -> server sees EPOLLHUP. */
+    close(fd);
+    usleep(20000); /* let the server observe HUP and drain workers */
+
+    /* Must not crash/hang: deferred finalize + inflight drain on stop. */
+    teardown_test(&ctx);
+}
+
 int main(void)
 {
     fprintf(stdout, "test_rpc_server (RonDB-native)\n");
@@ -320,6 +491,8 @@ int main(void)
     RUN_TEST(test_null_procedure);
     RUN_TEST(test_server_stop_clean);
     RUN_TEST(test_multiple_connections);
+    RUN_TEST(test_pipelined_requests);
+    RUN_TEST(test_close_during_pipeline);
 
     fprintf(stdout, "\n  %d/%d tests passed\n",
         tests_passed, tests_run);

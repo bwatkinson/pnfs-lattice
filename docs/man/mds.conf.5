@@ -265,6 +265,17 @@ Applies a curated set of tuning defaults.
 .BR 16 ).
 COMPOUND dispatch thread count.
 .TP
+.B max_inflight_per_conn
+.IR uint ,
+range
+.I "1..1024"
+(default
+.BR 8 ).
+Maximum COMPOUND requests processed concurrently per TCP connection
+(bounded request pipelining).  Larger values let a client with few
+connections but many NFSv4.1 session slots use more of the worker pool;
+the cost is up to this many in-flight request buffers per connection.
+.TP
 .B stripe_unit_bytes
 .I uint
 (default

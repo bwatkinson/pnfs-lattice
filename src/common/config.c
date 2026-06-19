@@ -202,6 +202,7 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
     cfg->self.grpc_port = 50051;
     cfg->catalogue_backend = MDS_BACKEND_RONDB;
     cfg->worker_threads = 16;
+    cfg->max_inflight_per_conn = 0;  /* 0 = RPC_DEFAULT_MAX_INFLIGHT (8) */
     cfg->repl_mode = MDS_REPL_SYNC;
     cfg->self_role = 0;                 /* NODE_ACTIVE */
     cfg->self_failover_partner_id = 0;  /* no failover partner */
@@ -540,6 +541,15 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
                 cfg->worker_threads = (uint32_t)v;
                 cfg->tuning_set |= MDS_CFG_SET_WORKER_THREADS;
 }
+        } else if (strcmp(key, "max_inflight_per_conn") == 0) {
+            unsigned long v = strtoul(val, NULL, 10);
+            if (v >= 1 && v <= 1024) {
+                cfg->max_inflight_per_conn = (uint32_t)v;
+            } else {
+                (void)fprintf(stderr,
+                    "WARN: max_inflight_per_conn=%lu out of range "
+                    "(1..1024); using default\n", v);
+            }
         } else if (strcmp(key, "ds_heartbeat_ms") == 0) {
             unsigned long v = strtoul(val, NULL, 10);
             if (v <= UINT32_MAX) { /* 0 = disabled */

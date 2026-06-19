@@ -65,15 +65,23 @@ struct rpc_conn {
     uint32_t  send_len;       /**< Bytes pending. */
     uint32_t  send_alloc;     /**< Buffer capacity. */
 
-    /* Thread-pool dispatch (3.3). */
-    pthread_mutex_t send_lock; /**< Protects send_buf/send_len + writev. */
-    _Atomic bool    busy;      /**< Request in flight on worker thread. */
-
-    /* Embedded work item -- eliminates malloc per dispatch.
-     * Safe because busy prevents concurrent dispatch per-conn. */
-    struct rpc_server *wi_srv;        /**< Server backpointer for worker. */
-    uint8_t           *wi_record;     /**< Points to recv_buf (zero-copy). */
-    uint32_t           wi_record_len; /**< Record length at dispatch time. */
+    /* Thread-pool dispatch.
+     *
+     * send_lock serializes all access to the circular send_buf: worker
+     * threads via send_record(), the epoll thread via the EPOLLOUT
+     * drain.  inflight counts requests currently being processed by
+     * worker threads for this connection -- bounded pipelining lets up
+     * to srv->max_inflight_per_conn run concurrently (replacing the old
+     * single-in-flight `busy` flag).  closing is owned exclusively by
+     * the epoll thread and marks a connection awaiting deferred teardown
+     * once inflight drains to zero (see conn_begin_close /
+     * conn_finalize_close).  Per-request record bytes are copied into a
+     * heap struct rpc_work at dispatch, so recv_buf is owned solely by
+     * the epoll thread and can be reused for the next record while
+     * workers run. */
+    pthread_mutex_t  send_lock;
+    _Atomic uint32_t inflight;
+    bool             closing;
 };
 
 struct rpc_server {
@@ -144,6 +152,7 @@ struct rpc_server {
     /* Thread-pool dispatch (3.3). */
     struct threadpool       *tp;          /**< Worker pool (NULL = inline). */
     int                      comp_pipe[2]; /**< Completion pipe: workers write conn idx. */
+    uint32_t                 max_inflight_per_conn; /**< Bounded pipelining cap. */
     uint32_t            *free_list;
     uint32_t             free_top;   /**< eventfd to wake epoll. */
 
@@ -153,6 +162,22 @@ struct rpc_server {
     /* fd-index: O(1) lookup by fd instead of linear scan. */
     struct rpc_conn        **fd_to_conn;  /**< Sparse array [fd_index_size]. */
     uint32_t                 fd_index_size;
+};
+
+/**
+ * Per-request owned work item.
+ *
+ * Decouples a worker from the connection's reused recv_buf: the record
+ * bytes are copied in at dispatch time so multiple requests on the same
+ * connection can be processed concurrently (up to max_inflight_per_conn)
+ * without the worker and the epoll reader racing on recv_buf.  Allocated
+ * by dispatch_record(), freed by the worker (rpc_work_fn).
+ */
+struct rpc_work {
+    struct rpc_server *srv;
+    struct rpc_conn   *conn;
+    uint32_t           record_len;
+    uint8_t            record[];  /* flexible array member -- owns the bytes */
 };
 
 /* -----------------------------------------------------------------------
@@ -174,7 +199,8 @@ static void conn_init(struct rpc_conn *c)
     memset(c, 0, sizeof(*c));
     c->fd = -1;
     pthread_mutex_init(&c->send_lock, NULL);
-    atomic_store(&c->busy, false);
+    atomic_store(&c->inflight, 0);
+    c->closing = false;
 }
 
 static void conn_reset(struct rpc_conn *c)
@@ -321,9 +347,17 @@ static int send_queue_drain(struct rpc_conn *c)
 /**
  * Send a complete record-marked reply.
  *
- * Attempts immediate writev.  If EAGAIN is hit, remaining data is
- * queued in the connection's send_buf for EPOLLOUT-driven drain.
- * Returns 0 on success (or queued), -1 on fatal error.
+ * Serializes on c->send_lock internally: with bounded request
+ * pipelining several worker threads may reply on the same connection
+ * concurrently, and the epoll thread drains send_buf on EPOLLOUT.  The
+ * lock keeps each record's bytes contiguous on the wire and protects
+ * the circular send_buf.  No caller may hold send_lock when calling
+ * this.
+ *
+ * Attempts an immediate sendmsg.  If EAGAIN is hit (or data is already
+ * queued ahead of us), the record is appended to the connection's
+ * send_buf for EPOLLOUT-driven drain.  Returns 0 on success (or
+ * queued), -1 on fatal error.
  */
 /* NOLINTNEXTLINE(readability-function-cognitive-complexity) */
 static int send_record(struct rpc_conn *c, const uint8_t *data, uint32_t len)
@@ -332,13 +366,29 @@ static int send_record(struct rpc_conn *c, const uint8_t *data, uint32_t len)
     uint32_t hdr = htonl(len | 0x80000000U);
     uint8_t hdr_buf[4];
     ssize_t total, sent;
+    int rc = 0;
 
     memcpy(hdr_buf, &hdr, 4);
     total = 4 + (ssize_t)len;
     sent = 0;
 
+    pthread_mutex_lock(&c->send_lock);
+
+    /* FIFO ordering: if bytes are already queued, append the whole
+     * record behind them rather than writing ahead of the pending
+     * remainder (which would interleave records on the wire). */
+    if (c->send_len > 0) {
+        if (send_queue_append(c, hdr_buf, 4) != 0 ||
+            send_queue_append(c, data, len) != 0) {
+            rc = -1;
+        }
+        pthread_mutex_unlock(&c->send_lock);
+        return rc;
+    }
+
     while (sent < total) {
         struct iovec iov[2];
+        struct msghdr msg;
         int iovcnt = 0;
         ssize_t n;
 
@@ -357,7 +407,13 @@ static int send_record(struct rpc_conn *c, const uint8_t *data, uint32_t len)
             iovcnt = 1;
         }
 
-        n = writev(c->fd, iov, iovcnt);
+        /* MSG_NOSIGNAL: the daemon installs no SIGPIPE handler, so a
+         * write to a peer-closed socket must return EPIPE rather than
+         * raise SIGPIPE (which would kill the worker). */
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = iov;
+        msg.msg_iovlen = (size_t)iovcnt;
+        n = sendmsg(c->fd, &msg, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -366,26 +422,27 @@ static int send_record(struct rpc_conn *c, const uint8_t *data, uint32_t len)
                 /* Queue the unsent remainder. */
                 if (sent < 4) {
                     if (send_queue_append(c, hdr_buf + sent,
-                                          4 - (uint32_t)sent) != 0) {
-                        return -1;
-}
-                    if (send_queue_append(c, data, len) != 0) {
-                        return -1;
+                                          4 - (uint32_t)sent) != 0 ||
+                        send_queue_append(c, data, len) != 0) {
+                        rc = -1;
 }
                 } else {
                     uint32_t data_off = (uint32_t)sent - 4;
 
                     if (send_queue_append(c, data + data_off,
                                           len - data_off) != 0) {
-                        return -1;
+                        rc = -1;
 }
                 }
-                return 0; /* Queued; caller will register EPOLLOUT. */
+                pthread_mutex_unlock(&c->send_lock);
+                return rc; /* Queued; epoll registers EPOLLOUT. */
             }
+            pthread_mutex_unlock(&c->send_lock);
             return -1;
         }
         sent += n;
     }
+    pthread_mutex_unlock(&c->send_lock);
     return 0;
 }
 
@@ -1391,37 +1448,35 @@ cleanup:
 /**
  * Worker function: process one RPC record on a pool thread.
  *
- * The work item is embedded in rpc_conn (zero-copy: wi_record points
- * directly into recv_buf).  No malloc/free on the hot path.
+ * The work item (struct rpc_work) owns its record bytes, so several
+ * requests on the same connection can be processed concurrently.
+ * send_record() serializes the reply on the connection's send_lock
+ * internally, so no lock is held across process_rpc_record().
  */
 static void rpc_work_fn(void *arg)
 {
-    struct rpc_conn   *conn = arg;
-    struct rpc_server *srv  = conn->wi_srv;
+    struct rpc_work   *w    = arg;
+    struct rpc_conn   *conn = w->conn;
+    struct rpc_server *srv  = w->srv;
 
-    /* process_rpc_record encodes the reply and calls send_record
-     * internally.  We must hold send_lock around it because
-     * send_record writes to conn->send_buf / conn->fd. */
-    pthread_mutex_lock(&conn->send_lock);
-    (void)process_rpc_record(srv, conn,
-                             conn->wi_record, conn->wi_record_len);
-    pthread_mutex_unlock(&conn->send_lock);
+    (void)process_rpc_record(srv, conn, w->record, w->record_len);
 
-    atomic_store(&conn->busy, false);
+    free(w);
 
-    /* Notify the epoll thread which connection completed. */
+    /* Compute the slot index BEFORE dropping our in-flight reference.
+     * Once inflight reaches zero on a closing connection the epoll
+     * thread may finalize and recycle the slot, so conn must not be
+     * dereferenced after the decrement.  The index arithmetic does not
+     * dereference conn, and srv outlives every worker. */
     uint32_t cidx = (uint32_t)(conn - srv->conns);
+    atomic_fetch_sub_explicit(&conn->inflight, 1, memory_order_acq_rel);
+
+    /* Wake the epoll thread: it re-arms EPOLLIN (which may have been
+     * disabled at the in-flight cap) and/or finalizes a deferred
+     * close once inflight has drained to zero. */
     (void)write(srv->comp_pipe[1], &cidx, sizeof(cidx));
 }
 
-/**
- * @brief Submit a completed RPC record to the worker pool.
- *
- * Copies the record, disables EPOLLIN, and submits to the threadpool.
- * Falls back to inline processing if the pool rejects the item.
- *
- * @return 0 on success (worker owns the connection), -1 on OOM.
- */
 /**
  * @brief Non-blocking read into buffer, handling EAGAIN/EINTR/EOF.
  * @return  1 = got some bytes (may need more),
@@ -1451,37 +1506,43 @@ static int nb_read(int fd, uint8_t *buf, uint32_t *pos, uint32_t want)
 }
 
 /**
- * Submit a completed RPC record to the worker pool.
+ * Dispatch one fully-assembled record to the worker pool.
  *
- * Zero-copy: passes recv_buf directly to the worker (no malloc/memcpy).
- * Safe because EPOLLIN is disabled until the worker finishes, so no
- * new reads can overwrite recv_buf while the worker uses it.
+ * Copies the record into an owned struct rpc_work and resets recv_len,
+ * so the epoll thread can immediately reuse recv_buf for the next
+ * (pipelined) record while the worker runs.  Bumps the connection's
+ * in-flight count.  EPOLLIN arming is managed by the caller (conn_read)
+ * based on the in-flight cap.
+ *
+ * @return  0 = dispatched (inflight incremented),
+ *          1 = pool full -- record dropped (the NFSv4.1 client
+ *              retransmits on its session-slot timeout, matching the
+ *              prior single-in-flight behaviour on pool saturation),
+ *         -1 = allocation failure (caller should drop the connection).
  */
-static int dispatch_to_pool(struct rpc_server *srv, struct rpc_conn *c)
+static int dispatch_record(struct rpc_server *srv, struct rpc_conn *c)
 {
-    /* Set up embedded work item -- zero-copy from recv_buf. */
-    c->wi_srv        = srv;
-    c->wi_record     = c->recv_buf;
-    c->wi_record_len = c->recv_len;
-    c->recv_len      = 0;  /* Reset for next request. */
+    struct rpc_work *w = malloc(sizeof(*w) + c->recv_len);
+    if (w == NULL) {
+        return -1;
+    }
+    w->srv        = srv;
+    w->conn       = c;
+    w->record_len = c->recv_len;
+    if (c->recv_len > 0) {
+        memcpy(w->record, c->recv_buf, c->recv_len);
+    }
+    c->recv_len = 0;  /* Record consumed; recv_buf free for the next one. */
 
-    atomic_store(&c->busy, true);
+    atomic_fetch_add_explicit(&c->inflight, 1, memory_order_relaxed);
 
-    /* Disable EPOLLIN -- no more reads until worker finishes. */
-    struct epoll_event ev;
-    ev.events = 0;
-    ev.data.fd = c->fd;
-    epoll_ctl(srv->epoll_fd, EPOLL_CTL_MOD, c->fd, &ev);
-
-    if (threadpool_submit(srv->tp, rpc_work_fn, c) != 0) {
-        /* Pool full -- re-enable EPOLLIN so the next epoll cycle
-         * retries.  NEVER fall back to inline processing here:
-         * the epoll thread must not block on NDB/NFS calls or
-         * it can't process comp_pipe completions, causing a
-         * permanent stall under concurrent load. */
-        atomic_store(&c->busy, false);
-        ev.events = EPOLLIN;
-        epoll_ctl(srv->epoll_fd, EPOLL_CTL_MOD, c->fd, &ev);
+    if (threadpool_submit(srv->tp, rpc_work_fn, w) != 0) {
+        /* Pool saturated.  Undo the in-flight bump and drop the record.
+         * NEVER process inline here: the epoll thread must not block on
+         * NDB/NFS I/O or it cannot drain comp_pipe completions. */
+        atomic_fetch_sub_explicit(&c->inflight, 1, memory_order_relaxed);
+        free(w);
+        return 1;
     }
     return 0;
 }
@@ -1556,7 +1617,30 @@ static int conn_read(struct rpc_server *srv, struct rpc_conn *c)
             }
 
             if (srv->tp != NULL) {
-                return dispatch_to_pool(srv, c);
+                int dr = dispatch_record(srv, c);
+                if (dr < 0) {
+                    return -1;  /* allocation failure -- drop conn */
+                }
+                if (dr == 1) {
+                    /* Pool full: stop reading this cycle.  EPOLLIN stays
+                     * armed (level-triggered), so the next readiness
+                     * retries once the pool drains. */
+                    return 0;
+                }
+                /* Bounded pipelining: at the in-flight cap, stop reading
+                 * and disarm EPOLLIN; a worker completion re-arms it via
+                 * the completion pipe.  Below the cap, keep reading any
+                 * pipelined records already buffered by the kernel. */
+                if (atomic_load_explicit(&c->inflight,
+                            memory_order_relaxed) >=
+                        srv->max_inflight_per_conn) {
+                    struct epoll_event ev;
+                    ev.events = 0;
+                    ev.data.fd = c->fd;
+                    epoll_ctl(srv->epoll_fd, EPOLL_CTL_MOD, c->fd, &ev);
+                    return 0;
+                }
+                continue;
             }
 
             /* Inline path (no threadpool or tests). */
@@ -1648,6 +1732,9 @@ int rpc_server_create(const struct rpc_server_config *cfg,
     srv->min_auth = cfg->min_auth;
     srv->gss_tbl = cfg->gss_tbl;
     srv->tp = cfg->tp;
+    srv->max_inflight_per_conn = cfg->max_inflight_per_conn
+                                 ? cfg->max_inflight_per_conn
+                                 : RPC_DEFAULT_MAX_INFLIGHT;
     srv->shard_map = cfg->shard_map;
     srv->comp_pipe[0] = -1;
     srv->comp_pipe[1] = -1;
@@ -1832,30 +1919,62 @@ static struct rpc_conn *find_conn_by_fd(struct rpc_server *srv, int fd)
     return srv->fd_to_conn[fd];
 }
 
-static void close_conn(struct rpc_server *srv, struct rpc_conn *c)
+/*
+ * Finalize a connection teardown: free buffers, close the fd, recycle
+ * the slot.  Epoll-thread only.  The caller MUST guarantee inflight == 0
+ * so no worker thread can still reference this connection (recv is owned
+ * by the epoll thread; send_buf/send_lock are touched by workers only
+ * while inflight > 0).
+ */
+static void conn_finalize_close(struct rpc_server *srv, struct rpc_conn *c)
 {
-    if (c->fd >= 0) {
-        /* Unbind backchannel before closing the connection. */
-        if (srv->st != NULL) {
-            session_unbind_conn(srv->st, c);
-        }
-        epoll_ctl(srv->epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
-        /* Clear fd-index entry before resetting the conn. */
-        if ((uint32_t)c->fd < srv->fd_index_size) {
-            srv->fd_to_conn[c->fd] = NULL;
-        }
-        conn_reset(c);
-        srv->conn_count--;
-        /* Return the slot to the free list; otherwise it is leaked
-         * and the server stops accepting once max_conns cumulative
-         * connections have closed.  A double push is impossible:
-         * conn_reset() set c->fd = -1, so a second close_conn() on
-         * the same conn skips this whole block. */
-        if (srv->free_list != NULL && srv->free_top < srv->max_conns) {
-            srv->free_list[srv->free_top++] =
-                (uint32_t)(c - srv->conns);
-        }
+    if (c->fd < 0) {
+        return;  /* Already finalized (stale completion or double call). */
     }
+    /* Clear fd-index entry before resetting the conn. */
+    if ((uint32_t)c->fd < srv->fd_index_size) {
+        srv->fd_to_conn[c->fd] = NULL;
+    }
+    conn_reset(c);  /* closes fd, frees bufs, re-inits via conn_init
+                     * (inflight=0, closing=false). */
+    srv->conn_count--;
+    /* Return the slot to the free list; conn_reset() set c->fd = -1, so a
+     * second finalize on the same slot is a no-op via the guard above. */
+    if (srv->free_list != NULL && srv->free_top < srv->max_conns) {
+        srv->free_list[srv->free_top++] =
+            (uint32_t)(c - srv->conns);
+    }
+}
+
+/*
+ * Begin a connection teardown.  Epoll-thread only.  Stops all new I/O
+ * (unbinds the backchannel, removes the fd from epoll) and then either
+ * finalizes immediately when no worker is processing, or defers finalize
+ * to handle_epoll_wakeup once the last in-flight worker drains.  This is
+ * what makes bounded pipelining safe: a connection is never freed or its
+ * slot recycled while a worker still holds it.
+ *
+ * The fd is NOT closed here -- finalize closes it -- so workers may still
+ * complete their sends on a half-open socket (send_record uses
+ * MSG_NOSIGNAL).  Idempotent: a second call while already closing is a
+ * no-op.
+ */
+static void conn_begin_close(struct rpc_server *srv, struct rpc_conn *c)
+{
+    if (c->fd < 0 || c->closing) {
+        return;
+    }
+    c->closing = true;
+    /* Unbind backchannel before we stop watching the fd. */
+    if (srv->st != NULL) {
+        session_unbind_conn(srv->st, c);
+    }
+    epoll_ctl(srv->epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
+    if (atomic_load_explicit(&c->inflight, memory_order_acquire) == 0) {
+        conn_finalize_close(srv, c);
+    }
+    /* else: the last worker's comp_pipe completion finalizes (see
+     * handle_epoll_wakeup). */
 }
 
 
@@ -1914,7 +2033,7 @@ static void handle_epoll_accept(struct rpc_server *srv)
     ev.data.fd = cfd;
     if (epoll_ctl(srv->epoll_fd, EPOLL_CTL_ADD,
                   cfd, &ev) < 0) {
-        close_conn(srv, c);
+        conn_begin_close(srv, c);  /* inflight==0 -> finalizes now */
     }
 }
 
@@ -1938,8 +2057,20 @@ static void handle_epoll_wakeup(struct rpc_server *srv)
             }
             struct rpc_conn *rc = &srv->conns[buf[i]];
             if (rc->fd < 0) {
+                continue;  /* Already finalized; stale completion. */
+            }
+            /* Deferred close: finalize once the last in-flight worker
+             * has drained.  Must be checked before re-arming. */
+            if (rc->closing) {
+                if (atomic_load_explicit(&rc->inflight,
+                            memory_order_acquire) == 0) {
+                    conn_finalize_close(srv, rc);
+                }
                 continue;
             }
+            /* Re-arm EPOLLIN (it may have been disabled at the
+             * in-flight cap) and EPOLLOUT if a worker queued reply
+             * bytes that still need draining. */
             struct epoll_event rev;
             rev.events = EPOLLIN;
             pthread_mutex_lock(&rc->send_lock);
@@ -1967,9 +2098,9 @@ static void handle_epoll_conn(struct rpc_server *srv,
 }
 
     if (ev->events & (EPOLLERR | EPOLLHUP)) {
-        if (!atomic_load(&c->busy)) {
-            close_conn(srv, c);
-        }
+        /* Deferred: if workers are still processing requests for this
+         * connection, teardown waits until they drain (begin_close). */
+        conn_begin_close(srv, c);
         return;
     }
 
@@ -1981,7 +2112,7 @@ static void handle_epoll_conn(struct rpc_server *srv,
         pthread_mutex_unlock(&c->send_lock);
 
         if (dr < 0) {
-            close_conn(srv, c);
+            conn_begin_close(srv, c);
             return;
         }
         if (empty) {
@@ -1996,22 +2127,28 @@ static void handle_epoll_conn(struct rpc_server *srv,
 
     if (ev->events & EPOLLIN) {
         if (conn_read(srv, c) != 0) {
-            close_conn(srv, c);
+            conn_begin_close(srv, c);
             return;
         }
     }
 
-    /* If send_record queued data, register EPOLLOUT. */
-    pthread_mutex_lock(&c->send_lock);
-    int has_pending = (c->fd >= 0 && c->send_len > 0);
-    pthread_mutex_unlock(&c->send_lock);
-    if (has_pending) {
-        struct epoll_event emod;
+    /* Inline path only: if process_rpc_record queued reply data on this
+     * (epoll) thread, register EPOLLOUT.  In threadpool mode the worker
+     * threads queue replies and EPOLLOUT/EPOLLIN are (re-)armed by the
+     * completion handler (handle_epoll_wakeup); re-arming EPOLLIN here
+     * would also undo the in-flight-cap disarm that conn_read just set. */
+    if (srv->tp == NULL) {
+        pthread_mutex_lock(&c->send_lock);
+        int has_pending = (c->fd >= 0 && c->send_len > 0);
+        pthread_mutex_unlock(&c->send_lock);
+        if (has_pending) {
+            struct epoll_event emod;
 
-        emod.events = EPOLLIN | EPOLLOUT;
-        emod.data.fd = c->fd;
-        epoll_ctl(srv->epoll_fd, EPOLL_CTL_MOD,
-                  c->fd, &emod);
+            emod.events = EPOLLIN | EPOLLOUT;
+            emod.data.fd = c->fd;
+            epoll_ctl(srv->epoll_fd, EPOLL_CTL_MOD,
+                      c->fd, &emod);
+        }
     }
 }
 
@@ -2074,13 +2211,14 @@ void rpc_server_stop(struct rpc_server *srv)
     }
 
     /* Wait for any in-flight worker threads to finish.
-     * Workers set busy=false and write to comp_pipe when done.
+     * Workers decrement inflight and write to comp_pipe when done.
      * We spin-wait briefly (bounded by pool drain time). */
     if (srv->tp != NULL) {
         for (int attempt = 0; attempt < 3000; attempt++) {
             bool any_busy = false;
             for (uint32_t i = 0; i < srv->max_conns; i++) {
-                if (atomic_load(&srv->conns[i].busy)) {
+                if (atomic_load_explicit(&srv->conns[i].inflight,
+                            memory_order_acquire) > 0) {
                     any_busy = true;
                     break;
                 }

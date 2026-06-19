@@ -678,6 +678,11 @@ struct mds_config {
 
     /* Tuning */
     uint32_t            worker_threads;
+    /* Bounded request pipelining: max COMPOUNDs processed concurrently
+     * per TCP connection by the worker pool (0 = default 8).  Higher
+     * values let clients with few connections but many session slots
+     * use more of the worker pool. */
+    uint32_t            max_inflight_per_conn;
     uint32_t            ds_heartbeat_ms;
     uint32_t            stripe_unit_bytes;
     bool                auto_widen_lease_on_4k;

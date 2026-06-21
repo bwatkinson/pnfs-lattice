@@ -62,6 +62,16 @@ struct mds_rondb_state {
 /** Persist the changefeed seqno counter every N mutations. */
 #define DELTA_PERSIST_INTERVAL 64
 
+/** Retries for rondb_shim rc==-2 (lock contention / transient NDB). */
+#define RONDB_TRANSIENT_RETRIES 8
+
+static void rondb_transient_backoff(int attempt)
+{
+	/* 500us .. 16ms exponential; mdtest parallel bursts need headroom. */
+	uint32_t us = 500U << (uint32_t)(attempt > 5 ? 5 : attempt);
+	usleep(us);
+}
+
 static void catalogue_rondb_close_backend(struct mds_catalogue *cat);
 
 /* Override the weak default from catalogue_dispatch.c. */
@@ -598,11 +608,8 @@ enum mds_status catalogue_rondb_ns_create(
 	 * via interpretedUpdateTuple -- immune to read-modify-write race.
 	 *
 	 * Retry on transient NDB errors (rc == -2): lock contention,
-	 * temporary resource exhaustion, node recovery.  Up to 5
-	 * attempts with 500us backoff between retries.  Extra attempts
-	 * cover concurrent mkdir bursts on the same parent partition
-	 * under mdtest-style load. */
-	for (int attempt = 0; attempt < 5; attempt++) {
+	 * temporary resource exhaustion, node recovery. */
+	for (int attempt = 0; attempt < RONDB_TRANSIENT_RETRIES; attempt++) {
 		rc = rondb_shim_ns_create(h, parent_fileid, name,
 					  child_buf, RONDB_INODE_FIXED_SIZE,
 					  parent_nlink_delta,
@@ -613,7 +620,7 @@ enum mds_status catalogue_rondb_ns_create(
 		if (rc != -2) {
 			break; /* Success, EXISTS, or permanent error. */
 		}
-		usleep(500 * (uint32_t)(attempt + 1)); /* 500us, 1ms, 1.5ms */
+		rondb_transient_backoff(attempt);
 	}
 	if (rc == 1) {
 		return MDS_ERR_EXISTS;
@@ -687,7 +694,7 @@ enum mds_status catalogue_rondb_ns_remove(struct mds_catalogue *cat,
 		return MDS_ERR_IO;
 	}
 
-	for (int attempt = 0; attempt < 3; attempt++) {
+	for (int attempt = 0; attempt < RONDB_TRANSIENT_RETRIES; attempt++) {
 		rc = rondb_shim_ns_remove(h, parent_fileid, name,
 					  child_fid,
 					  child_buf, RONDB_INODE_FIXED_SIZE,
@@ -695,7 +702,11 @@ enum mds_status catalogue_rondb_ns_remove(struct mds_catalogue *cat,
 					  parent_nlink_delta,
 					  0 /* stripe_count */);
 		if (rc != -2) { break; }
-		usleep(500 * (uint32_t)(attempt + 1));
+		rondb_transient_backoff(attempt);
+	}
+	if (rc == 1) {
+		/* TOCTOU: concurrent remove beat us; row already gone. */
+		return MDS_ERR_NOTFOUND;
 	}
 	if (rc != 0) {
 		return MDS_ERR_IO;
@@ -2341,7 +2352,7 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
 	}
 
 	/* Single fused NDB transaction: create + stripe + layout. */
-	for (int attempt = 0; attempt < 3; attempt++) {
+	for (int attempt = 0; attempt < RONDB_TRANSIENT_RETRIES; attempt++) {
 		rc = rondb_shim_ns_create_with_layout(
 			h, parent_fileid, name,
 			child_buf, RONDB_INODE_FIXED_SIZE,
@@ -2357,7 +2368,7 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
 		if (rc != -2) {
 			break;
 		}
-		usleep(500 * (uint32_t)(attempt + 1));
+		rondb_transient_backoff(attempt);
 	}
 	if (rc == 1) {
 		return MDS_ERR_EXISTS;

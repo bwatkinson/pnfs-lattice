@@ -62,6 +62,16 @@ struct mds_rondb_state {
 /** Persist the changefeed seqno counter every N mutations. */
 #define DELTA_PERSIST_INTERVAL 64
 
+/** Retries for rondb_shim rc==-2 (lock contention / transient NDB). */
+#define RONDB_TRANSIENT_RETRIES 8
+
+static void rondb_transient_backoff(int attempt)
+{
+	/* 500us .. 16ms exponential; mdtest parallel bursts need headroom. */
+	uint32_t us = 500U << (uint32_t)(attempt > 5 ? 5 : attempt);
+	usleep(us);
+}
+
 static void catalogue_rondb_close_backend(struct mds_catalogue *cat);
 
 /* Override the weak default from catalogue_dispatch.c. */
@@ -598,9 +608,8 @@ enum mds_status catalogue_rondb_ns_create(
 	 * via interpretedUpdateTuple -- immune to read-modify-write race.
 	 *
 	 * Retry on transient NDB errors (rc == -2): lock contention,
-	 * temporary resource exhaustion, node recovery.  Up to 3
-	 * attempts with 500us backoff between retries. */
-	for (int attempt = 0; attempt < 3; attempt++) {
+	 * temporary resource exhaustion, node recovery. */
+	for (int attempt = 0; attempt < RONDB_TRANSIENT_RETRIES; attempt++) {
 		rc = rondb_shim_ns_create(h, parent_fileid, name,
 					  child_buf, RONDB_INODE_FIXED_SIZE,
 					  parent_nlink_delta,
@@ -611,7 +620,7 @@ enum mds_status catalogue_rondb_ns_create(
 		if (rc != -2) {
 			break; /* Success, EXISTS, or permanent error. */
 		}
-		usleep(500 * (uint32_t)(attempt + 1)); /* 500us, 1ms, 1.5ms */
+		rondb_transient_backoff(attempt);
 	}
 	if (rc == 1) {
 		return MDS_ERR_EXISTS;
@@ -685,7 +694,7 @@ enum mds_status catalogue_rondb_ns_remove(struct mds_catalogue *cat,
 		return MDS_ERR_IO;
 	}
 
-	for (int attempt = 0; attempt < 3; attempt++) {
+	for (int attempt = 0; attempt < RONDB_TRANSIENT_RETRIES; attempt++) {
 		rc = rondb_shim_ns_remove(h, parent_fileid, name,
 					  child_fid,
 					  child_buf, RONDB_INODE_FIXED_SIZE,
@@ -693,7 +702,11 @@ enum mds_status catalogue_rondb_ns_remove(struct mds_catalogue *cat,
 					  parent_nlink_delta,
 					  0 /* stripe_count */);
 		if (rc != -2) { break; }
-		usleep(500 * (uint32_t)(attempt + 1));
+		rondb_transient_backoff(attempt);
+	}
+	if (rc == 1) {
+		/* TOCTOU: concurrent remove beat us; row already gone. */
+		return MDS_ERR_NOTFOUND;
 	}
 	if (rc != 0) {
 		return MDS_ERR_IO;
@@ -1102,6 +1115,7 @@ enum mds_status catalogue_rondb_ns_readdir(
 	struct mds_catalogue *cat,
 	uint64_t parent_fileid,
 	const char *start_after,
+	uint32_t max_entries,
 	mds_readdir_cb cb, void *ctx)
 {
 	void *h = rondb_handle(cat);
@@ -1116,12 +1130,39 @@ enum mds_status catalogue_rondb_ns_readdir(
 	adapt.cat_ctx = ctx;
 
 	rc = rondb_shim_ns_readdir(h, parent_fileid, start_after,
+				   max_entries,
 				   rondb_readdir_shim_cb, &adapt);
 	if (rc != 0) {
 		return MDS_ERR_IO;
 	}
 
 	return MDS_OK;
+}
+
+enum mds_status catalogue_rondb_dirent_name_for_child(
+	struct mds_catalogue *cat,
+	uint64_t parent_fileid,
+	uint64_t child_fileid,
+	char *name_out,
+	size_t name_out_len)
+{
+	void *h = rondb_handle(cat);
+	int rc;
+
+	if (h == NULL || name_out == NULL || name_out_len == 0) {
+		return MDS_ERR_INVAL;
+	}
+
+	rc = rondb_shim_dirent_name_for_child(h, parent_fileid,
+					      child_fileid,
+					      name_out, name_out_len);
+	if (rc == 0) {
+		return MDS_OK;
+	}
+	if (rc == 1) {
+		return MDS_ERR_NOTFOUND;
+	}
+	return MDS_ERR_IO;
 }
 
 /* -----------------------------------------------------------------------
@@ -1178,6 +1219,7 @@ enum mds_status catalogue_rondb_ns_readdir_plus(
 	struct mds_catalogue *cat,
 	uint64_t parent_fileid,
 	const char *start_after,
+	uint32_t max_entries,
 	mds_readdir_plus_cb cb, void *ctx)
 {
 	void *h = rondb_handle(cat);
@@ -1193,6 +1235,7 @@ enum mds_status catalogue_rondb_ns_readdir_plus(
 	adapt.cb_status = MDS_OK;
 
 	rc = rondb_shim_ns_readdir_plus(h, parent_fileid, start_after,
+					max_entries,
 					rondb_readdir_plus_shim_cb,
 					&adapt);
 	if (rc != 0) {
@@ -2309,7 +2352,7 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
 	}
 
 	/* Single fused NDB transaction: create + stripe + layout. */
-	for (int attempt = 0; attempt < 3; attempt++) {
+	for (int attempt = 0; attempt < RONDB_TRANSIENT_RETRIES; attempt++) {
 		rc = rondb_shim_ns_create_with_layout(
 			h, parent_fileid, name,
 			child_buf, RONDB_INODE_FIXED_SIZE,
@@ -2325,7 +2368,7 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
 		if (rc != -2) {
 			break;
 		}
-		usleep(500 * (uint32_t)(attempt + 1));
+		rondb_transient_backoff(attempt);
 	}
 	if (rc == 1) {
 		return MDS_ERR_EXISTS;
@@ -2592,22 +2635,33 @@ static enum mds_status rondb_auth_ns_setattr(
 
 static enum mds_status rondb_auth_ns_readdir(
 	struct mds_catalogue *cat, uint64_t parent,
-	const char *start_after, struct mds_cat_txn *txn,
+	const char *start_after, uint32_t max_entries,
+	struct mds_cat_txn *txn,
 	mds_readdir_cb cb, void *ctx)
 {
 	(void)txn;
 	return catalogue_rondb_ns_readdir(cat, parent, start_after,
-					 cb, ctx);
+					 max_entries, cb, ctx);
+}
+
+static enum mds_status rondb_auth_dirent_name_for_child(
+	struct mds_catalogue *cat, uint64_t parent,
+	uint64_t child_fileid, char *name_out, size_t name_out_len)
+{
+	return catalogue_rondb_dirent_name_for_child(cat, parent,
+						     child_fileid,
+						     name_out, name_out_len);
 }
 
 static enum mds_status rondb_auth_ns_readdir_plus(
 	struct mds_catalogue *cat, uint64_t parent,
-	const char *start_after, struct mds_cat_txn *txn,
+	const char *start_after, uint32_t max_entries,
+	struct mds_cat_txn *txn,
 	mds_readdir_plus_cb cb, void *ctx)
 {
 	(void)txn;
 	return catalogue_rondb_ns_readdir_plus(cat, parent, start_after,
-					       cb, ctx);
+					       max_entries, cb, ctx);
 }
 
 static enum mds_status rondb_auth_alloc_fileid(
@@ -3132,6 +3186,7 @@ static const struct mds_authority_ops rondb_authority_ops = {
 	.ns_setattr        = rondb_auth_ns_setattr,
 	.ns_readdir        = rondb_auth_ns_readdir,
 	.ns_readdir_plus   = rondb_auth_ns_readdir_plus,
+	.dirent_name_for_child = rondb_auth_dirent_name_for_child,
 	.ns_nlink_adjust   = catalogue_rondb_ns_nlink_adjust,
 	.alloc_fileid      = rondb_auth_alloc_fileid,
 	.inode_put         = catalogue_rondb_inode_put,
@@ -3217,6 +3272,7 @@ static const struct mds_authority_ops rondb_locked_authority_ops = {
 	.ns_setattr        = rondb_auth_ns_setattr,
 	.ns_readdir        = rondb_auth_ns_readdir,
 	.ns_readdir_plus   = rondb_auth_ns_readdir_plus,
+	.dirent_name_for_child = rondb_auth_dirent_name_for_child,
 	.ns_nlink_adjust   = catalogue_rondb_ns_nlink_adjust,
 	.alloc_fileid      = rondb_auth_alloc_fileid,
 	.inode_put         = catalogue_rondb_inode_put,

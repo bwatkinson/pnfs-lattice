@@ -1472,12 +1472,6 @@ static void rondb_set_inode_values(NdbOperation *op,
     op->setValue(RONDB_INO_COL_HOME_SHARD, shard);
 }
 
-struct rondb_readdir_row {
-    std::string name;
-    uint64_t child_fid;
-    uint8_t child_type;
-};
-
 static int rondb_compare_name_bytes(const char *lhs, size_t lhs_len,
                                     const char *rhs, size_t rhs_len)
 {
@@ -1496,6 +1490,146 @@ static int rondb_compare_name_bytes(const char *lhs, size_t lhs_len,
     return 0;
 }
 
+struct rondb_readdir_row {
+    std::string name;
+    uint64_t child_fid;
+    uint8_t child_type;
+};
+
+static void rondb_readdir_sort_rows(std::vector<rondb_readdir_row> &rows)
+{
+    std::sort(rows.begin(), rows.end(),
+              [](const rondb_readdir_row &lhs,
+                 const rondb_readdir_row &rhs) {
+                  return rondb_compare_name_bytes(lhs.name.data(),
+                                                  lhs.name.size(),
+                                                  rhs.name.data(),
+                                                  rhs.name.size()) < 0;
+              });
+}
+
+/** Index of the first row with name > start_after (or rows.size()). */
+static size_t rondb_readdir_start_index(
+    const std::vector<rondb_readdir_row> &rows,
+    const char *start_after)
+{
+    if (start_after == nullptr || start_after[0] == '\0') {
+        return 0;
+    }
+
+    size_t sa_len = std::strlen(start_after);
+    for (size_t i = 0; i < rows.size(); i++) {
+        if (rondb_compare_name_bytes(rows[i].name.data(),
+                                   rows[i].name.size(),
+                                   start_after, sa_len) > 0) {
+            return i;
+        }
+    }
+    return rows.size();
+}
+
+/** End index (exclusive) for a bounded page. */
+static size_t rondb_readdir_end_index(size_t first, size_t total,
+                                      uint32_t max_entries)
+{
+    if (max_entries == 0) {
+        return total;
+    }
+    size_t end = first + (size_t)max_entries;
+    return (end < total) ? end : total;
+}
+
+static int rondb_readdir_scan_parent(
+    rondb_shim_handle *state,
+    uint64_t parent_fileid,
+    std::vector<rondb_readdir_row> *rows_out,
+    const char *err_tag)
+{
+    NdbDictionary::Dictionary *dict;
+    const NdbDictionary::Table *tbl;
+    NdbTransaction *tx;
+    NdbScanOperation *scan;
+    NdbRecAttr *a_name, *a_cfid, *a_ctype;
+    NdbError err;
+    int next_rc;
+
+    if (state == nullptr || rows_out == nullptr) { return -1; }
+
+    dict = rondb_get_dictionary(state);
+    if (dict == nullptr) { return -1; }
+    tbl = dict->getTable(RONDB_TBL_DIRENTS);
+    if (tbl == nullptr) { return -1; }
+
+    {
+        uint8_t pk_buf[8];
+        fdb_put_u64(pk_buf, parent_fileid);
+        tx = rondb_get_ndb(state)->startTransaction(tbl, (const char *)pk_buf, 8);
+    }
+    if (tx == nullptr) {
+        return rondb_report_error(rondb_get_ndb(state)->getNdbError(),
+                                 err_tag != nullptr ? err_tag : "readdir startTx");
+    }
+
+    scan = tx->getNdbScanOperation(tbl);
+    if (scan == nullptr) {
+        err = tx->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "readdir getScanOp");
+    }
+
+    if (scan->readTuples(NdbOperation::LM_CommittedRead) != 0) {
+        err = scan->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "readdir readTuples");
+    }
+
+    {
+        NdbScanFilter filter(scan);
+        filter.begin(NdbScanFilter::AND);
+        filter.eq(tbl->getColumn(RONDB_DIR_COL_PARENT)->getColumnNo(),
+                  (Uint64)parent_fileid);
+        filter.end();
+    }
+
+    a_name  = scan->getValue(RONDB_DIR_COL_NAME, nullptr);
+    a_cfid  = scan->getValue(RONDB_DIR_COL_CHILD_FID, nullptr);
+    a_ctype = scan->getValue(RONDB_DIR_COL_CHILD_TYPE, nullptr);
+
+    if (tx->execute(NdbTransaction::NoCommit) == -1) {
+        err = tx->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "readdir exec");
+    }
+
+    rows_out->clear();
+    while ((next_rc = scan->nextResult(true)) == 0) {
+        uint64_t child_fid = a_cfid->u_64_value();
+        uint8_t child_type = (uint8_t)a_ctype->u_8_value();
+        const char *name_ptr = a_name->aRef();
+        uint32_t name_len;
+        rondb_readdir_row row;
+
+        if (name_ptr == nullptr) { continue; }
+
+        name_len = (uint32_t)(uint8_t)name_ptr[0];
+        name_ptr += 1;
+        row.child_fid = child_fid;
+        row.child_type = child_type;
+        row.name.assign(name_ptr, name_len);
+        rows_out->push_back(row);
+    }
+    if (next_rc != 1) {
+        err = scan->getNdbError();
+        scan->close();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "readdir nextResult");
+    }
+
+    scan->close();
+    rondb_get_ndb(state)->closeTransaction(tx);
+    return 0;
+}
+
 static int rondb_create_table_if_not_exists(
     NdbDictionary::Dictionary *dict,
     NdbDictionary::Table &table)
@@ -1511,6 +1645,44 @@ static int rondb_create_table_if_not_exists(
         return rondb_report_error(err, table.getName());
     }
     return 0;
+}
+
+/*
+ * RonDB can retain negative dictionary-cache entries after a prior
+ * getIndex() miss.  For ordered-index callers, retry once after
+ * invalidating both the index and parent table caches so live schema
+ * changes become visible to this API client.
+ */
+static const NdbDictionary::Index *
+rondb_resolve_index(NdbDictionary::Dictionary *dict,
+                    const char *ix_name,
+                    const char *table_name)
+{
+    if (dict == nullptr || ix_name == nullptr || table_name == nullptr) {
+        return nullptr;
+    }
+    const NdbDictionary::Index *ix = dict->getIndex(ix_name, table_name);
+    if (ix != nullptr) {
+        return ix;
+    }
+    dict->invalidateIndex(ix_name, table_name);
+    dict->invalidateTable(table_name);
+    return dict->getIndex(ix_name, table_name);
+}
+
+static int rondb_verify_index_visible(NdbDictionary::Dictionary *dict,
+                                      const char *ix_name,
+                                      const char *table_name)
+{
+    if (rondb_resolve_index(dict, ix_name, table_name) != nullptr) {
+        return 0;
+    }
+    std::fprintf(stderr,
+        "ERROR: ordered index %s on table %s is not visible to the NDB "
+        "API client after createIndex(); refusing to continue with a "
+        "missing layout index.\n",
+        ix_name, table_name);
+    return -1;
 }
 
 /* Helper: add a BIGUNSIGNED column. */
@@ -2223,8 +2395,6 @@ static int rondb_define_layout_state_table(NdbDictionary::Dictionary *dict)
 
 static int rondb_define_layout_by_file_table(NdbDictionary::Dictionary *dict)
 {
-    NdbDictionary::Table tbl;
-    tbl.setName(RONDB_TBL_LAYOUT_BY_FILE);
     {
         NdbDictionary::Table tbl2;
         tbl2.setName(RONDB_TBL_LAYOUT_BY_FILE);
@@ -2246,8 +2416,35 @@ static int rondb_define_layout_by_file_table(NdbDictionary::Dictionary *dict)
         c_sid.setNullable(false);
         tbl2.addColumn(c_sid);
 
-        return rondb_create_table_if_not_exists(dict, tbl2);
+        int rc = rondb_create_table_if_not_exists(dict, tbl2);
+        if (rc != 0) {
+            return rc;
+        }
     }
+
+    dict->invalidateIndex(RONDB_IX_LBF_FILEID, RONDB_TBL_LAYOUT_BY_FILE);
+    NdbDictionary::Index ix(RONDB_IX_LBF_FILEID);
+    ix.setTable(RONDB_TBL_LAYOUT_BY_FILE);
+    ix.setType(NdbDictionary::Index::OrderedIndex);
+    ix.setLogging(false);
+    ix.addColumnName(RONDB_LBF_COL_FILEID);
+    if (dict->createIndex(ix) != 0) {
+        NdbError err = dict->getNdbError();
+        if (err.classification != NdbError::SchemaObjectExists &&
+            err.code != 4714) {
+            return rondb_report_error(err, RONDB_IX_LBF_FILEID);
+        }
+        if (err.code == 4714) {
+            std::fprintf(stderr,
+                "WARN: index %s createIndex reported 4714 "
+                "(ndb_index_stat tables absent); verifying visibility "
+                "before continuing\n",
+                RONDB_IX_LBF_FILEID);
+        }
+    }
+
+    return rondb_verify_index_visible(dict, RONDB_IX_LBF_FILEID,
+                                      RONDB_TBL_LAYOUT_BY_FILE);
 }
 
 static int rondb_define_ds_layout_idx_table(NdbDictionary::Dictionary *dict)
@@ -3465,127 +3662,72 @@ int rondb_shim_dirent_del(void *handle, uint64_t parent_fileid,
 int rondb_shim_ns_readdir(void *handle,
                           uint64_t parent_fileid,
                           const char *start_after,
+                          uint32_t max_entries,
                           rondb_readdir_cb cb, void *ctx)
 {
     rondb_shim_handle *state = rondb_checked_handle(handle, nullptr);
-    NdbDictionary::Dictionary *dict;
-    const NdbDictionary::Table *tbl;
-    NdbTransaction *tx;
-    NdbScanOperation *scan;
-    NdbRecAttr *a_name, *a_cfid, *a_ctype;
-    NdbError err;
     std::vector<rondb_readdir_row> rows;
-    int next_rc;
+    size_t first;
+    size_t end;
+    int rc;
 
     if (state == nullptr || cb == nullptr) { return -1; }
 
-    dict = rondb_get_dictionary(state);
-    if (dict == nullptr) { return -1; }
-    tbl = dict->getTable(RONDB_TBL_DIRENTS);
-    if (tbl == nullptr) { return -1; }
-
-    {
-        uint8_t pk_buf[8];
-        fdb_put_u64(pk_buf, parent_fileid);
-        tx = rondb_get_ndb(state)->startTransaction(tbl, (const char *)pk_buf, 8);
-    }
-    if (tx == nullptr) {
-        return rondb_report_error(rondb_get_ndb(state)->getNdbError(),
-                                 "readdir startTx");
+    rc = rondb_readdir_scan_parent(state, parent_fileid, &rows,
+                                   "readdir startTx");
+    if (rc != 0) {
+        return rc;
     }
 
-    scan = tx->getNdbScanOperation(tbl);
-    if (scan == nullptr) {
-        err = tx->getNdbError();
-        rondb_get_ndb(state)->closeTransaction(tx);
-        return rondb_report_error(err, "readdir getScanOp");
+    if (rows.size() > 1) {
+        rondb_readdir_sort_rows(rows);
     }
 
-    if (scan->readTuples(NdbOperation::LM_CommittedRead) != 0) {
-        err = scan->getNdbError();
-        rondb_get_ndb(state)->closeTransaction(tx);
-        return rondb_report_error(err, "readdir readTuples");
-    }
+    first = rondb_readdir_start_index(rows, start_after);
+    end = rondb_readdir_end_index(first, rows.size(), max_entries);
 
-    /* Filter: parent_fileid == target. */
-    {
-        NdbScanFilter filter(scan);
-        filter.begin(NdbScanFilter::AND);
-        filter.eq(tbl->getColumn(RONDB_DIR_COL_PARENT)->getColumnNo(),
-                  (Uint64)parent_fileid);
-        filter.end();
-    }
-
-    a_name  = scan->getValue(RONDB_DIR_COL_NAME, nullptr);
-    a_cfid  = scan->getValue(RONDB_DIR_COL_CHILD_FID, nullptr);
-    a_ctype = scan->getValue(RONDB_DIR_COL_CHILD_TYPE, nullptr);
-
-    if (tx->execute(NdbTransaction::NoCommit) == -1) {
-        err = tx->getNdbError();
-        rondb_get_ndb(state)->closeTransaction(tx);
-        return rondb_report_error(err, "readdir exec");
-    }
-
-    /* Copy scan rows, then sort deterministically in memory. */
-    while ((next_rc = scan->nextResult(true)) == 0) {
-        uint64_t child_fid = a_cfid->u_64_value();
-        uint8_t child_type = (uint8_t)a_ctype->u_8_value();
-        const char *name_ptr = a_name->aRef();
-        uint32_t name_len;
-        rondb_readdir_row row;
-
-        if (name_ptr == nullptr) { continue; }
-
-        /* VARBINARY: first 1-2 bytes are length prefix. */
-        name_len = (uint32_t)(uint8_t)name_ptr[0];
-        name_ptr += 1;
-        row.child_fid = child_fid;
-        row.child_type = child_type;
-        row.name.assign(name_ptr, name_len);
-        rows.push_back(row);
-    }
-    if (next_rc != 1) {
-        err = scan->getNdbError();
-        scan->close();
-        rondb_get_ndb(state)->closeTransaction(tx);
-        return rondb_report_error(err, "readdir nextResult");
-    }
-
-    scan->close();
-    rondb_get_ndb(state)->closeTransaction(tx);
-
-    std::sort(rows.begin(), rows.end(),
-              [](const rondb_readdir_row &lhs,
-                 const rondb_readdir_row &rhs) {
-                  return rondb_compare_name_bytes(lhs.name.data(),
-                                                  lhs.name.size(),
-                                                  rhs.name.data(),
-                                                  rhs.name.size()) < 0;
-              });
-
-    if (start_after != nullptr && start_after[0] != '\0') {
-        size_t sa_len = std::strlen(start_after);
-
-        for (const rondb_readdir_row &row : rows) {
-            if (rondb_compare_name_bytes(row.name.data(), row.name.size(),
-                                         start_after, sa_len) <= 0) {
-                continue;
-            }
-            if (cb(row.child_fid, row.child_type,
-                   row.name.data(), (uint32_t)row.name.size(), ctx) != 0) {
-                break;
-            }
-        }
-        return 0;
-    }
-
-    for (const rondb_readdir_row &row : rows) {
+    for (size_t i = first; i < end; i++) {
+        const rondb_readdir_row &row = rows[i];
         if (cb(row.child_fid, row.child_type,
                row.name.data(), (uint32_t)row.name.size(), ctx) != 0) {
             break;
         }
     }
     return 0;
+}
+
+int rondb_shim_dirent_name_for_child(void *handle,
+                                     uint64_t parent_fileid,
+                                     uint64_t child_fileid,
+                                     char *name_out,
+                                     size_t name_out_cap)
+{
+    rondb_shim_handle *state = rondb_checked_handle(handle, nullptr);
+    std::vector<rondb_readdir_row> rows;
+    int rc;
+
+    if (state == nullptr || name_out == nullptr || name_out_cap == 0) {
+        return -1;
+    }
+
+    rc = rondb_readdir_scan_parent(state, parent_fileid, &rows,
+                                   "dirent_name_for_child startTx");
+    if (rc != 0) {
+        return rc;
+    }
+
+    for (const rondb_readdir_row &row : rows) {
+        if (row.child_fid != child_fileid) {
+            continue;
+        }
+        if (row.name.size() + 1 > name_out_cap) {
+            return -1;
+        }
+        std::memcpy(name_out, row.name.data(), row.name.size());
+        name_out[row.name.size()] = '\0';
+        return 0;
+    }
+    return 1;
 }
 
 /* -----------------------------------------------------------------------
@@ -3627,6 +3769,7 @@ struct rondb_readdir_plus_ino_set {
 int rondb_shim_ns_readdir_plus(void *handle,
                                uint64_t parent_fileid,
                                const char *start_after,
+                               uint32_t max_entries,
                                rondb_readdir_plus_cb cb, void *ctx)
 {
     rondb_shim_handle *state = rondb_checked_handle(handle, nullptr);
@@ -3721,41 +3864,27 @@ int rondb_shim_ns_readdir_plus(void *handle,
     }
     scan->close();
 
-    std::sort(rows.begin(), rows.end(),
-              [](const rondb_readdir_row &lhs,
-                 const rondb_readdir_row &rhs) {
-                  return rondb_compare_name_bytes(lhs.name.data(),
-                                                  lhs.name.size(),
-                                                  rhs.name.data(),
-                                                  rhs.name.size()) < 0;
-              });
+    if (rows.size() > 1) {
+        rondb_readdir_sort_rows(rows);
+    }
 
-    /* start_after filter: skip rows with name <= start_after. */
-    size_t first = 0;
-    if (start_after != nullptr && start_after[0] != '\0') {
-        size_t sa_len = std::strlen(start_after);
-        while (first < rows.size()) {
-            if (rondb_compare_name_bytes(rows[first].name.data(),
-                                         rows[first].name.size(),
-                                         start_after, sa_len) > 0) {
-                break;
-            }
-            first++;
+    {
+        size_t first = rondb_readdir_start_index(rows, start_after);
+        size_t end = rondb_readdir_end_index(first, rows.size(),
+                                             max_entries);
+
+        /* Empty result -- close the txn cleanly without the inode batch. */
+        if (first >= end) {
+            rondb_get_ndb(state)->closeTransaction(tx);
+            return 0;
         }
-    }
 
-    /* Empty result -- close the txn cleanly without the inode batch. */
-    if (first >= rows.size()) {
-        rondb_get_ndb(state)->closeTransaction(tx);
-        return 0;
-    }
-
-    /* Phase 2: queue one readTuple per dirent on INODES.  All ops are
-     * queued on the SAME tx so execute(Commit) below drives a single
-     * API->TC round-trip that fans out the reads across partitions. */
-    std::vector<rondb_readdir_plus_ino_set> ino_ops(rows.size() - first);
-    for (size_t i = first; i < rows.size(); i++) {
-        rondb_readdir_plus_ino_set &s = ino_ops[i - first];
+        /* Phase 2: queue one readTuple per dirent on INODES.  All ops are
+         * queued on the SAME tx so execute(Commit) below drives a single
+         * API->TC round-trip that fans out the reads across partitions. */
+        std::vector<rondb_readdir_plus_ino_set> ino_ops(end - first);
+        for (size_t i = first; i < end; i++) {
+            rondb_readdir_plus_ino_set &s = ino_ops[i - first];
 
         s.op = tx->getNdbOperation(ino_tbl);
         if (s.op == nullptr) {
@@ -3788,27 +3917,27 @@ int rondb_shim_ns_readdir_plus(void *handle,
         s.a_verf   = s.op->getValue(RONDB_INO_COL_CREATE_VERF, nullptr);
         s.a_parent = s.op->getValue(RONDB_INO_COL_PARENT, nullptr);
         s.a_shard  = s.op->getValue(RONDB_INO_COL_HOME_SHARD, nullptr);
-    }
-
-    /* AO_IgnoreError: a per-op 626 (row missing) no longer aborts the
-     * whole batch.  The txn-level error is only consulted as a secondary
-     * signal; per-op errors are re-checked below for the valid flag. */
-    if (tx->execute(NdbTransaction::Commit,
-                    NdbOperation::AO_IgnoreError) == -1) {
-        err = tx->getNdbError();
-        /* 626 at the txn level is expected when some ops missed --
-         * tolerate it and drive per-op inspection. */
-        if (err.code != 626) {
-            rondb_get_ndb(state)->closeTransaction(tx);
-            return rondb_report_error(err, "readdir_plus batch exec");
         }
-    }
 
-    /* Phase 3: materialise each row into the 137-byte rondb_inode
-     * buffer and deliver it via the caller's callback.  Stopping early
-     * (cb returns non-zero) is honoured. */
-    for (size_t i = first; i < rows.size(); i++) {
-        rondb_readdir_plus_ino_set &s = ino_ops[i - first];
+        /* AO_IgnoreError: a per-op 626 (row missing) no longer aborts the
+         * whole batch.  The txn-level error is only consulted as a secondary
+         * signal; per-op errors are re-checked below for the valid flag. */
+        if (tx->execute(NdbTransaction::Commit,
+                        NdbOperation::AO_IgnoreError) == -1) {
+            err = tx->getNdbError();
+            /* 626 at the txn level is expected when some ops missed --
+             * tolerate it and drive per-op inspection. */
+            if (err.code != 626) {
+                rondb_get_ndb(state)->closeTransaction(tx);
+                return rondb_report_error(err, "readdir_plus batch exec");
+            }
+        }
+
+        /* Phase 3: materialise each row into the 137-byte rondb_inode
+         * buffer and deliver it via the caller's callback.  Stopping early
+         * (cb returns non-zero) is honoured. */
+        for (size_t i = first; i < end; i++) {
+            rondb_readdir_plus_ino_set &s = ino_ops[i - first];
         uint8_t inode_buf[RONDB_INODE_FIXED_SIZE];
         int inode_valid = 1;
 
@@ -3846,6 +3975,7 @@ int rondb_shim_ns_readdir_plus(void *handle,
                inode_valid ? (uint32_t)RONDB_INODE_FIXED_SIZE : 0U,
                inode_valid, ctx) != 0) {
             break;
+        }
         }
     }
 
@@ -8863,88 +8993,69 @@ int rondb_shim_layout_get_by_stateid(void *handle,
     return rc;
 }
 
-/*
- * Presence check: does `fileid` have any live layout?
- *
- * Mirrors rondb_shim_layout_iter_file's access path: a fileid-bounded
- * primary-key ordered-index scan of mds_layout_state (partition-pruned
- * to the single owning fragment), falling back to a table scan +
- * equality filter when the PRIMARY ordered index is absent.  Only the
- * fileid key column is read and the scan stops at the first match, so
- * this is a cheap existence probe rather than a full enumeration.
- */
 int rondb_shim_layout_scan_for_file(void *handle, uint64_t fileid,
                                     int *has_layout)
 {
     rondb_shim_handle *state = rondb_checked_handle(handle, nullptr);
     NdbDictionary::Dictionary *dict;
-    const NdbDictionary::Table *ls_tbl;
+    const NdbDictionary::Table *lbf_tbl;
+    const NdbDictionary::Index *ix;
     NdbTransaction *tx;
-    NdbScanOperation *scan = nullptr;
-    NdbIndexScanOperation *iscan;
+    NdbIndexScanOperation *scan;
     NdbError err;
     int next_rc;
-    Uint64 bound_fileid = (Uint64)fileid;
 
     if (state == nullptr || has_layout == nullptr) { return -1; }
     *has_layout = 0;
 
     dict = rondb_get_dictionary(state);
     if (dict == nullptr) { return -1; }
-    ls_tbl = dict->getTable(RONDB_TBL_LAYOUT_STATE);
-    if (ls_tbl == nullptr) { return -1; }
+    lbf_tbl = dict->getTable(RONDB_TBL_LAYOUT_BY_FILE);
+    if (lbf_tbl == nullptr) { return -1; }
 
-    /* TC locality hint: layout_state is partitioned by fileid. */
-    {
-        uint8_t pk_buf[8];
-        fdb_put_u64(pk_buf, fileid);
-        tx = rondb_get_ndb(state)->startTransaction(
-            ls_tbl, (const char *)pk_buf, 8);
+    /*
+     * Partition-pruned index probe on ix_layout_by_file_fileid -- same
+     * BoundEQ(fileid) path as rondb_shim_layout_iter_file Step 1, but
+     * stop after the first tuple.  Replaces the prior NdbScanOperation
+     * + NdbScanFilter pushdown, which visited every fragment and cost
+     * ~230 ms p50 on the lab cluster when used as the unlink empty-
+     * layout fast path.
+     */
+    ix = rondb_resolve_index(dict, RONDB_IX_LBF_FILEID,
+                             RONDB_TBL_LAYOUT_BY_FILE);
+    if (ix == nullptr) {
+        return rondb_report_error(dict->getNdbError(),
+                                 "layout_scan_file getIndex");
     }
+
+    tx = rondb_get_ndb(state)->startTransaction();
     if (tx == nullptr) {
         return rondb_report_error(rondb_get_ndb(state)->getNdbError(),
                                  "layout_scan_file startTx");
     }
 
-    /* Fast path: primary-key ordered-index scan bounded by fileid;
-     * fall back to a table scan + filter when PRIMARY is absent. */
-    iscan = tx->getNdbIndexScanOperation("PRIMARY", RONDB_TBL_LAYOUT_STATE);
-    if (iscan != nullptr) {
-        if (iscan->readTuples(NdbOperation::LM_CommittedRead) != 0) {
-            err = iscan->getNdbError();
-            rondb_get_ndb(state)->closeTransaction(tx);
-            return rondb_report_error(err, "layout_scan_file idx readTuples");
-        }
-        if (iscan->setBound(RONDB_LS_COL_FILEID,
-                            NdbIndexScanOperation::BoundEQ,
-                            &bound_fileid) != 0) {
-            err = iscan->getNdbError();
-            rondb_get_ndb(state)->closeTransaction(tx);
-            return rondb_report_error(err, "layout_scan_file setBound");
-        }
-        scan = iscan;
-    } else {
-        scan = tx->getNdbScanOperation(ls_tbl);
-        if (scan == nullptr) {
-            err = tx->getNdbError();
-            rondb_get_ndb(state)->closeTransaction(tx);
-            return rondb_report_error(err, "layout_scan_file getScanOp");
-        }
-        if (scan->readTuples(NdbOperation::LM_CommittedRead) != 0) {
-            err = scan->getNdbError();
-            rondb_get_ndb(state)->closeTransaction(tx);
-            return rondb_report_error(err, "layout_scan_file readTuples");
-        }
-        {
-            NdbScanFilter filter(scan);
-            filter.begin(NdbScanFilter::AND);
-            filter.eq(ls_tbl->getColumn(RONDB_LS_COL_FILEID)->getColumnNo(),
-                      (Uint64)fileid);
-            filter.end();
-        }
+    scan = tx->getNdbIndexScanOperation(ix);
+    if (scan == nullptr) {
+        err = tx->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "layout_scan_file getIndexScanOp");
     }
 
-    (void)scan->getValue(RONDB_LS_COL_FILEID, nullptr);
+    if (scan->readTuples(NdbOperation::LM_CommittedRead) != 0) {
+        err = scan->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "layout_scan_file readTuples");
+    }
+
+    if (scan->setBound(RONDB_LBF_COL_FILEID,
+                       NdbIndexScanOperation::BoundEQ,
+                       &fileid) != 0) {
+        err = scan->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "layout_scan_file setBound");
+    }
+
+    (void)scan->getValue(RONDB_LBF_COL_FILEID, nullptr);
 
     if (tx->execute(NdbTransaction::NoCommit) == -1) {
         err = tx->getNdbError();
@@ -9172,31 +9283,7 @@ int rondb_shim_ds_layout_idx_scan(void *handle, uint32_t ds_id,
 }
 
 /* -----------------------------------------------------------------------
- * Phase 8A+ -- per-file layout holder enumeration
- *
- * Enumerate every layout holder for `fileid` for the recall
- * coordinator (final-unlink revoke and byte-range conflict recall).
- *
- * mds_layout_state has PK (fileid, stateid_other) partitioned by
- * fileid and stores clientid/iomode/seqid inline (schema v6), so a
- * single fileid-scoped scan of layout_state returns everything the
- * callback needs.  This deliberately no longer reads
- * mds_layout_by_file and no longer issues a per-stateid
- * rondb_shim_layout_get_by_stateid round-trip: the previous revision
- * did both, turning one unlink into 1 + N table scans
- * (layout_get_by_stateid is itself a scan), which dominated mdtest
- * delete latency and amplified scan contention into spurious
- * NFS4ERR_DELAY retries.
- *
- * Fast path: a primary-key ordered-index scan bounded by fileid.
- * Because fileid is the full distribution key, NDB prunes the scan to
- * the single fragment that owns the file, so cost is O(holders for
- * this file) rather than O(all live layouts in the cluster).  If the
- * primary ordered index is unavailable (clusters created without
- * ndb_index_stat system tables -- see the note on
- * rondb_shim_layout_get_by_stateid), fall back to a table scan with a
- * server-side equality filter on fileid.  Both paths read the same
- * columns and yield identical results.
+ * Phase 8A+ -- layout_by_file iteration with layout_state join
  * ----------------------------------------------------------------------- */
 
 int rondb_shim_layout_iter_file(void *handle, uint64_t fileid,
@@ -9204,91 +9291,68 @@ int rondb_shim_layout_iter_file(void *handle, uint64_t fileid,
 {
     rondb_shim_handle *state = rondb_checked_handle(handle, nullptr);
     NdbDictionary::Dictionary *dict;
-    const NdbDictionary::Table *ls_tbl;
+    const NdbDictionary::Table *lbf_tbl;
+    const NdbDictionary::Index *ix;
     NdbTransaction *tx;
-    NdbScanOperation *scan = nullptr;
-    NdbIndexScanOperation *iscan;
-    NdbRecAttr *a_cid, *a_fid, *a_io, *a_seq, *a_sid;
+    NdbIndexScanOperation *scan;
+    NdbRecAttr *a_sid;
     NdbError err;
     int next_rc;
-    Uint64 bound_fileid = (Uint64)fileid;
-
-    /* One decoded holder row, collected during the scan and emitted to
-     * the callback after the scan transaction is closed. */
-    struct iter_row {
-        uint64_t clientid;
-        uint32_t seqid;
-        uint32_t iomode;
-        uint8_t  stateid[12];
-    };
-    std::vector<iter_row> rows;
+    std::vector<std::string> stateids;
 
     if (state == nullptr || cb == nullptr) { return -1; }
 
     dict = rondb_get_dictionary(state);
     if (dict == nullptr) { return -1; }
-    ls_tbl = dict->getTable(RONDB_TBL_LAYOUT_STATE);
-    if (ls_tbl == nullptr) { return -1; }
-
-    /* TC locality hint: layout_state is partitioned by fileid. */
-    {
-        uint8_t pk_buf[8];
-        fdb_put_u64(pk_buf, fileid);
-        tx = rondb_get_ndb(state)->startTransaction(
-            ls_tbl, (const char *)pk_buf, 8);
+    lbf_tbl = dict->getTable(RONDB_TBL_LAYOUT_BY_FILE);
+    if (lbf_tbl == nullptr) { return -1; }
+    ix = rondb_resolve_index(dict, RONDB_IX_LBF_FILEID,
+                             RONDB_TBL_LAYOUT_BY_FILE);
+    if (ix == nullptr) {
+        return rondb_report_error(dict->getNdbError(),
+                                 "layout_iter_file getIndex");
     }
+
+    /*
+     * Step 1: partition-pruned ordered-index scan of mds_layout_by_file
+     * for every stateid_other recorded against `fileid`.  fileid is the
+     * partition key and the leading PK column, so an NdbIndexScanOperation
+     * with BoundEQ(fileid) reads only the matching rows from a single
+     * fragment -- one NDB round-trip regardless of global cardinality.
+     * Replaces the prior NdbScanOperation + NdbScanFilter.eq pushdown,
+     * which visited every fragment and scaled linearly with
+     * layout_by_file size (approximately 230 ms p50 on the lab cluster,
+     * approximately 100 percent of the layout_recall_scan catalogue phase).
+     */
+    tx = rondb_get_ndb(state)->startTransaction();
     if (tx == nullptr) {
         return rondb_report_error(rondb_get_ndb(state)->getNdbError(),
                                  "layout_iter_file startTx");
     }
 
-    /* Fast path: primary-key ordered-index scan bounded by fileid.
-     * A null op means the PRIMARY ordered index is absent on this
-     * cluster; fall back to a table scan + filter (no operation has
-     * been attached to the transaction yet, so this is safe). */
-    iscan = tx->getNdbIndexScanOperation("PRIMARY", RONDB_TBL_LAYOUT_STATE);
-    if (iscan != nullptr) {
-        if (iscan->readTuples(NdbOperation::LM_CommittedRead) != 0) {
-            err = iscan->getNdbError();
-            rondb_get_ndb(state)->closeTransaction(tx);
-            return rondb_report_error(err, "layout_iter_file idx readTuples");
-        }
-        if (iscan->setBound(RONDB_LS_COL_FILEID,
-                            NdbIndexScanOperation::BoundEQ,
-                            &bound_fileid) != 0) {
-            err = iscan->getNdbError();
-            rondb_get_ndb(state)->closeTransaction(tx);
-            return rondb_report_error(err, "layout_iter_file setBound");
-        }
-        scan = iscan;
-    } else {
-        scan = tx->getNdbScanOperation(ls_tbl);
-        if (scan == nullptr) {
-            err = tx->getNdbError();
-            rondb_get_ndb(state)->closeTransaction(tx);
-            return rondb_report_error(err, "layout_iter_file getScanOp");
-        }
-        if (scan->readTuples(NdbOperation::LM_CommittedRead) != 0) {
-            err = scan->getNdbError();
-            rondb_get_ndb(state)->closeTransaction(tx);
-            return rondb_report_error(err, "layout_iter_file readTuples");
-        }
-        {
-            NdbScanFilter filter(scan);
-            filter.begin(NdbScanFilter::AND);
-            filter.eq(ls_tbl->getColumn(RONDB_LS_COL_FILEID)->getColumnNo(),
-                      (Uint64)fileid);
-            filter.end();
-        }
+    scan = tx->getNdbIndexScanOperation(ix);
+    if (scan == nullptr) {
+        err = tx->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "layout_iter_file getIndexScanOp");
     }
 
-    a_cid = scan->getValue(RONDB_LS_COL_CLIENTID, nullptr);
-    a_fid = scan->getValue(RONDB_LS_COL_FILEID, nullptr);
-    a_io  = scan->getValue(RONDB_LS_COL_IOMODE, nullptr);
-    a_seq = scan->getValue(RONDB_LS_COL_SEQID, nullptr);
-    a_sid = scan->getValue(RONDB_LS_COL_STATEID, nullptr);
-    if (a_cid == nullptr || a_fid == nullptr || a_io == nullptr ||
-        a_seq == nullptr || a_sid == nullptr) {
+    if (scan->readTuples(NdbOperation::LM_CommittedRead) != 0) {
+        err = scan->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "layout_iter_file readTuples");
+    }
+
+    if (scan->setBound(RONDB_LBF_COL_FILEID,
+                       NdbIndexScanOperation::BoundEQ,
+                       &fileid) != 0) {
+        err = scan->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "layout_iter_file setBound");
+    }
+
+    a_sid = scan->getValue(RONDB_LBF_COL_STATEID, nullptr);
+    if (a_sid == nullptr) {
         rondb_get_ndb(state)->closeTransaction(tx);
         return -1;
     }
@@ -9300,26 +9364,13 @@ int rondb_shim_layout_iter_file(void *handle, uint64_t fileid,
     }
 
     while ((next_rc = scan->nextResult(true)) == 0) {
-        /* Defensive: the index bound / scan filter already restrict to
-         * this fileid; re-check so a filter edge case cannot leak a
-         * foreign holder to the recall coordinator. */
-        if (a_fid->u_64_value() != fileid) {
-            continue;
-        }
         const char *ref = a_sid->aRef();
-        if (ref == nullptr) {
-            continue;
+        if (ref != nullptr) {
+            uint32_t vb_len = (uint32_t)(uint8_t)ref[0];
+            if (vb_len == 12) {
+                stateids.emplace_back(ref + 1, 12);
+            }
         }
-        uint32_t vb_len = (uint32_t)(uint8_t)ref[0];
-        if (vb_len != 12) {
-            continue;
-        }
-        iter_row r;
-        r.clientid = a_cid->u_64_value();
-        r.seqid    = a_seq->u_32_value();
-        r.iomode   = a_io->u_32_value();
-        std::memcpy(r.stateid, ref + 1, 12);
-        rows.push_back(r);
     }
     if (next_rc != 1) {
         err = scan->getNdbError();
@@ -9330,14 +9381,22 @@ int rondb_shim_layout_iter_file(void *handle, uint64_t fileid,
     scan->close();
     rondb_get_ndb(state)->closeTransaction(tx);
 
-    /* Emit after the scan transaction is closed: keeps the NDB scan
-     * cursor short-lived and avoids invoking the callback with an open
-     * transaction.  The callback set used here does not issue
-     * catalogue I/O, but decoupling is the safer contract. */
-    for (const iter_row &r : rows) {
-        if (cb(r.clientid, r.stateid, r.seqid, r.iomode, ctx) != 0) {
-            break;
+    /* Step 2: for each stateid, read layout_state to get details,
+     * then invoke the callback. */
+    for (const std::string &sid : stateids) {
+        uint64_t cid = 0;
+        uint32_t iomode = 0, seqid = 0;
+        int rc = rondb_shim_layout_get_by_stateid(
+            handle, (const uint8_t *)sid.data(),
+            &cid, nullptr, &iomode, nullptr, nullptr, &seqid);
+        if (rc == 0) {
+            int cb_rc = cb(cid, (const uint8_t *)sid.data(),
+                          seqid, iomode, ctx);
+            if (cb_rc != 0) {
+                break;
+            }
         }
+        /* rc == 1 (NOTFOUND): stale index entry, skip. */
     }
 
     return 0;

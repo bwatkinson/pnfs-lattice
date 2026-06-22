@@ -1179,27 +1179,36 @@ enum nfs4_status op_create(struct compound_data *cd,
 				      NOTIFY4_ADD_ENTRY,
 				      a->name, NULL);
 
-	/* Capture parent change_before so encode_res_create() can
-	 * emit a correct change_info4 without reading from the
-	 * union-aliased r->res.change_info.{before,after} fields,
-	 * which would overlap r->res.create.inode and therefore
-	 * carry bogus values derived from the child inode we are
-	 * about to write (e.g. (parent.change_before, mode << 32 |
-	 * type) seen on the wire pre-fix).  parent_change_after is
-	 * captured after cat_create() succeeds. */
+	/* Parent must exist and be a directory before CREATE (RFC 8881
+	 * §18.16.4).  Also capture change_before for encode_res_create()
+	 * without reading from the union-aliased r->res.change_info
+	 * fields, which overlap r->res.create.inode. */
 	uint64_t parent_change_before = 0;
 	{
 		struct mds_inode create_parent;
-		if (compound_inode_get(cd, cd->current_fh.fileid,
-				       &create_parent) == MDS_OK) {
-			parent_change_before = create_parent.change;
+
+		st = compound_inode_get(cd, cd->current_fh.fileid,
+					&create_parent);
+		if (st != MDS_OK) {
+			return mds_status_to_nfs4(st);
 		}
+		if (create_parent.type != MDS_FTYPE_DIR) {
+			return NFS4ERR_NOTDIR;
+		}
+		parent_change_before = create_parent.change;
 	}
 
 	st = cat_create(cd, cd->current_fh.fileid, a->name,
 			   a->type, a->mode, eff_uid, eff_gid,
 			   cd->prealloc,
 		       &res->res.create.inode);
+	if (st == MDS_ERR_EXISTS) {
+		/* Concurrent mkdir/create: flush any negative dirent
+		 * cache entry so subsequent LOOKUPs on this client
+		 * session see the committed object. */
+		compound_dirent_invalidate(cd, cd->current_fh.fileid,
+					   a->name);
+	}
 	if (st != MDS_OK) {
 		return mds_status_to_nfs4(st);
 	}
@@ -1722,7 +1731,7 @@ enum nfs4_status op_rename(struct compound_data *cd,
 				.target = cd->current_fh.fileid,
 				.found = false,
 			};
-			if (cat_readdir(cd, MDS_FILEID_ROOT, NULL,
+			if (cat_readdir(cd, MDS_FILEID_ROOT, NULL, 0,
 					find_name_cat_cb, &fnc) == MDS_OK
 			    && fnc.found) {
 				(void)snprintf(cd->current_path,
@@ -2268,8 +2277,6 @@ enum nfs4_status op_link(struct compound_data *cd,
 struct readdir_fill {
 	struct compound_data    *cd;
 	struct nfs4_res_readdir *rd;
-	uint64_t cookie_fileid; /* Resume after this fileid (0 = start) */
-	bool     past_cookie;   /* Have we passed the cookie entry? */
 };
 
 /**
@@ -2343,17 +2350,6 @@ static int readdir_plus_cat_cb(const struct mds_cat_dirent *entry,
 						     &se) == MDS_OK) {
 				return 0; /* hidden referral junction */
 			}
-		}
-	}
-
-	if (!f->past_cookie) {
-		if (f->cookie_fileid == 0) {
-			f->past_cookie = true;
-		} else if (entry->fileid == f->cookie_fileid) {
-			f->past_cookie = true;
-			return 0;
-		} else {
-			return 0;
 		}
 	}
 
@@ -2463,20 +2459,40 @@ enum nfs4_status op_readdir(struct compound_data *cd,
 
 	{
 		struct readdir_fill fill;
+		const char *start_after = NULL;
+		char cookie_name[MDS_MAX_NAME + 1];
 
 		fill.cd = cd;
 		fill.rd = &res->res.readdir;
-		fill.cookie_fileid = op->arg.readdir.cookie;
-		fill.past_cookie = false;
 
-		/* Fused path: dirent scan + all entry_attrs resolve in one
+		/* Translate the opaque fileid cookie into a start_after name
+		 * so the catalogue can skip earlier entries without scanning
+		 * the full directory on every page. */
+		if (op->arg.readdir.cookie != 0) {
+			st = mds_cat_ns_dirent_name_for_child(
+				cd->cat, cd->current_fh.fileid,
+				op->arg.readdir.cookie,
+				cookie_name, sizeof(cookie_name));
+			if (st == MDS_OK) {
+				start_after = cookie_name;
+			} else if (st == MDS_ERR_NOTFOUND) {
+				/* Stale cookie (entry removed): empty page. */
+				res->res.readdir.eof = true;
+				return NFS4_OK;
+			} else {
+				return mds_status_to_nfs4(st);
+			}
+		}
+
+		/* Fused path: dirent scan + entry_attrs resolve in one
 		 * NDB transaction on RonDB; null-safe dispatch falls back
 		 * to ns_readdir + per-entry ns_getattr for other backends.
 		 * entry_attrs / entry_attrs_valid are populated inline by
 		 * readdir_plus_cat_cb so the old populate_readdir_entry_attrs
 		 * loop is no longer needed on this path. */
 		st = cat_readdir_plus(cd, cd->current_fh.fileid,
-				      NULL, readdir_plus_cat_cb, &fill);
+				      start_after, NFS4_READDIR_MAX,
+				      readdir_plus_cat_cb, &fill);
 		if (st != MDS_OK) {
 			return mds_status_to_nfs4(st);
 }

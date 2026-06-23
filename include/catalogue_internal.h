@@ -64,6 +64,10 @@ struct mds_authority_ops {
     enum mds_status (*ns_remove)(struct mds_catalogue *cat,
         struct mds_cat_txn *txn, uint64_t parent,
         const char *name);
+    /** Optional: remove when child inode was already resolved. */
+    enum mds_status (*ns_remove_known)(struct mds_catalogue *cat,
+        struct mds_cat_txn *txn, uint64_t parent,
+        const char *name, const struct mds_inode *child);
     enum mds_status (*ns_rename)(struct mds_catalogue *cat,
         struct mds_cat_txn *txn, uint64_t src_parent,
         const char *src_name, uint64_t dst_parent,

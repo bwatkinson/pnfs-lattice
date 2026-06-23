@@ -1970,9 +1970,16 @@ static void revoke_unused_pregrant(struct compound_data *cd)
 	cd->layout_pregranted = false;
 }
 
-/* Per-op timing: sample 1-in-64 compounds to avoid log spam. */
+/* Per-op timing: sample 1-in-64 compounds when threshold > 0. */
 static _Atomic uint32_t g_compound_sample_ctr = 0;
+static _Atomic uint32_t g_compound_perf_threshold_us = 0;
 #define COMPOUND_SAMPLE_INTERVAL 64
+
+void compound_set_perf_threshold_us(uint32_t threshold_us)
+{
+	atomic_store_explicit(&g_compound_perf_threshold_us, threshold_us,
+			      memory_order_relaxed);
+}
 
 static const char *opnum_name(enum nfs_opnum4 op)
 {
@@ -2004,8 +2011,11 @@ uint32_t compound_process(struct compound_data *cd,
 	uint32_t i;
 	struct timespec t_start, t_op_start, t_op_end;
 	uint64_t op_us[64];
-	bool do_sample = (atomic_fetch_add(&g_compound_sample_ctr, 1)
-			  % COMPOUND_SAMPLE_INTERVAL) == 0;
+	uint32_t perf_threshold = atomic_load_explicit(
+		&g_compound_perf_threshold_us, memory_order_relaxed);
+	bool do_sample = perf_threshold > 0 &&
+		(atomic_fetch_add(&g_compound_sample_ctr, 1)
+		 % COMPOUND_SAMPLE_INTERVAL) == 0;
 
 	if (do_sample && count <= 64) {
 		clock_gettime(CLOCK_MONOTONIC, &t_start);
@@ -2131,13 +2141,13 @@ op_done:
 		}
 	}
 
-	/* Log sampled compound timing. */
+	/* Log sampled compound timing (disabled when threshold == 0). */
 	if (do_sample && count <= 64) {
 		struct timespec t_end;
 		clock_gettime(CLOCK_MONOTONIC, &t_end);
 		int64_t total_us = (int64_t)(t_end.tv_sec - t_start.tv_sec) * 1000000LL
 				  + (int64_t)(t_end.tv_nsec - t_start.tv_nsec) / 1000LL;
-		if (total_us > 2000) { /* Only log compounds > 2ms */
+		if (total_us > (int64_t)perf_threshold) {
 			char buf[512];
 			int pos = snprintf(buf, sizeof(buf),
 				"PERF: compound %lluus [", (unsigned long long)total_us);

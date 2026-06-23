@@ -273,6 +273,7 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
     cfg->dir_deleg_recall_timeout_ms = 5000;
     cfg->metrics_http_port = 9090;
     cfg->metrics_op_enabled = true;
+    cfg->compound_perf_threshold_us = 0; /* disabled; was 2000 hardcoded */
 
     /* mountd compatibility responder (`showmount -e`).  Enabled
      * by default; binds UDP+TCP on 0.0.0.0:20048, registers with the
@@ -875,6 +876,9 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
              * without recompiling. */
             cfg->metrics_op_enabled =
                 (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+        } else if (strcmp(key, "compound_perf_threshold_us") == 0) {
+            unsigned long v = strtoul(val, NULL, 10);
+            cfg->compound_perf_threshold_us = (uint32_t)v;
 
         /* mountd_compat -- `showmount -e` compatibility responder.
          * See docs/mountd-compat.md.  All keys are optional; the

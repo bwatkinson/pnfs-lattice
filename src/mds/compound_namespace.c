@@ -1347,15 +1347,19 @@ enum nfs4_status op_create(struct compound_data *cd,
  * regular file (i.e. this remove was the last name for the inode).
  */
 static void enqueue_gc_for_final_unlink(struct compound_data *cd,
-					uint64_t fileid)
+					uint64_t fileid,
+					struct mds_ds_map_entry *entries_prefetch,
+					uint32_t stripe_count_prefetch,
+					uint32_t mirror_count_prefetch)
 {
-	struct mds_ds_map_entry *entries = NULL;
-	uint32_t stripe_count = 0;
+	struct mds_ds_map_entry *entries = entries_prefetch;
+	uint32_t stripe_count = stripe_count_prefetch;
 	uint32_t stripe_unit = 0;
-	uint32_t mirror_count = 0;
+	uint32_t mirror_count = mirror_count_prefetch;
 	enum mds_status st;
 	uint32_t total;
 	uint32_t i;
+	bool entries_owned = false;
 	/* De-dup buffer: at most stripe_count*mirror_count unique IDs.
 	 * Heap-allocated (Phase A of docs/hpc-nto1-plan.md): with
 	 * MDS_MAX_STRIPES at 1024 the worst-case 4096-uint32 buffer is
@@ -1370,12 +1374,20 @@ static void enqueue_gc_for_final_unlink(struct compound_data *cd,
 		return;
 	}
 
-	st = cat_stripe_map_get(cd, fileid, &stripe_count, &stripe_unit,
-				&mirror_count, &entries);
+	if (entries == NULL) {
+		st = cat_stripe_map_get(cd, fileid, &stripe_count, &stripe_unit,
+					&mirror_count, &entries);
+		entries_owned = true;
+	} else {
+		st = (entries != NULL && stripe_count > 0 && mirror_count > 0)
+			? MDS_OK : MDS_ERR_NOTFOUND;
+	}
 	(void)stripe_unit;
 	if (st != MDS_OK || entries == NULL ||
 	    stripe_count == 0 || mirror_count == 0) {
-		free(entries);
+		if (entries_owned) {
+			free(entries);
+		}
 		return;
 	}
 
@@ -1445,7 +1457,9 @@ static void enqueue_gc_for_final_unlink(struct compound_data *cd,
 	layout_commit_aggregator_drop(cd->lcommit_agg, fileid);
 
 	free(seen);
-	free(entries);
+	if (entries_owned) {
+		free(entries);
+	}
 }
 
 enum nfs4_status op_remove(struct compound_data *cd,
@@ -1527,6 +1541,10 @@ enum nfs4_status op_remove(struct compound_data *cd,
 		 rm_inode.type == MDS_FTYPE_REG &&
 		 rm_inode.nlink == 1);
 	uint64_t rm_fileid = (st == MDS_OK) ? rm_inode.fileid : 0;
+	struct mds_ds_map_entry *rm_sm_entries = NULL;
+	uint32_t rm_sm_sc = 0;
+	uint32_t rm_sm_su = 0;
+	uint32_t rm_sm_mc = 0;
 
 	/* Phase 8d: NOTIFY4_REMOVE_ENTRY or recall. */
 	compound_notify_or_recall_dir(cd, cd->current_fh.fileid,
@@ -1565,22 +1583,20 @@ enum nfs4_status op_remove(struct compound_data *cd,
 		 * layout is revoked and the inode is about to be
 		 * deleted.  Best-effort: do not fail the remove. */
 		if (cd->proxy != NULL && cd->cat != NULL) {
-			struct mds_ds_map_entry *fe = NULL;
-			uint32_t fsc = 0, fsu = 0, fmc = 0;
-
 			if (mds_cat_stripe_map_get(cd->cat, rm_fileid,
-					&fsc, &fsu, &fmc, &fe) == MDS_OK &&
-			    fe != NULL) {
-				uint32_t ftot = fsc * fmc;
+					&rm_sm_sc, &rm_sm_su, &rm_sm_mc,
+					&rm_sm_entries) == MDS_OK &&
+			    rm_sm_entries != NULL) {
+				uint32_t ftot = rm_sm_sc * rm_sm_mc;
+
 				for (uint32_t fi = 0; fi < ftot; fi++) {
 					(void)mds_proxy_fence_ds_file(
 						cd->proxy,
-						fe[fi].ds_id,
+						rm_sm_entries[fi].ds_id,
 						rm_fileid,
-						fi / fmc,
-						fi % fmc);
+						fi / rm_sm_mc,
+						fi % rm_sm_mc);
 				}
-				free(fe);
 			}
 		}
 
@@ -1595,8 +1611,11 @@ enum nfs4_status op_remove(struct compound_data *cd,
 		}
 	}
 
-	st = cat_remove(cd, cd->current_fh.fileid,
-			op->arg.remove.name);
+	st = (st == MDS_OK)
+		? cat_remove_known(cd, cd->current_fh.fileid,
+				   op->arg.remove.name, &rm_inode)
+		: cat_remove(cd, cd->current_fh.fileid,
+			     op->arg.remove.name);
 	if (st == MDS_OK && rm_quota) {
 		quota_submit_adjust(cd, rm_inode.uid, rm_inode.gid,
 				    -(int64_t)rm_inode.size, -1);
@@ -1638,9 +1657,13 @@ enum nfs4_status op_remove(struct compound_data *cd,
 		 * remove status; the next pass picks up any rows
 		 * we miss. */
 		if (rm_final_data_unlink && rm_fileid != 0) {
-			enqueue_gc_for_final_unlink(cd, rm_fileid);
+			enqueue_gc_for_final_unlink(cd, rm_fileid,
+						    rm_sm_entries,
+						    rm_sm_sc, rm_sm_mc);
+			rm_sm_entries = NULL;
 		}
 	}
+	free(rm_sm_entries);
 	return mds_status_to_nfs4(st);
 }
 

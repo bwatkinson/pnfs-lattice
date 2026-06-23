@@ -324,9 +324,11 @@ int main(int argc, char *argv[])
 	 * disabled, every observation site takes a one-load early-return
 	 * path; the dispatcher metrics in threadpool.c stay always-on. */
 	mds_op_metrics_set_enabled(cfg.metrics_op_enabled);
+	compound_set_perf_threshold_us(cfg.compound_perf_threshold_us);
 	MDS_LOG_INFO(LOG_COMP_MDS,
-		"op_metrics=%s",
-		cfg.metrics_op_enabled ? "on" : "off");
+		"op_metrics=%s compound_perf_threshold_us=%u",
+		cfg.metrics_op_enabled ? "on" : "off",
+		cfg.compound_perf_threshold_us);
 
 	/* 1b. Block SIGINT/SIGTERM before any worker threads.
 	 *     All subsequently created threads inherit the blocked mask;

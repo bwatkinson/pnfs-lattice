@@ -52,29 +52,18 @@ enum nfs4_status op_sequence(struct compound_data *cd,
 				    &r->highest_slot_id,
 				    &r->target_highest_slot_id,
 				    &r->status_flags,
-				    &cd->clientid);
+				    &cd->clientid,
+				    &cd->max_response_size,
+				    &cd->max_response_size_cached);
 	switch (rc) {
 	case 0:  /* new request */
 		memcpy(r->session_id, a->session_id, SESSION_ID_SIZE);
 		r->slot_id = a->slot_id;
 		r->seq_id = a->seq_id;
 		cd->sequence_done = true;
-		/* Populate per-session response size caps for
-		 * RFC 8881 §2.10.6.1.3 enforcement.  SEQUENCE
-		 * response is the first result in the compound
+		/* SEQUENCE response is the first result in the compound
 		 * (~56 bytes on the wire). */
-		{
-			uint32_t mrs = 0, mrsc = 0;
-			if (session_get_response_limits(
-				cd->st, a->session_id,
-				&mrs, &mrsc) == 0) {
-				cd->max_response_size = mrs;
-				cd->max_response_size_cached = mrsc;
-			}
-			/* Account for COMPOUND4res header (~12 bytes)
-			 * + this SEQUENCE result (~48 bytes). */
-			cd->response_size_est = 60;
-		}
+		cd->response_size_est = 60;
 		/*
 		 * RFC 8881 §2.10.6.1.3: "If sa_cachethis is TRUE
 		 * and the replier determines that the reply to the

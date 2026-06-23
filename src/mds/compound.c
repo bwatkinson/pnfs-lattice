@@ -33,6 +33,7 @@
 #include "dirent_cache.h"
 #include "delegation.h"
 #include "dir_delegation.h"
+#include "layout_recall.h"
 #include "xdr_codec.h"
 #include "mds_metrics.h"
 #include "mds_op_metrics.h"
@@ -1550,6 +1551,14 @@ static enum nfs4_status dispatch_op(struct compound_data *cd,
 			if (!found && cd->lt != NULL) {
 				if (lock_state_exists(cd->lt,
 						      ts->stateids[k].other)) {
+					found = true;
+				}
+			}
+			if (!found) {
+				uint32_t layout_seq = 0;
+
+				if (layout_seqid_peek(ts->stateids[k].other,
+						      &layout_seq)) {
 					found = true;
 				}
 			}

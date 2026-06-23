@@ -406,14 +406,14 @@ static void test_sequence_valid(void)
 
 	/* Slot starts at seq_id = 0; first new request uses 1. */
 	rc = session_sequence_check(st, session_id, 0, 1, 15,
-				    &highest, &target, &flags, NULL);
+				    &highest, &target, &flags, NULL, NULL, NULL);
 	ASSERT_EQ(rc, 0);  /* new request */
 	ASSERT_EQ(highest, 15);
 	ASSERT_EQ(flags, 0);
 
 	/* Next request on same slot: seq_id = 2. */
 	rc = session_sequence_check(st, session_id, 0, 2, 15,
-				    &highest, &target, &flags, NULL);
+				    &highest, &target, &flags, NULL, NULL, NULL);
 	ASSERT_EQ(rc, 0);
 
 	session_table_destroy(st);
@@ -448,12 +448,12 @@ static void test_sequence_replay(void)
 
 	/* First request: seq_id = 1. */
 	rc = session_sequence_check(st, session_id, 0, 1, 15,
-				    NULL, NULL, NULL, NULL);
+				    NULL, NULL, NULL, NULL, NULL, NULL);
 	ASSERT_EQ(rc, 0);
 
 	/* Replay: seq_id = 1 again (same as last completed). */
 	rc = session_sequence_check(st, session_id, 0, 1, 15,
-				    NULL, NULL, NULL, NULL);
+				    NULL, NULL, NULL, NULL, NULL, NULL);
 	ASSERT_EQ(rc, 1);  /* replay detected */
 
 	session_table_destroy(st);
@@ -488,12 +488,12 @@ static void test_sequence_misordered(void)
 
 	/* First request: seq_id = 1. */
 	rc = session_sequence_check(st, session_id, 0, 1, 15,
-				    NULL, NULL, NULL, NULL);
+				    NULL, NULL, NULL, NULL, NULL, NULL);
 	ASSERT_EQ(rc, 0);
 
 	/* Skip to seq_id = 5 → misordered. */
 	rc = session_sequence_check(st, session_id, 0, 5, 15,
-				    NULL, NULL, NULL, NULL);
+				    NULL, NULL, NULL, NULL, NULL, NULL);
 	ASSERT_EQ(rc, -3);  /* NFS4ERR_SEQ_MISORDERED */
 
 	session_table_destroy(st);
@@ -513,7 +513,7 @@ static void test_sequence_bad_session(void)
 
 	memset(bogus, 0xFF, SESSION_ID_SIZE);
 	rc = session_sequence_check(st, bogus, 0, 1, 0,
-				    NULL, NULL, NULL, NULL);
+				    NULL, NULL, NULL, NULL, NULL, NULL);
 	ASSERT_EQ(rc, -1);  /* NFS4ERR_BADSESSION */
 
 	session_table_destroy(st);
@@ -548,7 +548,7 @@ static void test_sequence_bad_slot(void)
 
 	/* 4 slots → valid 0-3; slot 99 is out of range. */
 	rc = session_sequence_check(st, session_id, 99, 1, 3,
-				    NULL, NULL, NULL, NULL);
+				    NULL, NULL, NULL, NULL, NULL, NULL);
 	ASSERT_EQ(rc, -2);  /* NFS4ERR_BADSLOT */
 
 	session_table_destroy(st);

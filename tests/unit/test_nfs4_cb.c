@@ -123,7 +123,7 @@ static void test_cb_prog_preserved(void)
     uint32_t h_slot, t_slot, flags;
     uint64_t out_cid;
     int rc = session_sequence_check(st, sid, 0, 1, 15,
-                                    &h_slot, &t_slot, &flags, &out_cid);
+                                    &h_slot, &t_slot, &flags, &out_cid, NULL, NULL);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(out_cid, clientid);
 

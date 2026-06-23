@@ -105,9 +105,14 @@ struct nfs4_slot {
  * Session
  * ----------------------------------------------------------------------- */
 
+struct nfs4_client;  /* Forward — owner back-link on nfs4_session */
+
 struct nfs4_session {
 	uint8_t              session_id[SESSION_ID_SIZE];
 	uint64_t             clientid;
+	/* Back-link to the owning client for hot-path lease renewal in
+	 * session_sequence_check without a clientid hash walk. */
+	struct nfs4_client  *owner;
 	uint32_t             num_slots;       /* Forechannel slot count */
 	struct nfs4_slot    *slots;           /* [num_slots] */
 	struct nfs4_session *hash_next;       /* Session hash chain */
@@ -443,6 +448,9 @@ int session_destroy_session(struct session_table *st,
  * @param out_target_slot  Receives server's target_highest_slot_id.
  * @param out_status_flags Receives SEQ4_STATUS_* flags.
  * @param out_clientid     Receives the clientid owning this session (optional).
+ * @param out_max_resp     Receives ca_maxresponsesize (optional; avoids a
+ *                         second session-table lock in op_sequence).
+ * @param out_max_resp_cached Receives ca_maxresponsesizecached (optional).
  * @return 0 on success (new request).
  *         1 = replay (seq_id matches last completed; caller should
  *             return cached result if available, else NFS4_OK).
@@ -479,7 +487,9 @@ int session_sequence_check(struct session_table *st,
 			   uint32_t *out_highest_slot,
 			   uint32_t *out_target_slot,
 			   uint32_t *out_status_flags,
-			   uint64_t *out_clientid);
+			   uint64_t *out_clientid,
+			   uint32_t *out_max_resp,
+			   uint32_t *out_max_resp_cached);
 
 /* -----------------------------------------------------------------------
  * API — Backchannel connection binding

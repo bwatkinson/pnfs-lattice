@@ -996,6 +996,7 @@ int session_create_session(struct session_table *st,
 	 * With seq_id=0, the check (1 == 0+1) accepts it. */
 	s->num_slots = actual_fore;
 	s->clientid = clientid;
+	s->owner = c;
 	s->minorversion = minorversion;
 	s->max_request_size = actual_max_req;
 	{
@@ -1397,7 +1398,9 @@ int session_sequence_check(struct session_table *st,
 			   uint32_t *out_highest_slot,
 			   uint32_t *out_target_slot,
 			   uint32_t *out_status_flags,
-			   uint64_t *out_clientid)
+			   uint64_t *out_clientid,
+			   uint32_t *out_max_resp,
+			   uint32_t *out_max_resp_cached)
 {
 	struct nfs4_session *s;
 	struct nfs4_client *c;
@@ -1465,11 +1468,17 @@ int session_sequence_check(struct session_table *st,
 	}
 
 accepted:
-	/* Renew lease. */
-	c = find_client_by_id(st, s->clientid);
-	if (c != NULL) {
-		c->last_renewed = time(NULL);
-}
+	/* Renew lease via the session's owner back-link (set at
+	 * CREATE_SESSION) to avoid a clientid hash walk on every
+	 * SEQUENCE. */
+	if (s->owner != NULL) {
+		s->owner->last_renewed = time(NULL);
+	} else {
+		c = find_client_by_id(st, s->clientid);
+		if (c != NULL) {
+			c->last_renewed = time(NULL);
+		}
+	}
 
 	/* Output hints. */
 	if (out_highest_slot != NULL) {
@@ -1484,6 +1493,12 @@ accepted:
 	if (out_clientid != NULL) {
 		*out_clientid = s->clientid;
 }
+	if (out_max_resp != NULL) {
+		*out_max_resp = s->max_response_size;
+	}
+	if (out_max_resp_cached != NULL) {
+		*out_max_resp_cached = s->max_response_size_cached;
+	}
 
 out:
 	pthread_mutex_unlock(&st->locks[shard]);
@@ -1727,6 +1742,47 @@ int session_for_each_with_cb_for_clientid(struct session_table *st,
  * Expired clients have their sessions and open/layout state cleaned up.
  * ----------------------------------------------------------------------- */
 
+static void session_expire_client_state(struct session_table *st,
+					uint64_t clientid,
+					bool confirmed)
+{
+	if (!confirmed) {
+		return;
+	}
+	if (st->ot != NULL) {
+		open_state_close_all_for_client(st->ot, clientid);
+	}
+	if (st->lt != NULL) {
+		lock_release_all_for_client(st->lt, clientid);
+	}
+	if (st->cat != NULL) {
+		(void)mds_coord_layout_del_all_for_client(st->cat, clientid);
+	}
+}
+
+static void session_finish_expired_client(struct session_table *st,
+					  struct nfs4_client *c)
+{
+	if (c == NULL) {
+		return;
+	}
+	if (c->confirmed) {
+		session_expire_client_state(st, c->clientid, true);
+		if (st->cq != NULL) {
+			struct commit_op cop;
+
+			memset(&cop, 0, sizeof(cop));
+			cop.type = COMMIT_OP_RECOVERY_DEL;
+			cop.args.recovery_del.clientid = c->clientid;
+			(void)commit_queue_submit(st->cq, &cop);
+		} else if (st->cat != NULL) {
+			(void)mds_coord_recovery_del(st->cat, NULL,
+						     c->clientid);
+		}
+	}
+	free(c);
+}
+
 /* NOLINTNEXTLINE(readability-function-cognitive-complexity) */
 static void *lease_reaper_thread(void *arg)
 {
@@ -1753,11 +1809,12 @@ static void *lease_reaper_thread(void *arg)
         }
 
         time_t now = time(NULL);
+        struct nfs4_client *orphans[CLIENT_HASH_BUCKETS];
+        uint32_t orphan_count = 0;
 
-        /* The reaper frees expired clients together with their
-         * sessions, so it must hold ALL stripe locks (see the
-         * locks[] protocol comment) to exclude shard-locked
-         * SEQUENCE/DRC readers. */
+        /* Identify and unlink expired clients under ALL stripe locks,
+         * but defer RonDB / open-state cleanup until after unlock so
+         * SEQUENCE handlers are not blocked for seconds. */
         session_table_lock_all(st);
         for (uint32_t b = 0; b < CLIENT_HASH_BUCKETS; b++) {
             struct nfs4_client **pp = &st->client_hash[b];
@@ -1772,46 +1829,32 @@ static void *lease_reaper_thread(void *arg)
                 uint32_t age = (uint32_t)(now - c->last_renewed);
 
                 if (!c->confirmed && age >= lease) {
-                    /* RFC 8881 §18.35.4: unconfirmed records
-                     * not confirmed within a lease period
-                     * SHOULD be removed. */
                     expired = true;
                 } else if (c->confirmed && age > lease * 2) {
-                    /* Confirmed clients get 2× lease grace
-                     * (they actively renew via SEQUENCE). */
                     expired = true;
                 }
 
                 if (expired) {
-                    /* Advance the bucket-chain pointer past c
-                     * before unhash removes c from the chain. */
                     *pp = c->hash_next;
-                    /* unhash_client unlinks from owner_hash;
-                     * the client_hash unlink above is redundant
-                     * with unhash_client's client_hash walk, but
-                     * harmless (walk finds nothing). */
                     unhash_client(st, c);
-                    if (c->confirmed) {
-                        if (st->ot != NULL) {
-                            open_state_close_all_for_client(
-                                st->ot, c->clientid);
-                        }
-                        if (st->lt != NULL) {
-                            lock_release_all_for_client(
-                                st->lt, c->clientid);
-                        }
-                        if (st->cat != NULL) {
-                            (void)mds_coord_layout_del_all_for_client(
-                                st->cat, c->clientid);
-                        }
+                    destroy_client_sessions(st, c);
+                    c->sessions = NULL;
+                    if (orphan_count < CLIENT_HASH_BUCKETS) {
+                        orphans[orphan_count++] = c;
+                    } else {
+                        /* Table unexpectedly full; finish inline. */
+                        session_finish_expired_client(st, c);
                     }
-                    free_client(st, c);
                 } else {
                     pp = &c->hash_next;
                 }
             }
         }
         session_table_unlock_all(st);
+
+        for (uint32_t i = 0; i < orphan_count; i++) {
+            session_finish_expired_client(st, orphans[i]);
+        }
     }
     return NULL;
 }

@@ -569,6 +569,16 @@ cat_remove(struct compound_data *cd, uint64_t parent,
 }
 
 static inline enum mds_status
+cat_remove_known(struct compound_data *cd, uint64_t parent,
+		 const char *name, const struct mds_inode *child)
+{
+	if (cd->cat == NULL) {
+		return MDS_ERR_INVAL;
+	}
+	return mds_cat_ns_remove_known(cd->cat, NULL, parent, name, child);
+}
+
+static inline enum mds_status
 cat_rename(struct compound_data *cd,
 	   uint64_t sp, const char *sn,
 	   uint64_t dp, const char *dn)

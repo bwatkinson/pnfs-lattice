@@ -629,6 +629,14 @@ struct mds_config {
     bool                metrics_op_enabled;
 
     /*
+     * Compound PERF log threshold in microseconds.  When > 0, roughly
+     * 1-in-64 compounds whose total wall time exceeds this value
+     * are logged at INFO ("PERF: compound ...").  Default 0 disables
+     * the sampler entirely (no timing overhead on the hot path).
+     */
+    uint32_t            compound_perf_threshold_us;
+
+    /*
      * `showmount -e` compatibility responder (mountd_compat).
      *
      * The MDS is an NFSv4.1 / pNFS server and does NOT speak NFSv3

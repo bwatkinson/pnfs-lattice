@@ -634,31 +634,27 @@ enum mds_status catalogue_rondb_ns_create(
 	return MDS_OK;
 }
 
+enum mds_status catalogue_rondb_ns_remove_known(struct mds_catalogue *cat,
+						uint64_t parent_fileid,
+						const char *name,
+						const struct mds_inode *child);
+
 enum mds_status catalogue_rondb_ns_remove(struct mds_catalogue *cat,
 					  uint64_t parent_fileid,
 					  const char *name)
 {
 	void *h = rondb_handle(cat);
 	struct mds_inode child_ino;
-	uint32_t child_shard = 0;
 	uint64_t child_fid = 0;
 	uint8_t child_type = 0;
 	uint8_t child_buf[RONDB_INODE_MAX_SIZE];
 	uint32_t outlen = 0;
-	struct timespec now;
-	int delete_child;
-	int32_t parent_nlink_delta;
 	int rc;
 
 	if (h == NULL || name == NULL) {
 		return MDS_ERR_INVAL;
 	}
 
-	/* Two-transaction remove: fused read (dirent + inode) in txn 1,
-	 * then atomic delete in txn 2.  The single-transaction approach
-	 * (rondb_shim_ns_remove_full) was benchmarked and caused a 30%
-	 * regression due to exclusive locks held across 3 execute phases
-	 * under parallel load.  Short lock windows win. */
 	rc = rondb_shim_ns_lookup(h, parent_fileid, name,
 				  &child_fid, &child_type,
 				  child_buf, sizeof(child_buf),
@@ -673,9 +669,31 @@ enum mds_status catalogue_rondb_ns_remove(struct mds_catalogue *cat,
 		return MDS_ERR_IO;
 	}
 	if (rondb_inode_deserialize(child_buf, outlen,
-				   &child_ino, &child_shard) != 0) {
+				   &child_ino, NULL) != 0) {
 		return MDS_ERR_IO;
 	}
+	return catalogue_rondb_ns_remove_known(cat, parent_fileid, name,
+					       &child_ino);
+}
+
+enum mds_status catalogue_rondb_ns_remove_known(struct mds_catalogue *cat,
+						uint64_t parent_fileid,
+						const char *name,
+						const struct mds_inode *child)
+{
+	void *h = rondb_handle(cat);
+	struct mds_inode child_ino;
+	uint8_t child_buf[RONDB_INODE_MAX_SIZE];
+	int delete_child;
+	int32_t parent_nlink_delta;
+	struct timespec now;
+	int rc;
+
+	if (h == NULL || name == NULL || child == NULL) {
+		return MDS_ERR_INVAL;
+	}
+
+	child_ino = *child;
 
 	/* Prepare updated child inode (nlink decrement). */
 	clock_gettime(CLOCK_REALTIME, &now);
@@ -689,14 +707,14 @@ enum mds_status catalogue_rondb_ns_remove(struct mds_catalogue *cat,
 	parent_nlink_delta =
 		(child_ino.type == MDS_FTYPE_DIR) ? -1 : 0;
 
-	if (rondb_inode_serialize(&child_ino, child_shard,
+	if (rondb_inode_serialize(&child_ino, 0,
 				  child_buf, sizeof(child_buf)) < 0) {
 		return MDS_ERR_IO;
 	}
 
 	for (int attempt = 0; attempt < RONDB_TRANSIENT_RETRIES; attempt++) {
 		rc = rondb_shim_ns_remove(h, parent_fileid, name,
-					  child_fid,
+					  child_ino.fileid,
 					  child_buf, RONDB_INODE_FIXED_SIZE,
 					  delete_child,
 					  parent_nlink_delta,
@@ -2607,6 +2625,15 @@ static enum mds_status rondb_auth_ns_remove(
 	return catalogue_rondb_ns_remove(cat, parent, name);
 }
 
+static enum mds_status rondb_auth_ns_remove_known(
+	struct mds_catalogue *cat, struct mds_cat_txn *txn,
+	uint64_t parent, const char *name,
+	const struct mds_inode *child)
+{
+	(void)txn;
+	return catalogue_rondb_ns_remove_known(cat, parent, name, child);
+}
+
 static enum mds_status rondb_auth_ns_rename(
 	struct mds_catalogue *cat, struct mds_cat_txn *txn,
 	uint64_t src_parent, const char *src_name,
@@ -3179,6 +3206,7 @@ void catalogue_rondb_poller_stop(struct mds_catalogue *cat)
 static const struct mds_authority_ops rondb_authority_ops = {
 	.ns_create         = rondb_auth_ns_create,
 	.ns_remove         = rondb_auth_ns_remove,
+	.ns_remove_known   = rondb_auth_ns_remove_known,
 	.ns_rename         = rondb_auth_ns_rename,
 	.ns_link           = rondb_auth_ns_link,
 	.ns_lookup         = catalogue_rondb_ns_lookup,
@@ -3265,6 +3293,7 @@ static const struct mds_authority_ops rondb_authority_ops = {
 static const struct mds_authority_ops rondb_locked_authority_ops = {
 	.ns_create         = rondb_auth_ns_create,
 	.ns_remove         = rondb_auth_ns_remove,
+	.ns_remove_known   = rondb_auth_ns_remove_known,
 	.ns_rename         = rondb_locked_ns_rename,
 	.ns_link           = rondb_auth_ns_link,
 	.ns_lookup         = catalogue_rondb_ns_lookup,

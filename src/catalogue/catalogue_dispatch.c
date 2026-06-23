@@ -214,6 +214,24 @@ enum mds_status mds_cat_ns_remove(struct mds_catalogue *cat,
         cat->auth_ops->ns_remove(cat, txn, parent_fileid, name));
 }
 
+enum mds_status mds_cat_ns_remove_known(struct mds_catalogue *cat,
+                                        struct mds_cat_txn *txn,
+                                        uint64_t parent_fileid,
+                                        const char *name,
+                                        const struct mds_inode *child)
+{
+    if (cat == NULL || cat->auth_ops == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (cat->auth_ops->ns_remove_known != NULL && child != NULL) {
+        return CAT_TIMED(MDS_CATOP_NS_REMOVE,
+            cat->auth_ops->ns_remove_known(cat, txn, parent_fileid,
+                                           name, child));
+    }
+    return CAT_TIMED(MDS_CATOP_NS_REMOVE,
+        cat->auth_ops->ns_remove(cat, txn, parent_fileid, name));
+}
+
 enum mds_status mds_cat_ns_rename(struct mds_catalogue *cat,
                                   struct mds_cat_txn *txn,
                                   uint64_t src_parent,

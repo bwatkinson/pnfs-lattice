@@ -1848,6 +1848,9 @@ uint32_t compound_process(struct compound_data *cd,
 			   struct nfs4_result *results,
 			   uint32_t count);
 
+/** Set compound PERF log threshold (0 = disabled). */
+void compound_set_perf_threshold_us(uint32_t threshold_us);
+
 /**
  * Map internal mds_status to NFSv4 status code.
  */

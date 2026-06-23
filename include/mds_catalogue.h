@@ -171,6 +171,13 @@ enum mds_status mds_cat_ns_remove(struct mds_catalogue *cat,
 				  uint64_t parent_fileid,
 				  const char *name);
 
+/** Remove when the child inode was already looked up (skips re-read). */
+enum mds_status mds_cat_ns_remove_known(struct mds_catalogue *cat,
+					struct mds_cat_txn *txn,
+					uint64_t parent_fileid,
+					const char *name,
+					const struct mds_inode *child);
+
 /** Atomic rename: src dirent -> dst dirent + parent touches. */
 enum mds_status mds_cat_ns_rename(struct mds_catalogue *cat,
 				  struct mds_cat_txn *txn,

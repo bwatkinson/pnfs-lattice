@@ -6314,7 +6314,7 @@ ns_create_wl_err:
  * Stripe cleanup deferred to stripe_del stub.
  * ----------------------------------------------------------------------- */
 
-int rondb_shim_ns_remove(void *handle,
+static int rondb_shim_ns_remove_once(void *handle,
                          uint64_t parent_fileid, const char *name,
                          uint64_t child_fileid,
                          const uint8_t *child_inode_buf, uint32_t child_ino_len,
@@ -6360,8 +6360,9 @@ int rondb_shim_ns_remove(void *handle,
         tx = rondb_get_ndb(state)->startTransaction(dir_tbl, (const char *)pk_buf, 8);
     }
     if (tx == nullptr) {
-        return rondb_report_error(rondb_get_ndb(state)->getNdbError(),
-                                 "ns_remove startTx");
+        err = rondb_get_ndb(state)->getNdbError();
+        if (err.code == 266 || err.code == 274) { return err.code; }
+        return rondb_report_error(err, "ns_remove startTx");
     }
 
     /* 1. Delete dirent. */
@@ -6428,7 +6429,7 @@ int rondb_shim_ns_remove(void *handle,
     if (tx->execute(NdbTransaction::Commit) == -1) {
         err = tx->getNdbError();
         rondb_get_ndb(state)->closeTransaction(tx);
-        if (rondb_is_temporary(err)) { return -2; }
+        if (err.code == 266 || err.code == 274) { return err.code; }
         return rondb_report_error(err, "ns_remove commit");
     }
 
@@ -6438,8 +6439,31 @@ int rondb_shim_ns_remove(void *handle,
 ns_remove_err:
     err = tx->getNdbError();
     rondb_get_ndb(state)->closeTransaction(tx);
-    if (rondb_is_temporary(err)) { return -2; }
+    if (err.code == 266 || err.code == 274) { return err.code; }
     return rondb_report_error(err, "ns_remove op");
+}
+
+int rondb_shim_ns_remove(void *handle,
+                         uint64_t parent_fileid, const char *name,
+                         uint64_t child_fileid,
+                         const uint8_t *child_inode_buf, uint32_t child_ino_len,
+                         int delete_child,
+                         int32_t parent_nlink_delta,
+                         uint32_t stripe_count)
+{
+    for (int attempt = 0; attempt < NDB_RETRY_MAX; attempt++) {
+        int rc = rondb_shim_ns_remove_once(
+                handle, parent_fileid, name,
+                child_fileid, child_inode_buf, child_ino_len,
+                delete_child, parent_nlink_delta, stripe_count);
+        if (rc == 0) { return 0; }
+        if (rc != 266 && rc != 274) { return rc; }
+        struct timespec _ts;
+        _ts.tv_sec  = 0;
+        _ts.tv_nsec = (long)(NDB_RETRY_DELAY_US * (attempt + 1)) * 1000L;
+        nanosleep(&_ts, nullptr);
+    }
+    return -2;  /* exhausted retries — signal MDS_ERR_BUSY to caller */
 }
 
 int rondb_shim_ns_remove_full(void *handle,

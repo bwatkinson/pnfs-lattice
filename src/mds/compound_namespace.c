@@ -1335,8 +1335,9 @@ enum nfs4_status op_create(struct compound_data *cd,
  * stripe map (the worker brute-forces stripe/mirror coordinates,
  * bounded by MDS_MAX_STRIPES * MDS_MAX_MIRRORS — currently 4096
  * cheap unlinks per DS, most ENOENT, with an early-out in ds_gc.c
- * once the stripe count is exhausted).  Drop the stripe map after
- * enqueue so the next iteration does not re-enter.  All steps are
+ * once the stripe count is exhausted).  Catalogue stripe rows are
+ * deleted in the ns_remove transaction; ds_gc repeats stripe_map_del
+ * idempotently after DS bytes are gone.  All steps are
  * best-effort: a failure here only forfeits this round of cleanup;
  * the GC table will catch the next pass.  We never propagate the
  * failure back to the client — the unlink semantics from the user's
@@ -1393,9 +1394,7 @@ static void enqueue_gc_for_final_unlink(struct compound_data *cd,
 
 	total = stripe_count * mirror_count;
 	if (total > (uint32_t)(MDS_MAX_STRIPES * MDS_MAX_MIRRORS)) {
-		/* Defensive: catalogue invariant violated.  Free the
-		 * buffer and bail; stripe_map_del below would still
-		 * remove the malformed row on a future pass. */
+		/* Defensive: catalogue invariant violated. */
 		free(entries);
 		return;
 	}
@@ -1440,9 +1439,9 @@ static void enqueue_gc_for_final_unlink(struct compound_data *cd,
 					 entries[i].nfs_fh, fh_len);
 	}
 
-	/* Best-effort: drop the now-orphaned stripe map.  Idempotent
-	 * on the catalogue — a NOTFOUND on a re-run is not an error. */
-	(void)mds_cat_stripe_map_del(cd->cat, NULL, fileid);
+	/* Stripe catalogue rows are deleted inside the ns_remove NDB
+	 * transaction on final unlink.  Any orphaned stripe_map rows are
+	 * dropped asynchronously by ds_gc after DS file cleanup. */
 
 	/* Phase D of docs/hpc-nto1-plan.md — keep the per-MDS HPC
 	 * layout cache coherent with the catalogue.  NULL-safe; the

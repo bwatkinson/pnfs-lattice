@@ -259,6 +259,30 @@ enum mds_status mds_cat_ns_readdir_plus(struct mds_catalogue *cat,
 					void *ctx);
 
 /**
+ * Fused readdir_plus resumed by a READDIR cookie that encodes the last
+ * child fileid seen (0 for the first page).  Entries are returned with
+ * child_fileid strictly greater than @cookie, in ascending fileid
+ * order, up to @max_entries.
+ *
+ * Fast path: backends exposing ns_readdir_plus_from satisfy this with
+ * an indexed range scan (O(log N + page)).  Fallback: the cookie is
+ * translated back to a name via dirent_name_for_child and the
+ * name-order ns_readdir_plus resume is used, preserving behaviour on
+ * backends without the fileid cursor.  A stale cookie (its entry was
+ * removed) yields an empty, drained page on the fallback path; the
+ * fast path is inherently safe because the resume is a strict
+ * fileid > cookie range.
+ */
+enum mds_status mds_cat_ns_readdir_plus_from_cookie(
+					struct mds_catalogue *cat,
+					uint64_t parent_fileid,
+					uint64_t cookie,
+					uint32_t max_entries,
+					struct mds_cat_txn *txn,
+					mds_readdir_plus_cb cb,
+					void *ctx);
+
+/**
  * Resolve an absolute namespace path to its fileid.
  *
  * Walks the namespace from root using backend-neutral lookup operations.

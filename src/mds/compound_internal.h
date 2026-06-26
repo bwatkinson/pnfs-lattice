@@ -663,6 +663,26 @@ cat_readdir_plus(struct compound_data *cd, uint64_t parent,
 				       max_entries, NULL, cat_cb, ctx);
 }
 
+/**
+ * Readdir_plus dispatch resumed by a READDIR cookie (the last child
+ * fileid seen, 0 for the first page).  Backends with an ordered
+ * (parent, child_fileid) index resume in O(log N + page); others fall
+ * back to the name-order resume.  See
+ * mds_cat_ns_readdir_plus_from_cookie.
+ */
+static inline enum mds_status
+cat_readdir_plus_from_cookie(struct compound_data *cd, uint64_t parent,
+			     uint64_t cookie, uint32_t max_entries,
+			     mds_readdir_plus_cb cat_cb, void *ctx)
+{
+	if (cd->cat == NULL) {
+		return MDS_ERR_INVAL;
+	}
+	return mds_cat_ns_readdir_plus_from_cookie(cd->cat, parent, cookie,
+						   max_entries, NULL,
+						   cat_cb, ctx);
+}
+
 /* -- Inline data ------------------------------------------------------- */
 
 static inline enum mds_status

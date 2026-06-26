@@ -1263,6 +1263,40 @@ enum mds_status catalogue_rondb_ns_readdir_plus(
 	return MDS_OK;
 }
 
+/* Fused readdir_plus resumed by a child-fileid cursor (ascending
+ * fileid order, O(log N + page) on RonDB).  Reuses the same shim
+ * adapter as the name-order variant. */
+static enum mds_status catalogue_rondb_ns_readdir_plus_from(
+	struct mds_catalogue *cat,
+	uint64_t parent_fileid,
+	uint64_t start_after_fileid,
+	uint32_t max_entries,
+	mds_readdir_plus_cb cb, void *ctx)
+{
+	void *h = rondb_handle(cat);
+	struct rondb_readdir_plus_adapt adapt;
+	int rc;
+
+	if (h == NULL || cb == NULL) {
+		return MDS_ERR_INVAL;
+	}
+
+	adapt.cat_cb    = cb;
+	adapt.cat_ctx   = ctx;
+	adapt.cb_status = MDS_OK;
+
+	rc = rondb_shim_ns_readdir_plus_from(h, parent_fileid,
+					     start_after_fileid,
+					     max_entries,
+					     rondb_readdir_plus_shim_cb,
+					     &adapt);
+	if (rc != 0) {
+		return MDS_ERR_IO;
+	}
+
+	return MDS_OK;
+}
+
 /* -----------------------------------------------------------------------
  * Link -- create dirent + bump target nlink atomically
  * ----------------------------------------------------------------------- */
@@ -2691,6 +2725,18 @@ static enum mds_status rondb_auth_ns_readdir_plus(
 					       max_entries, cb, ctx);
 }
 
+static enum mds_status rondb_auth_ns_readdir_plus_from(
+	struct mds_catalogue *cat, uint64_t parent,
+	uint64_t start_after_fileid, uint32_t max_entries,
+	struct mds_cat_txn *txn,
+	mds_readdir_plus_cb cb, void *ctx)
+{
+	(void)txn;
+	return catalogue_rondb_ns_readdir_plus_from(cat, parent,
+						    start_after_fileid,
+						    max_entries, cb, ctx);
+}
+
 static enum mds_status rondb_auth_alloc_fileid(
 	struct mds_catalogue *cat, struct mds_cat_txn *txn,
 	uint64_t *fileid)
@@ -3214,6 +3260,7 @@ static const struct mds_authority_ops rondb_authority_ops = {
 	.ns_setattr        = rondb_auth_ns_setattr,
 	.ns_readdir        = rondb_auth_ns_readdir,
 	.ns_readdir_plus   = rondb_auth_ns_readdir_plus,
+	.ns_readdir_plus_from = rondb_auth_ns_readdir_plus_from,
 	.dirent_name_for_child = rondb_auth_dirent_name_for_child,
 	.ns_nlink_adjust   = catalogue_rondb_ns_nlink_adjust,
 	.alloc_fileid      = rondb_auth_alloc_fileid,
@@ -3301,6 +3348,7 @@ static const struct mds_authority_ops rondb_locked_authority_ops = {
 	.ns_setattr        = rondb_auth_ns_setattr,
 	.ns_readdir        = rondb_auth_ns_readdir,
 	.ns_readdir_plus   = rondb_auth_ns_readdir_plus,
+	.ns_readdir_plus_from = rondb_auth_ns_readdir_plus_from,
 	.dirent_name_for_child = rondb_auth_dirent_name_for_child,
 	.ns_nlink_adjust   = catalogue_rondb_ns_nlink_adjust,
 	.alloc_fileid      = rondb_auth_alloc_fileid,

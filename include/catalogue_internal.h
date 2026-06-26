@@ -108,6 +108,23 @@ struct mds_authority_ops {
         uint32_t max_entries,
         struct mds_cat_txn *txn, mds_readdir_plus_cb cb, void *ctx);
 
+    /**
+     * Optional fused readdir_plus resumed by a stable child-fileid
+     * cursor instead of a name prefix.  Returns entries whose
+     * child_fileid is strictly greater than @start_after_fileid, in
+     * ascending child_fileid order, up to @max_entries.  Backends that
+     * implement this over an ordered (parent, child_fileid) index make
+     * cookie resume O(log N + page) instead of O(N) per page.
+     *
+     * Leave NULL when the backend cannot resume by fileid; the dispatch
+     * wrapper (mds_cat_ns_readdir_plus_from_cookie) then falls back to
+     * the name-order ns_readdir_plus resume via a cookie->name lookup.
+     */
+    enum mds_status (*ns_readdir_plus_from)(struct mds_catalogue *cat,
+        uint64_t parent, uint64_t start_after_fileid,
+        uint32_t max_entries,
+        struct mds_cat_txn *txn, mds_readdir_plus_cb cb, void *ctx);
+
     enum mds_status (*ns_nlink_adjust)(struct mds_catalogue *cat,
         uint64_t fileid, int32_t delta);
     enum mds_status (*alloc_fileid)(struct mds_catalogue *cat,

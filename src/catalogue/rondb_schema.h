@@ -139,6 +139,12 @@
 #define RONDB_DIR_COL_CHILD_FID   "child_fileid"
 #define RONDB_DIR_COL_CHILD_TYPE  "child_type"
 
+/* Ordered index on (parent_fileid, child_fileid).  Enables O(log N +
+ * page) READDIR cookie resume by child fileid (range scan child_fileid
+ * > cookie, ascending).  Additive: created idempotently at bootstrap,
+ * no row-format change and no schema-version bump required. */
+#define RONDB_IX_DIRENTS_PARENT_CHILD  "ix_dirents_parent_child"
+
 /* -----------------------------------------------------------------------
  * Column names -- mds_stripe_maps (header)
  * ----------------------------------------------------------------------- */

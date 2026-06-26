@@ -456,8 +456,10 @@ static int send_record(struct rpc_conn *c, const uint8_t *data, uint32_t len)
     return 0;
 }
 
-/** Reply buffer size -- 256 KB is plenty for any single NFS compound. */
-#define REPLY_BUF_SIZE ((size_t)256 * 1024)
+/** Reply buffer size -- 256 KB is plenty for any single NFS compound.
+ *  Single source of truth in xdr_codec.h so the READDIR byte budget
+ *  (compound_namespace.c) is clamped against the exact same value. */
+#define REPLY_BUF_SIZE NFS4_REPLY_BUF_SIZE
 
 /** Maximum size of an inbound COMPOUND request body, in bytes.
  *

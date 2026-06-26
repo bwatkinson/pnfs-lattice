@@ -40,6 +40,13 @@
 /** Maximum operations in a single compound. */
 #define NFS4_MAX_OPS      64
 
+/** Server reply-buffer size for a single COMPOUND (256 KiB).
+ *  The entire COMPOUND reply is XDR-encoded into one fixed buffer of
+ *  this size (rpc_server.c).  READDIR's per-page byte budget is
+ *  clamped below this so a single page can never overflow the encode
+ *  buffer and produce a short/dropped reply on the wire. */
+#define NFS4_REPLY_BUF_SIZE  ((size_t)256 * 1024)
+
 /** COMPOUND4 minor versions we accept (1 = NFSv4.1, 2 = NFSv4.2). */
 #define NFS4_MINOR_VERSION_MIN 1  /* v4.1+ only; v4.0 lacks SEQUENCE */
 #define NFS4_MINOR_VERSION_MAX 2

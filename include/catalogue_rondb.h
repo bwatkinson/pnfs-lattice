@@ -337,6 +337,20 @@ int rondb_shim_ns_readdir_plus(void *handle,
                                uint32_t max_entries,
                                rondb_readdir_plus_cb cb, void *ctx);
 
+/** Fused READDIR_PLUS resumed by a child-fileid cursor.  Returns
+ *  entries whose child_fileid is strictly greater than
+ *  start_after_fileid, in ascending fileid order, up to max_entries,
+ *  via an ordered (parent_fileid, child_fileid) index range scan
+ *  (O(log N + page)).  Falls back to a full parent scan sorted by
+ *  child_fileid when the index is absent.
+ *
+ *  Returns 0 on success, -1 on error. */
+int rondb_shim_ns_readdir_plus_from(void *handle,
+                                    uint64_t parent_fileid,
+                                    uint64_t start_after_fileid,
+                                    uint32_t max_entries,
+                                    rondb_readdir_plus_cb cb, void *ctx);
+
 /** Atomic LINK: create dirent + bump target nlink + atomic parent
  *  update.  Single NDB txn.  Parent nlink/change/mtime updated
  *  atomically via interpretedUpdateTuple (delta=0 for hard links).

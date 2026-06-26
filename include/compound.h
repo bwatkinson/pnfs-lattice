@@ -1001,7 +1001,14 @@ struct nfs4_op {
  * Per-operation result structures
  * ----------------------------------------------------------------------- */
 
-#define NFS4_READDIR_MAX 128
+/* Per-page READDIR entry ceiling.  The result struct below holds the
+ * page inline, so this also bounds the per-op scratch size in the
+ * thread-local result array (rpc_server.c).  The actual page size is
+ * usually bounded earlier by op_readdir's byte budget; this ceiling is
+ * the hard upper limit.  Kept deliberately moderate (256) to bound the
+ * per-op memset cost on hot non-READDIR paths while still quadrupling
+ * the legacy 128 page. */
+#define NFS4_READDIR_MAX 256
 
 struct nfs4_res_access {
 	uint32_t supported;  /**< Which bits the server recognises */

@@ -932,6 +932,233 @@ static void test_readdir_pagination(void)
 }
 
 /* -----------------------------------------------------------------------
+ * test_readdir_cursor_multipage -- many entries, page-by-page cookie walk
+ *
+ * Validates the fileid-cursor resume: every entry appears exactly once,
+ * entries are in strictly ascending fileid order across the whole walk,
+ * eof is false until the directory actually drains, and the scan makes
+ * forward progress across multiple pages.
+ * ----------------------------------------------------------------------- */
+
+static void test_readdir_cursor_multipage(void)
+{
+	struct mds_catalogue *db;
+	struct compound_data cd;
+	struct nfs4_op ops[3];
+	struct nfs4_result res[3];
+	uint32_t n;
+	char *path;
+	const uint32_t total = 600;
+	uint64_t base_fid = 0;
+	uint64_t cookie = 0;
+	uint64_t prev_fid = 0;
+	uint32_t walked = 0;
+	uint32_t pages = 0;
+	bool eof = false;
+	uint8_t *seen;
+	uint32_t i;
+
+	db = open_test_db(&path);
+
+	/* Bulk-create `total` files directly via the catalogue; fileids
+	 * are assigned in creation order. */
+	for (i = 0; i < total; i++) {
+		struct mds_inode child;
+		char name[32];
+
+		snprintf(name, sizeof(name), "f%04u", i);
+		VERIFY(test_create_file(db, MDS_FILEID_ROOT, name, 0644,
+					&child) == MDS_OK);
+		if (i == 0) { base_fid = child.fileid; }
+	}
+
+	seen = calloc(total, 1);
+	VERIFY(seen != NULL);
+
+	do {
+		compound_init(&cd);
+		cd.cat = g_test_cat;
+		cd.prealloc = g_prealloc;
+		ops[0] = mk_sequence();
+		ops[1] = mk_putrootfh();
+		ops[2] = mk_readdir(cookie);
+
+		n = compound_process(&cd, ops, res, 3);
+		ASSERT_EQ(n, (uint32_t)3);
+		ASSERT_EQ(res[2].status, NFS4_OK);
+		ASSERT_TRUE(res[2].res.readdir.count <= (uint32_t)NFS4_READDIR_MAX);
+
+		for (i = 0; i < res[2].res.readdir.count; i++) {
+			uint64_t fid = res[2].res.readdir.entries[i].fileid;
+			uint64_t idx = fid - base_fid;
+
+			/* Strictly ascending fileid order across the walk. */
+			ASSERT_TRUE(fid > prev_fid);
+			prev_fid = fid;
+
+			/* Each fileid delivered exactly once. */
+			ASSERT_TRUE(idx < total);
+			ASSERT_EQ(seen[idx], (uint8_t)0);
+			seen[idx] = 1;
+			walked++;
+		}
+
+		eof = res[2].res.readdir.eof;
+		if (!eof) {
+			ASSERT_TRUE(res[2].res.readdir.count > 0);
+			cookie = res[2].res.readdir.entries[
+				res[2].res.readdir.count - 1].fileid;
+		}
+		pages++;
+		ASSERT_TRUE(pages <= total); /* forward-progress guard */
+	} while (!eof);
+
+	ASSERT_EQ(walked, total);
+	ASSERT_TRUE(pages >= 2); /* the page ceiling forced multiple pages */
+	for (i = 0; i < total; i++) {
+		ASSERT_EQ(seen[i], (uint8_t)1);
+	}
+
+	free(seen);
+	close_test_db(db, path);
+}
+
+/* -----------------------------------------------------------------------
+ * test_readdir_byte_budget -- a small client maxcount bounds the page
+ *
+ * With a small maxcount the page is bounded by the byte budget well
+ * below the entry ceiling, and eof is false because entries remain.
+ * ----------------------------------------------------------------------- */
+
+static void test_readdir_byte_budget(void)
+{
+	struct mds_catalogue *db;
+	struct compound_data cd;
+	struct nfs4_op ops[3];
+	struct nfs4_result res[3];
+	uint32_t n;
+	char *path;
+	const uint32_t total = 100;
+	uint32_t i;
+
+	db = open_test_db(&path);
+
+	for (i = 0; i < total; i++) {
+		struct mds_inode child;
+		char name[32];
+
+		snprintf(name, sizeof(name), "f%04u", i);
+		VERIFY(test_create_file(db, MDS_FILEID_ROOT, name, 0644,
+					&child) == MDS_OK);
+	}
+
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_readdir(0);
+	ops[2].arg.readdir.maxcount = 2000; /* bytes */
+
+	n = compound_process(&cd, ops, res, 3);
+	ASSERT_EQ(n, (uint32_t)3);
+	ASSERT_EQ(res[2].status, NFS4_OK);
+
+	/* Bounded by the byte budget, not the entry ceiling, and more
+	 * entries remain so the page is not the end of the directory. */
+	ASSERT_TRUE(res[2].res.readdir.count >= 1);
+	ASSERT_TRUE(res[2].res.readdir.count < total);
+	ASSERT_TRUE(res[2].res.readdir.count < (uint32_t)NFS4_READDIR_MAX);
+	ASSERT_EQ(res[2].res.readdir.eof, false);
+
+	close_test_db(db, path);
+}
+
+/* -----------------------------------------------------------------------
+ * test_readdir_deleted_cookie -- resume is safe across a deleted cookie
+ *
+ * Removing the entry whose fileid is the immediate successor of the
+ * cookie between pages must not break the walk: the deleted entry is
+ * simply absent and every other remaining entry is delivered once.
+ * ----------------------------------------------------------------------- */
+
+static void test_readdir_deleted_cookie(void)
+{
+	struct mds_catalogue *db;
+	struct compound_data cd;
+	struct nfs4_op ops[3];
+	struct nfs4_result res[3];
+	uint32_t n;
+	char *path;
+	const uint32_t total = 300;
+	uint64_t cookie;
+	uint64_t deleted_fid;
+	char dname[32];
+	struct mds_inode dino;
+	bool found_deleted = false;
+	uint32_t i;
+
+	db = open_test_db(&path);
+
+	for (i = 0; i < total; i++) {
+		struct mds_inode child;
+		char name[32];
+
+		snprintf(name, sizeof(name), "f%04u", i);
+		VERIFY(test_create_file(db, MDS_FILEID_ROOT, name, 0644,
+					&child) == MDS_OK);
+	}
+
+	/* Page 1: a full ceiling page with more entries remaining. */
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_readdir(0);
+	n = compound_process(&cd, ops, res, 3);
+	ASSERT_EQ(n, (uint32_t)3);
+	ASSERT_EQ(res[2].res.readdir.count, (uint32_t)NFS4_READDIR_MAX);
+	ASSERT_EQ(res[2].res.readdir.eof, false);
+	cookie = res[2].res.readdir.entries[NFS4_READDIR_MAX - 1].fileid;
+
+	/* Delete the cousin of the cookie: the entry created immediately
+	 * after the last page-1 entry (f<NFS4_READDIR_MAX>), whose fileid
+	 * is strictly greater than the cookie. */
+	snprintf(dname, sizeof(dname), "f%04u", (uint32_t)NFS4_READDIR_MAX);
+	VERIFY(mds_cat_ns_lookup(g_test_cat, MDS_FILEID_ROOT, dname,
+				 &dino) == MDS_OK);
+	deleted_fid = dino.fileid;
+	ASSERT_TRUE(deleted_fid > cookie);
+	VERIFY(mds_cat_ns_remove(g_test_cat, NULL, MDS_FILEID_ROOT,
+				 dname) == MDS_OK);
+
+	/* Page 2: resume strictly past the cookie. */
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_readdir(cookie);
+	n = compound_process(&cd, ops, res, 3);
+	ASSERT_EQ(n, (uint32_t)3);
+	ASSERT_EQ(res[2].status, NFS4_OK);
+	/* total - NFS4_READDIR_MAX page-1 entries - 1 deleted. */
+	ASSERT_EQ(res[2].res.readdir.count,
+		  (uint32_t)(total - NFS4_READDIR_MAX - 1));
+	ASSERT_TRUE(res[2].res.readdir.eof);
+
+	for (i = 0; i < res[2].res.readdir.count; i++) {
+		if (res[2].res.readdir.entries[i].fileid == deleted_fid) {
+			found_deleted = true;
+		}
+	}
+	ASSERT_EQ(found_deleted, false);
+
+	close_test_db(db, path);
+}
+
+/* -----------------------------------------------------------------------
  * test_readdir_hides_referral_junctions -- cfg_hide_referral_junctions
  *
  * With the flag set, the /shardN referral junction directories
@@ -3968,6 +4195,9 @@ int main(void)
 	RUN_TEST(test_readdir);
 	RUN_TEST(test_readdir_skips_pending_hpc_create);
 	RUN_TEST(test_readdir_pagination);
+	RUN_TEST(test_readdir_cursor_multipage);
+	RUN_TEST(test_readdir_byte_budget);
+	RUN_TEST(test_readdir_deleted_cookie);
 	RUN_TEST(test_readdir_hides_referral_junctions);
 	RUN_TEST(test_rename);
 	RUN_TEST(test_link);

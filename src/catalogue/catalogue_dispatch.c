@@ -420,6 +420,56 @@ enum mds_status mds_cat_ns_readdir_plus(struct mds_catalogue *cat,
     return fctx.last_status;
 }
 
+enum mds_status mds_cat_ns_readdir_plus_from_cookie(
+    struct mds_catalogue *cat,
+    uint64_t parent_fileid,
+    uint64_t cookie,
+    uint32_t max_entries,
+    struct mds_cat_txn *txn,
+    mds_readdir_plus_cb cb,
+    void *ctx)
+{
+    char start_name[MDS_MAX_NAME + 1];
+    const char *start_after = NULL;
+    enum mds_status st;
+
+    if (cat == NULL || cat->auth_ops == NULL || cb == NULL) {
+        return MDS_ERR_INVAL;
+    }
+
+    /* Fast path: indexed range scan resumed by child fileid.
+     * O(log N + page) per page and inherently safe across a deleted
+     * cookie (the resume is a strict child_fileid > cookie range). */
+    if (cat->auth_ops->ns_readdir_plus_from != NULL) {
+        return CAT_TIMED(MDS_CATOP_NS_READDIR_PLUS,
+            cat->auth_ops->ns_readdir_plus_from(cat, parent_fileid,
+                                                cookie, max_entries,
+                                                txn, cb, ctx));
+    }
+
+    /* Fallback: translate the fileid cookie back to a name and resume
+     * in name order via the existing readdir_plus path.  Preserves
+     * behaviour on backends without the fileid cursor. */
+    if (cookie != 0) {
+        st = mds_cat_ns_dirent_name_for_child(cat, parent_fileid, cookie,
+                                              start_name,
+                                              sizeof(start_name));
+        if (st == MDS_ERR_NOTFOUND) {
+            /* Stale cookie: the entry was removed between pages.  The
+             * name-order resume cannot recover a start point, so report
+             * a drained page (matches the pre-cursor behaviour). */
+            return MDS_OK;
+        }
+        if (st != MDS_OK) {
+            return st;
+        }
+        start_after = start_name;
+    }
+
+    return mds_cat_ns_readdir_plus(cat, parent_fileid, start_after,
+                                   max_entries, txn, cb, ctx);
+}
+
 enum mds_status mds_cat_resolve_path(struct mds_catalogue *cat,
                                      const char *path,
                                      uint64_t *out_fileid)

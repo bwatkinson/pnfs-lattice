@@ -599,6 +599,91 @@ static enum mds_status mem_ns_readdir(struct mds_catalogue *cat,
     return MDS_OK;
 }
 
+/* Fused readdir_plus resumed by a child-fileid cursor: returns entries
+ * whose child_fileid is strictly greater than start_after_fileid, in
+ * ascending fileid order, up to max_entries.  Mirrors the RonDB
+ * ordered-index cursor semantics so the cookie-resume path (ordering,
+ * deleted-cookie safety, drain/eof) is exercised by the unit tests. */
+struct mem_rdp_row {
+    uint64_t fid;
+    uint8_t  type;
+    char     name[MDS_MAX_NAME + 1];
+};
+
+static int mem_rdp_row_cmp(const void *a, const void *b)
+{
+    const struct mem_rdp_row *ra = a;
+    const struct mem_rdp_row *rb = b;
+
+    if (ra->fid < rb->fid) { return -1; }
+    if (ra->fid > rb->fid) { return 1; }
+    return 0;
+}
+
+static enum mds_status mem_ns_readdir_plus_from(struct mds_catalogue *cat,
+    uint64_t parent, uint64_t start_after_fileid,
+    uint32_t max_entries,
+    struct mds_cat_txn *txn, mds_readdir_plus_cb cb, void *ctx)
+{
+    (void)txn;
+    struct memdb *m = cat->backend_private;
+    struct mem_rdp_row *rows;
+    uint32_t n = 0;
+
+    if (cb == NULL) {
+        return MDS_ERR_INVAL;
+    }
+
+    rows = calloc(MEMDB_MAX_DIRENTS, sizeof(*rows));
+    if (rows == NULL) {
+        return MDS_ERR_NOMEM;
+    }
+
+    /* Snapshot the matching children under the lock, then sort and
+     * deliver without holding it (mem_ns_getattr re-locks). */
+    pthread_mutex_lock(&m->lock);
+    for (uint32_t i = 0; i < MEMDB_MAX_DIRENTS; i++) {
+        if (!m->dirents[i].used || m->dirents[i].parent != parent) {
+            continue;
+        }
+        if (m->dirents[i].child_fileid <= start_after_fileid) {
+            continue;
+        }
+        rows[n].fid = m->dirents[i].child_fileid;
+        rows[n].type = m->dirents[i].child_type;
+        snprintf(rows[n].name, sizeof(rows[n].name), "%s",
+                 m->dirents[i].name);
+        n++;
+    }
+    pthread_mutex_unlock(&m->lock);
+
+    if (n > 1) {
+        qsort(rows, n, sizeof(*rows), mem_rdp_row_cmp);
+    }
+
+    for (uint32_t i = 0; i < n; i++) {
+        struct mds_cat_dirent d;
+        struct mds_inode inode;
+        bool valid;
+
+        if (max_entries > 0 && i >= max_entries) {
+            break;
+        }
+        memset(&d, 0, sizeof(d));
+        d.fileid = rows[i].fid;
+        d.type = rows[i].type;
+        snprintf(d.name, sizeof(d.name), "%s", rows[i].name);
+
+        valid = (mem_ns_getattr(cat, rows[i].fid, &inode) == MDS_OK);
+        if (cb(&d, valid ? &inode : NULL, valid, ctx) != 0) {
+            break;
+        }
+    }
+
+    free(rows);
+    return MDS_OK;
+}
+
 static enum mds_status mem_ns_nlink_adjust(struct mds_catalogue *cat,
     uint64_t fileid, int32_t delta)
 {
@@ -1642,6 +1727,7 @@ static const struct mds_authority_ops memdb_auth_ops = {
     .ns_getattr      = mem_ns_getattr,
     .ns_setattr      = mem_ns_setattr,
     .ns_readdir      = mem_ns_readdir,
+    .ns_readdir_plus_from = mem_ns_readdir_plus_from,
     .dirent_name_for_child = mem_dirent_name_for_child,
     .ns_nlink_adjust = mem_ns_nlink_adjust,
     .alloc_fileid    = mem_alloc_fileid,

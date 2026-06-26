@@ -2296,10 +2296,48 @@ enum nfs4_status op_link(struct compound_data *cd,
 	return mds_status_to_nfs4(st);
 }
 
+/* -----------------------------------------------------------------------
+ * READDIR byte-budget pagination constants.
+ *
+ * The page stops at the first of: the entry ceiling (NFS4_READDIR_MAX),
+ * the total reply-byte budget, or the dircount (name-only) budget.  A
+ * deliberately conservative per-entry size estimate keeps the encoded
+ * page within the fixed XDR reply buffer (NFS4_REPLY_BUF_SIZE) so a
+ * large page can never overflow it and produce a short/dropped reply.
+ * ----------------------------------------------------------------------- */
+
+/* Per-entry4 XDR framing: value_follows(4) + cookie(8) + name len(4),
+ * excluding the variable name bytes and the trailing fattr4. */
+#define READDIR_ENTRY_FRAMING   16
+/* Upper bound on the encoded fattr4 for one entry when attributes are
+ * requested.  The worst case across the supported attribute set is
+ * ~650 bytes (incl. numeric owner/owner_group strings); round up
+ * generously so the byte accumulator can never under-count. */
+#define READDIR_ATTR_EST_FULL  768
+/* Minimal attrs (TYPE + FILEID) emitted even when none are requested. */
+#define READDIR_ATTR_EST_MIN    64
+/* Bytes reserved within the reply buffer for the rest of the COMPOUND
+ * (RPC + COMPOUND headers, SEQUENCE/PUTFH results, the READDIR
+ * cookieverf and trailer).  Far larger than the ~200 bytes needed. */
+#define READDIR_REPLY_HEADROOM 8192
+
+/* True if the client requested any per-entry attributes. */
+static bool readdir_attrs_requested(const uint32_t req[NFS4_BITMAP_WORDS])
+{
+	return (req[0] | req[1] | req[2]) != 0;
+}
+
 /* Readdir callback context. */
 struct readdir_fill {
 	struct compound_data    *cd;
 	struct nfs4_res_readdir *rd;
+	/* Byte-budget pagination state (see constants above). */
+	size_t total_budget;   /* max total reply bytes for entries */
+	size_t total_used;     /* running estimate of total bytes */
+	size_t dir_budget;     /* client dircount (0 = unlimited) */
+	size_t dir_used;       /* running name-only bytes */
+	size_t attr_est;       /* per-entry attr-bytes upper bound */
+	bool   truncated;      /* page stopped before the dir drained */
 };
 
 /**
@@ -2376,13 +2414,44 @@ static int readdir_plus_cat_cb(const struct mds_cat_dirent *entry,
 		}
 	}
 
-	if (f->rd->count >= NFS4_READDIR_MAX) {
-		return -1;
-	}
-
+	/* Skip inodes still pending an HPC wide-create (not yet visible).
+	 * Do this before the page-boundary checks so a pending entry does
+	 * not consume budget or wrongly mark the page truncated. */
 	if (inode_valid && inode != NULL &&
 	    (inode->flags & MDS_IFLAG_HPC_CREATE_PENDING) != 0) {
 		return 0;
+	}
+
+	/* Page boundary 1: hard entry ceiling. */
+	if (f->rd->count >= NFS4_READDIR_MAX) {
+		f->truncated = true;
+		return -1;
+	}
+
+	/* Page boundary 2: byte budget.  Use a conservative per-entry
+	 * size estimate (framing + 4-byte-aligned name + attr upper
+	 * bound) so the encoded page stays within the fixed reply
+	 * buffer.  Always emit at least one entry (count == 0). */
+	{
+		size_t name_len = strnlen(entry->name, MDS_MAX_NAME);
+		size_t name_pad = (name_len + 3u) & ~(size_t)3u;
+		size_t entry_est = READDIR_ENTRY_FRAMING + name_pad +
+				   f->attr_est;
+		size_t dir_est = READDIR_ENTRY_FRAMING + name_pad;
+
+		if (f->rd->count >= 1) {
+			if (f->total_used + entry_est > f->total_budget) {
+				f->truncated = true;
+				return -1;
+			}
+			if (f->dir_budget > 0 &&
+			    f->dir_used + dir_est > f->dir_budget) {
+				f->truncated = true;
+				return -1;
+			}
+		}
+		f->total_used += entry_est;
+		f->dir_used += dir_est;
 	}
 
 	dst = &f->rd->entries[f->rd->count];
@@ -2482,47 +2551,53 @@ enum nfs4_status op_readdir(struct compound_data *cd,
 
 	{
 		struct readdir_fill fill;
-		const char *start_after = NULL;
-		char cookie_name[MDS_MAX_NAME + 1];
+		size_t budget;
 
+		memset(&fill, 0, sizeof(fill));
 		fill.cd = cd;
 		fill.rd = &res->res.readdir;
 
-		/* Translate the opaque fileid cookie into a start_after name
-		 * so the catalogue can skip earlier entries without scanning
-		 * the full directory on every page. */
-		if (op->arg.readdir.cookie != 0) {
-			st = mds_cat_ns_dirent_name_for_child(
-				cd->cat, cd->current_fh.fileid,
-				op->arg.readdir.cookie,
-				cookie_name, sizeof(cookie_name));
-			if (st == MDS_OK) {
-				start_after = cookie_name;
-			} else if (st == MDS_ERR_NOTFOUND) {
-				/* Stale cookie (entry removed): empty page. */
-				res->res.readdir.eof = true;
-				return NFS4_OK;
-			} else {
-				return mds_status_to_nfs4(st);
-			}
+		/* Byte budget = min(reply-buffer headroom, client maxcount,
+		 * session ca_maxresponsesize).  The reply-buffer clamp is the
+		 * load-bearing one: the whole COMPOUND is XDR-encoded into a
+		 * fixed NFS4_REPLY_BUF_SIZE buffer, so a page that does not fit
+		 * would be dropped on the wire as a short reply. */
+		budget = NFS4_REPLY_BUF_SIZE - READDIR_REPLY_HEADROOM;
+		if (op->arg.readdir.maxcount > 0 &&
+		    (size_t)op->arg.readdir.maxcount < budget) {
+			budget = op->arg.readdir.maxcount;
 		}
+		if (cd->max_response_size > 0 &&
+		    (size_t)cd->max_response_size < budget) {
+			budget = cd->max_response_size;
+		}
+		fill.total_budget = budget;
+		fill.dir_budget = op->arg.readdir.dircount; /* 0 = unlimited */
+		fill.attr_est =
+			readdir_attrs_requested(res->res.readdir.requested)
+				? READDIR_ATTR_EST_FULL
+				: READDIR_ATTR_EST_MIN;
 
-		/* Fused path: dirent scan + entry_attrs resolve in one
-		 * NDB transaction on RonDB; null-safe dispatch falls back
-		 * to ns_readdir + per-entry ns_getattr for other backends.
-		 * entry_attrs / entry_attrs_valid are populated inline by
-		 * readdir_plus_cat_cb so the old populate_readdir_entry_attrs
-		 * loop is no longer needed on this path. */
-		st = cat_readdir_plus(cd, cd->current_fh.fileid,
-				      start_after, NFS4_READDIR_MAX,
-				      readdir_plus_cat_cb, &fill);
+		/* O(1)-per-page resume: the READDIR cookie IS the last child
+		 * fileid seen (0 = first page).  Entries return in ascending
+		 * fileid order; the client re-sorts for display (RFC 8881
+		 * §3.2 — cookies are server-opaque).  A deleted cookie is
+		 * safe because resume is a strict child_fileid > cookie range.
+		 * Pass ceiling + 1 so the fill callback -- not the backend --
+		 * is the page boundary, which keeps eof exact. */
+		st = cat_readdir_plus_from_cookie(cd, cd->current_fh.fileid,
+						  op->arg.readdir.cookie,
+						  NFS4_READDIR_MAX + 1u,
+						  readdir_plus_cat_cb,
+						  &fill);
 		if (st != MDS_OK) {
 			return mds_status_to_nfs4(st);
 }
 
 		res->res.readdir.cookie_base = 0; /* Cookies are fileids now */
-		res->res.readdir.eof =
-			(res->res.readdir.count < NFS4_READDIR_MAX);
+		/* eof is true only when the scan actually drained -- not when
+		 * we stopped on the entry ceiling or the byte budget. */
+		res->res.readdir.eof = !fill.truncated;
 
 		/* R1.1: cookieverf from dir inode change attribute. */
 		{

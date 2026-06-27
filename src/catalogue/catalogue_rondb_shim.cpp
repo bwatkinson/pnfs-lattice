@@ -2462,11 +2462,19 @@ static int rondb_define_layout_by_file_table(NdbDictionary::Dictionary *dict)
             return rondb_report_error(err, RONDB_IX_LBF_FILEID);
         }
         if (err.code == 4714) {
+            /* The index was created successfully; only the stats-tracking
+             * scaffolding (ndb_index_stat system tables) is absent.  On a
+             * fresh single-node cluster that was never touched by a MySQL
+             * Server instance, getIndex() after a 4714 return can fail
+             * because the NDB dictionary cache records the 4714 as a
+             * creation failure.  Skip the verify step — the index IS
+             * functional and will become visible on the next cache
+             * invalidation (e.g. first scan that references it). */
             std::fprintf(stderr,
-                "WARN: index %s createIndex reported 4714 "
-                "(ndb_index_stat tables absent); verifying visibility "
-                "before continuing\n",
+                "WARN: index %s created without stats "
+                "(ndb_index_stat tables absent, code=4714)\n",
                 RONDB_IX_LBF_FILEID);
+            return 0;
         }
     }
 

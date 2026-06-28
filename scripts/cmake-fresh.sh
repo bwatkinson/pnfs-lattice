@@ -20,6 +20,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${1:-build}"
 shift || true
 
+# shellcheck source=build-env.sh
+source "${ROOT}/scripts/build-env.sh"
+
 BUILD_PATH="${ROOT}/${BUILD_DIR}"
 CACHE_FILE="${BUILD_PATH}/CMakeCache.txt"
 
@@ -56,5 +59,10 @@ if [[ -f "${CACHE_FILE}" ]]; then
   fi
 fi
 
-mkdir -p "${BUILD_PATH}"
-exec cmake -S "${ROOT}" -B "${BUILD_PATH}" "$@"
+mkdir -p "${BUILD_PATH}" "${BUILD_TMP}"
+
+# Re-export after sourcing build-env; CMake's compiler probe must not
+# inherit a login-shell TMPDIR=/tmp.
+export TMPDIR TEMP TMP
+exec env TMPDIR="${TMPDIR}" TEMP="${TMPDIR}" TMP="${TMPDIR}" \
+	cmake -S "${ROOT}" -B "${BUILD_PATH}" "$@"

@@ -53,6 +53,10 @@ echo "scripts/build-install-mds.sh not found — using inline build" >&2
 BUILD_DIR="${BUILD_DIR:-build}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 RONDB_ROOT="${RONDB_ROOT:-/opt/rondb}"
+
+# shellcheck source=build-env.sh
+source "${ROOT}/scripts/build-env.sh"
+
 BUILD_PATH="${ROOT}/${BUILD_DIR}"
 CACHE_FILE="${BUILD_PATH}/CMakeCache.txt"
 

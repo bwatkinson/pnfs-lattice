@@ -1675,9 +1675,10 @@ static int rondb_verify_index_visible(NdbDictionary::Dictionary *dict,
                                       const char *ix_name,
                                       const char *table_name)
 {
-    /* Fresh RonDB clusters can return createIndex() code 4714
-     * (ndb_index_stat absent) and need a short propagation delay
-     * before the index is visible to NdbDictionary::getIndex(). */
+    /* After a clean createIndex() the index may need a short propagation
+     * delay before it is visible to NdbDictionary::getIndex(). Callers
+     * that received code 4714 (ndb_index_stat absent) should skip this
+     * check and rely on the runtime table-scan fallback instead. */
     for (int attempt = 0; attempt < 60; attempt++) {
         if (rondb_resolve_index(dict, ix_name, table_name) != nullptr) {
             return 0;
@@ -2460,6 +2461,7 @@ static int rondb_define_layout_by_file_table(NdbDictionary::Dictionary *dict)
         }
     }
 
+    bool ix_no_stats = false;
     auto create_ix = [&](const char *ix_name,
                           const char *col_name) -> int {
         dict->invalidateIndex(ix_name, RONDB_TBL_LAYOUT_BY_FILE);
@@ -2488,6 +2490,7 @@ static int rondb_define_layout_by_file_table(NdbDictionary::Dictionary *dict)
                 "WARN: index %s created without stats "
                 "(ndb_index_stat tables absent, code=4714)\n",
                 ix_name);
+            ix_no_stats = true;
             return 0;
         }
         return rondb_report_error(err, ix_name);
@@ -2498,9 +2501,11 @@ static int rondb_define_layout_by_file_table(NdbDictionary::Dictionary *dict)
     }
 
     /* Best-effort: verify the index is visible on the startup dictionary.
-     * Failure is non-fatal: rondb_shim_layout_iter_file falls back to a
-     * partition-pruned table scan when the index is unavailable at runtime. */
-    if (rondb_verify_index_visible(dict, RONDB_IX_LBF_FILEID,
+     * Skipped when createIndex returned 4714 (ndb_index_stat absent) because
+     * the propagation window is unbounded on such clusters; the runtime
+     * table-scan fallback in rondb_shim_layout_iter_file handles that case. */
+    if (!ix_no_stats &&
+        rondb_verify_index_visible(dict, RONDB_IX_LBF_FILEID,
                                    RONDB_TBL_LAYOUT_BY_FILE) != 0) {
         std::fprintf(stderr,
             "WARN: %s not yet visible to startup dict; "

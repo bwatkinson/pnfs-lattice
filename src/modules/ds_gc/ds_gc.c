@@ -81,8 +81,18 @@ static bool process_one_entry(struct ds_gc *gc,
 	bool had_any_existed = false;
 	bool blocked = false;
 
+	/*
+	 * A file's stripes (0..stripe_count-1) and mirrors (0..mirror_count-1)
+	 * are dense from 0, so the first absent slot means there are no higher
+	 * ones.  Stop probing there instead of brute-forcing all
+	 * MDS_MAX_STRIPES * MDS_MAX_MIRRORS combinations -- that was ~4096 DS
+	 * round-trips per single-stripe file, which made the drain unable to
+	 * keep up with a heavy-delete backlog.
+	 */
 	for (uint32_t stripe = 0; stripe < MDS_MAX_STRIPES && !blocked;
 	     stripe++) {
+		bool stripe_had_existing = false;
+
 		for (uint32_t mirror = 0; mirror < MDS_MAX_MIRRORS; mirror++) {
 			bool existed = false;
 			enum mds_status st;
@@ -92,29 +102,30 @@ static bool process_one_entry(struct ds_gc *gc,
 						      entry->fileid,
 						      stripe, mirror,
 						      &existed);
-			if (st == MDS_ERR_NOTFOUND) {
-				/* DS mount missing -- retry later. */
+			if (st == MDS_ERR_NOTFOUND || st != MDS_OK) {
+				/* DS mount missing / I/O error -- retry later. */
 				blocked = true;
 				break;
 			}
-			if (st != MDS_OK) {
-				blocked = true;
-				break;
-			}
-			if (!existed) {
-				if (!had_any_existed) {
-					goto dequeue_ok;
-				}
-			} else {
+			if (existed) {
 				had_any_existed = true;
+				stripe_had_existing = true;
+				continue;
 			}
+			/* First absent mirror in this stripe: no higher
+			 * mirrors exist for it. */
+			break;
+		}
+		/* First stripe with no mirror at all: stripes exhausted. */
+		if (!blocked && !stripe_had_existing) {
+			break;
 		}
 	}
 
-dequeue_ok:
 	if (blocked) {
 		return false;
 	}
+	(void)had_any_existed;
 	/* Best-effort: drop catalogue stripe rows after DS bytes are gone.
 	 * Idempotent when ns_remove already deleted them in-txn. */
 	(void)mds_cat_stripe_map_del(gc->cat, NULL, entry->fileid);

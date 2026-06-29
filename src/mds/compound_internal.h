@@ -579,12 +579,14 @@ cat_remove(struct compound_data *cd, uint64_t parent,
 
 static inline enum mds_status
 cat_remove_known(struct compound_data *cd, uint64_t parent,
-		 const char *name, const struct mds_inode *child)
+		 const char *name, const struct mds_inode *child,
+		 uint32_t stripe_count)
 {
 	if (cd->cat == NULL) {
 		return MDS_ERR_INVAL;
 	}
-	return mds_cat_ns_remove_known(cd->cat, NULL, parent, name, child);
+	return mds_cat_ns_remove_known(cd->cat, NULL, parent, name, child,
+				       stripe_count);
 }
 
 static inline enum mds_status

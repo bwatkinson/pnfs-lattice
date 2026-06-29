@@ -1624,7 +1624,8 @@ enum nfs4_status op_remove(struct compound_data *cd,
 
 	st = (st == MDS_OK)
 		? cat_remove_known(cd, cd->current_fh.fileid,
-				   op->arg.remove.name, &rm_inode)
+				   op->arg.remove.name, &rm_inode,
+				   rm_sm_sc)
 		: cat_remove(cd, cd->current_fh.fileid,
 			     op->arg.remove.name);
 	if (st == MDS_OK && rm_quota) {

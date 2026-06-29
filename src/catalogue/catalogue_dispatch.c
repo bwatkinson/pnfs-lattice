@@ -218,7 +218,8 @@ enum mds_status mds_cat_ns_remove_known(struct mds_catalogue *cat,
                                         struct mds_cat_txn *txn,
                                         uint64_t parent_fileid,
                                         const char *name,
-                                        const struct mds_inode *child)
+                                        const struct mds_inode *child,
+                                        uint32_t stripe_count)
 {
     if (cat == NULL || cat->auth_ops == NULL) {
         return MDS_ERR_INVAL;
@@ -226,7 +227,7 @@ enum mds_status mds_cat_ns_remove_known(struct mds_catalogue *cat,
     if (cat->auth_ops->ns_remove_known != NULL && child != NULL) {
         return CAT_TIMED(MDS_CATOP_NS_REMOVE,
             cat->auth_ops->ns_remove_known(cat, txn, parent_fileid,
-                                           name, child));
+                                           name, child, stripe_count));
     }
     return CAT_TIMED(MDS_CATOP_NS_REMOVE,
         cat->auth_ops->ns_remove(cat, txn, parent_fileid, name));

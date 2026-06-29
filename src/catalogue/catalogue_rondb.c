@@ -637,7 +637,8 @@ enum mds_status catalogue_rondb_ns_create(
 enum mds_status catalogue_rondb_ns_remove_known(struct mds_catalogue *cat,
 						uint64_t parent_fileid,
 						const char *name,
-						const struct mds_inode *child);
+						const struct mds_inode *child,
+						uint32_t stripe_count);
 
 enum mds_status catalogue_rondb_ns_remove(struct mds_catalogue *cat,
 					  uint64_t parent_fileid,
@@ -673,13 +674,14 @@ enum mds_status catalogue_rondb_ns_remove(struct mds_catalogue *cat,
 		return MDS_ERR_IO;
 	}
 	return catalogue_rondb_ns_remove_known(cat, parent_fileid, name,
-					       &child_ino);
+					       &child_ino, 0);
 }
 
 enum mds_status catalogue_rondb_ns_remove_known(struct mds_catalogue *cat,
 						uint64_t parent_fileid,
 						const char *name,
-						const struct mds_inode *child)
+						const struct mds_inode *child,
+						uint32_t stripe_count)
 {
 	void *h = rondb_handle(cat);
 	struct mds_inode child_ino;
@@ -718,7 +720,7 @@ enum mds_status catalogue_rondb_ns_remove_known(struct mds_catalogue *cat,
 					  child_buf, RONDB_INODE_FIXED_SIZE,
 					  delete_child,
 					  parent_nlink_delta,
-					  0 /* stripe_count */);
+					  stripe_count);
 		if (rc != -2) { break; }
 		rondb_transient_backoff(attempt);
 	}
@@ -2654,10 +2656,11 @@ static enum mds_status rondb_auth_ns_remove(
 static enum mds_status rondb_auth_ns_remove_known(
 	struct mds_catalogue *cat, struct mds_cat_txn *txn,
 	uint64_t parent, const char *name,
-	const struct mds_inode *child)
+	const struct mds_inode *child, uint32_t stripe_count)
 {
 	(void)txn;
-	return catalogue_rondb_ns_remove_known(cat, parent, name, child);
+	return catalogue_rondb_ns_remove_known(cat, parent, name, child,
+					       stripe_count);
 }
 
 static enum mds_status rondb_auth_ns_rename(

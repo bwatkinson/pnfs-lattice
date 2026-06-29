@@ -2326,7 +2326,33 @@ static int rondb_define_gc_queue_table(NdbDictionary::Dictionary *dict)
                         false, false);
     /* owner_mds_id: which MDS drains this row (0 = legacy/unassigned). */
     rondb_add_unsigned(tbl, RONDB_GC_COL_OWNER_MDS);
-    return rondb_create_table_if_not_exists(dict, tbl);
+    int rc = rondb_create_table_if_not_exists(dict, tbl);
+    if (rc != 0) {
+        return rc;
+    }
+    /*
+     * Ordered index on gc_seq so the drainer reads the oldest entries
+     * in order (SF_OrderBy) and stops after a batch, instead of scanning
+     * the whole queue every tick.  Idempotent: SchemaObjectExists / 4714
+     * (index_stat tables absent) are both treated as success, and the
+     * peek/count paths fall back to a full scan if the index is missing.
+     */
+    dict->invalidateIndex(RONDB_IX_GC_SEQ, RONDB_TBL_GC_QUEUE);
+    {
+        NdbDictionary::Index ix(RONDB_IX_GC_SEQ);
+        ix.setTable(RONDB_TBL_GC_QUEUE);
+        ix.setType(NdbDictionary::Index::OrderedIndex);
+        ix.setLogging(false);
+        ix.addColumnName(RONDB_GC_COL_SEQ);
+        if (dict->createIndex(ix) != 0) {
+            NdbError err = dict->getNdbError();
+            if (err.classification != NdbError::SchemaObjectExists &&
+                err.code != 4714) {
+                return rondb_report_error(err, RONDB_IX_GC_SEQ);
+            }
+        }
+    }
+    return 0;
 }
 
 /*
@@ -8507,6 +8533,85 @@ int rondb_shim_gc_peek_batch(void *handle, struct mds_gc_entry *entries,
     tbl = dict->getTable(RONDB_TBL_GC_QUEUE);
     if (tbl == nullptr) { return -1; }
 
+    /*
+     * Fast path: ordered-index scan on gc_seq.  SF_OrderBy returns rows
+     * ascending by gc_seq across fragments, so we read the oldest owned
+     * entries directly and stop after `cap` -- O(cap) instead of a full
+     * scan of a queue that can be millions of rows during a delete burst.
+     * `examine_cap` bounds the rows visited so an MDS that owns only a
+     * sparse slice of the oldest entries still returns promptly; any
+     * setup/scan failure falls through to the full-scan path below.
+     */
+    {
+        const NdbDictionary::Index *ix =
+            rondb_resolve_index(dict, RONDB_IX_GC_SEQ, RONDB_TBL_GC_QUEUE);
+        if (ix != nullptr) {
+            NdbTransaction *itx = rondb_get_ndb(state)->startTransaction();
+            if (itx != nullptr) {
+                NdbIndexScanOperation *iscan =
+                    itx->getNdbIndexScanOperation(ix);
+                if (iscan != nullptr &&
+                    iscan->readTuples(NdbOperation::LM_CommittedRead,
+                                      NdbScanOperation::SF_OrderBy) == 0) {
+                    NdbRecAttr *i_seq =
+                        iscan->getValue(RONDB_GC_COL_SEQ, nullptr);
+                    NdbRecAttr *i_fid =
+                        iscan->getValue(RONDB_GC_COL_FILEID, nullptr);
+                    NdbRecAttr *i_dsid =
+                        iscan->getValue(RONDB_GC_COL_DS_ID, nullptr);
+                    NdbRecAttr *i_fhlen =
+                        iscan->getValue(RONDB_GC_COL_NFS_FH_LEN, nullptr);
+                    NdbRecAttr *i_fh =
+                        iscan->getValue(RONDB_GC_COL_NFS_FH, nullptr);
+                    NdbRecAttr *i_owner =
+                        iscan->getValue(RONDB_GC_COL_OWNER_MDS, nullptr);
+                    if (itx->execute(NdbTransaction::NoCommit) != -1) {
+                        uint32_t got = 0;
+                        uint64_t examined = 0;
+                        uint64_t examine_cap = (uint64_t)cap * 256ULL + 4096ULL;
+                        int irc;
+                        while (got < cap && examined < examine_cap &&
+                               (irc = iscan->nextResult(true)) == 0) {
+                            examined++;
+                            uint32_t owner = (i_owner != nullptr) ?
+                                i_owner->u_32_value() : 0U;
+                            if (self_mds_id != 0U && owner != 0U &&
+                                owner != self_mds_id) {
+                                continue;
+                            }
+                            struct mds_gc_entry e;
+                            std::memset(&e, 0, sizeof(e));
+                            e.gc_seq       = i_seq->u_64_value();
+                            e.fileid       = i_fid->u_64_value();
+                            e.ds_id        = i_dsid->u_32_value();
+                            e.owner_mds_id = owner;
+                            e.nfs_fh_len   = i_fhlen->u_32_value();
+                            if (e.nfs_fh_len > MDS_NFS_FH_MAX) {
+                                e.nfs_fh_len = MDS_NFS_FH_MAX;
+                            }
+                            const char *fh_ptr = i_fh->aRef();
+                            if (fh_ptr != nullptr && e.nfs_fh_len > 0) {
+                                uint32_t vb_len =
+                                    (uint32_t)(uint8_t)fh_ptr[0];
+                                if (vb_len > MDS_NFS_FH_MAX) {
+                                    vb_len = MDS_NFS_FH_MAX;
+                                }
+                                std::memcpy(e.nfs_fh, fh_ptr + 1, vb_len);
+                            }
+                            entries[got++] = e;   /* already gc_seq order */
+                        }
+                        iscan->close();
+                        rondb_get_ndb(state)->closeTransaction(itx);
+                        *n_out = got;
+                        return 0;
+                    }
+                }
+                rondb_get_ndb(state)->closeTransaction(itx);
+            }
+        }
+        /* Index unavailable -- fall through to the full-scan heap path. */
+    }
+
     tx = rondb_get_ndb(state)->startTransaction();
     if (tx == nullptr) {
         return rondb_report_error(rondb_get_ndb(state)->getNdbError(),
@@ -8704,14 +8809,30 @@ int rondb_shim_gc_count(void *handle, uint32_t *count, uint32_t self_mds_id)
         return rondb_report_error(err, "gc_count exec");
     }
 
+    /*
+     * Bounded count.  gc_pending is a monitoring gauge, so we saturate
+     * the owned count at COUNT_CAP and bound the rows examined at
+     * EXAMINE_CAP -- exact counting of a multi-million-row queue every
+     * coordinator tick would steal RonDB capacity from the drain itself.
+     * The gauge reads "COUNT_CAP" while the backlog is huge and becomes
+     * exact once it drains below the cap.
+     */
+    const uint32_t COUNT_CAP   = 100000U;
+    const uint64_t EXAMINE_CAP = 500000ULL;
+    uint64_t examined = 0;
+    bool capped = false;
     while ((next_rc = scan->nextResult(true)) == 0) {
         uint32_t owner = (a_owner != nullptr) ? a_owner->u_32_value() : 0U;
-        if (self_mds_id != 0U && owner != 0U && owner != self_mds_id) {
-            continue;
+        examined++;
+        if (!(self_mds_id != 0U && owner != 0U && owner != self_mds_id)) {
+            n++;
         }
-        n++;
+        if (n >= COUNT_CAP || examined >= EXAMINE_CAP) {
+            capped = true;
+            break;
+        }
     }
-    if (next_rc != 1) {
+    if (!capped && next_rc != 1) {
         err = scan->getNdbError();
         scan->close();
         rondb_get_ndb(state)->closeTransaction(tx);

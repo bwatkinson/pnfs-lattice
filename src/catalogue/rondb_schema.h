@@ -326,6 +326,13 @@
  * owner_mds_id == 0 as "unassigned" and any MDS may reclaim them.
  */
 #define RONDB_GC_COL_OWNER_MDS    "owner_mds_id"
+/*
+ * Ordered index on gc_seq: lets the drainer read the oldest queued
+ * entries in gc_seq order without a full-table scan, so the GC keeps
+ * up with heavy-delete bursts even when the backlog is millions of
+ * rows.  Created with logging off (rebuilt in memory on node restart).
+ */
+#define RONDB_IX_GC_SEQ           "ix_gc_queue_seq"
 
 /* -----------------------------------------------------------------------
  * Column names -- mds_prealloc_pool

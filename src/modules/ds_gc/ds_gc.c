@@ -31,6 +31,7 @@
 #define DS_GC_MAX_WORKERS     32U
 #define DS_GC_MAX_BATCH_SIZE  4096U
 #define DS_GC_QUEUE_CAP       4096U
+#define DS_GC_GAUGE_EVERY     6U   /* refresh gc_pending every 6th tick */
 
 struct ds_gc_work_item {
 	struct mds_gc_entry entry;
@@ -193,6 +194,7 @@ static void coordinator_drain_queue(struct ds_gc *gc)
 static void *ds_gc_coordinator_main(void *arg)
 {
 	struct ds_gc *gc = arg;
+	uint32_t gauge_tick = 0;
 
 	while (!atomic_load_explicit(&gc->stop, memory_order_relaxed)) {
 		uint32_t n = 0;
@@ -210,8 +212,11 @@ static void *ds_gc_coordinator_main(void *arg)
 		}
 
 		/* Refresh the GC backlog gauge (this MDS's owned rows) so
-		 * pnfs-mds-top / Prometheus can track drain progress. */
-		{
+		 * pnfs-mds-top / Prometheus can track drain progress.  The
+		 * count is a bounded scan; refresh it only every Nth tick so
+		 * it does not steal RonDB capacity from the drain on a large
+		 * backlog (the drain itself uses the ordered-index peek). */
+		if ((gauge_tick++ % DS_GC_GAUGE_EVERY) == 0) {
 			uint32_t pending = 0;
 			if (mds_cat_gc_count(gc->cat, &pending) == MDS_OK) {
 				atomic_store_explicit(

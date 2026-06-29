@@ -8810,29 +8810,21 @@ int rondb_shim_gc_count(void *handle, uint32_t *count, uint32_t self_mds_id)
     }
 
     /*
-     * Bounded count.  gc_pending is a monitoring gauge, so we saturate
-     * the owned count at COUNT_CAP and bound the rows examined at
-     * EXAMINE_CAP -- exact counting of a multi-million-row queue every
-     * coordinator tick would steal RonDB capacity from the drain itself.
-     * The gauge reads "COUNT_CAP" while the backlog is huge and becomes
-     * exact once it drains below the cap.
+     * Exact count of this MDS's queued rows.  This is a full scan, but
+     * the ds_gc coordinator only refreshes the gauge every Nth tick
+     * (DS_GC_GAUGE_EVERY), so the cost is amortised and shrinks as the
+     * backlog drains; the drain hot path itself uses the cheap
+     * ordered-index peek, not this count.  An earlier "examine cap" made
+     * this scan stop early, which turned the gauge into a noisy
+     * under-estimate on a large queue -- removed.
      */
-    const uint32_t COUNT_CAP   = 100000U;
-    const uint64_t EXAMINE_CAP = 500000ULL;
-    uint64_t examined = 0;
-    bool capped = false;
     while ((next_rc = scan->nextResult(true)) == 0) {
         uint32_t owner = (a_owner != nullptr) ? a_owner->u_32_value() : 0U;
-        examined++;
         if (!(self_mds_id != 0U && owner != 0U && owner != self_mds_id)) {
             n++;
         }
-        if (n >= COUNT_CAP || examined >= EXAMINE_CAP) {
-            capped = true;
-            break;
-        }
     }
-    if (!capped && next_rc != 1) {
+    if (next_rc != 1) {
         err = scan->getNdbError();
         scan->close();
         rondb_get_ndb(state)->closeTransaction(tx);

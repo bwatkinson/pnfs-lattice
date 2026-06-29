@@ -12426,7 +12426,7 @@ int rondb_shim_deleg_del(void *handle, const uint8_t stateid_other[12])
     if (idx_c) { NdbOperation *dc = tx->getNdbOperation(idx_c);
       if (dc) { dc->deleteTuple(); (void)rondb_equal_u64(dc, RONDB_DG_COL_CLIENTID, row.clientid); dc->equal(RONDB_DG_COL_STATEID, (const char *)sid_vb, 13); } }
     if (tx->execute(NdbTransaction::Commit) == -1) {
-        err = tx->getNdbError(); rondb_get_ndb(state)->closeTransaction(tx); return rondb_report_error(err, "deleg_del commit");
+        err = tx->getNdbError(); rondb_get_ndb(state)->closeTransaction(tx); if (err.code == 626) { return 0; } return rondb_report_error(err, "deleg_del commit");
     }
     rondb_get_ndb(state)->closeTransaction(tx);
     return 0;

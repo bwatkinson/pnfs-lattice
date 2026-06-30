@@ -50,6 +50,7 @@ ds_export="/export/ds"
 ds_mount_fmt="/mnt/ds%u"
 data_dir="/var/lib/rondb"
 data_memory="2G"
+host_memory=""         # smallest data-node host RAM (e.g. 192G); determines TotalMemoryConfig
 conf_dir="/etc/pnfs-mds"
 replicas_opt=""
 mgmt_host=""
@@ -65,6 +66,7 @@ DS_IPS=()
 DATA_IPS=()            # MDS hosts that run a RonDB data node (subset of MDS_IPS)
 MGMT_IP=""             # MDS host that runs ndb_mgmd
 replicas=1
+total_memory_config="" # RonDB TotalMemoryConfig computed from host_memory
 GENERATED_AT=""
 
 usage() {
@@ -107,6 +109,10 @@ Options (defaults in brackets):
   --ds-mount-fmt FMT     MDS-side DS mount template (one %u) [${ds_mount_fmt}].
   --data-dir DIR         RonDB data/mgm directory [${data_dir}].
   --data-memory SIZE     RonDB DataMemory [${data_memory}].
+  --host-memory SIZE     RAM of the smallest data-node host (e.g. 64G, 192G).
+                         RonDB will be capped to ~65%% via TotalMemoryConfig.
+                         Prompted interactively if omitted on a TTY; defaults
+                         to 8G in non-interactive mode.
   --conf-dir DIR         Target dir for mds.conf/rondb.conf [${conf_dir}].
   -h, --help             Show this help.
 
@@ -137,6 +143,76 @@ is_ipv4() {
         (( 10#${o} <= 255 )) || return 1
     done
     return 0
+}
+
+# parse_size_to_gb VALUE
+# Converts a memory size string (e.g. "192G", "8192M", "1T") to integer GB.
+# Returns 1 on invalid input; caller should handle via || or $?.
+parse_size_to_gb() {
+    local val="$1" num unit gb
+    val="${val^^}"
+    if [[ "${val}" =~ ^([0-9]+)([GMT]?)$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]:-G}"
+        case "${unit}" in
+            M) gb=$(( num / 1024 )) ;;
+            G) gb="${num}" ;;
+            T) gb=$(( num * 1024 )) ;;
+        esac
+        printf '%s' "${gb}"
+    else
+        return 1
+    fi
+}
+
+# resolve_memory
+# Determines TotalMemoryConfig for RonDB data nodes.  Data nodes are
+# colocated with pnfs-mds on the MDS hosts, so RonDB must not consume
+# all host RAM.  Priority: --host-memory flag > interactive prompt >
+# conservative 8G default.
+resolve_memory() {
+    local host_gb
+
+    if [[ -n "${host_memory}" ]]; then
+        host_gb="$(parse_size_to_gb "${host_memory}")" || \
+            die "invalid --host-memory value: '${host_memory}' (use e.g. 64G, 128G, 1T)"
+    elif [[ -t 0 ]]; then
+        local answer
+        info "RonDB data nodes are colocated with pnfs-mds on the MDS hosts."
+        info "To prevent RonDB from consuming all host RAM, TotalMemoryConfig"
+        info "will be set to ~65%% of the smallest data-node host's RAM."
+        printf '%s: Smallest data-node host RAM in GB (e.g. 64, 128, 192) [8]: ' \
+            "${PROG}" >&2
+        IFS= read -r answer
+        answer="${answer#"${answer%%[![:space:]]*}"}"
+        answer="${answer%"${answer##*[![:space:]]}"}"
+        if [[ -z "${answer}" ]]; then
+            host_gb=8
+            warn "no host memory specified; using conservative TotalMemoryConfig=8G"
+        else
+            [[ "${answer}" =~ ^[0-9]+$ ]] && answer="${answer}G"
+            host_gb="$(parse_size_to_gb "${answer}")" || \
+                die "invalid host memory: '${answer}' (enter a number in GB, e.g. 64, 128, 192)"
+        fi
+    else
+        host_gb=8
+        warn "no --host-memory specified (non-interactive); using conservative default TotalMemoryConfig=8G"
+    fi
+
+    (( host_gb >= 8 )) || die "host memory must be at least 8G (got ${host_gb}G)"
+
+    local rondb_gb=$(( (host_gb * 65) / 100 ))
+    (( rondb_gb >= 8 )) || rondb_gb=8
+    total_memory_config="${rondb_gb}G"
+
+    # Sanity: TotalMemoryConfig must exceed DataMemory.
+    local dm_gb
+    dm_gb="$(parse_size_to_gb "${data_memory}")" || dm_gb=0
+    if (( dm_gb > 0 && dm_gb >= rondb_gb )); then
+        die "DataMemory (${data_memory}) would exceed TotalMemoryConfig (${total_memory_config}); increase --host-memory or decrease --data-memory"
+    fi
+
+    info "TotalMemoryConfig=${total_memory_config} (~65%% of ${host_gb}G host RAM)"
 }
 
 # read_list FILE LABEL OUT_ARRAY_NAME
@@ -185,6 +261,7 @@ parse_args() {
             --ds-mount-fmt)   ds_mount_fmt="${2:?--ds-mount-fmt requires an argument}"; shift 2;;
             --data-dir)       data_dir="${2:?--data-dir requires an argument}"; shift 2;;
             --data-memory)    data_memory="${2:?--data-memory requires an argument}"; shift 2;;
+            --host-memory)    host_memory="${2:?--host-memory requires an argument}"; shift 2;;
             --conf-dir)       conf_dir="${2:?--conf-dir requires an argument}"; shift 2;;
             -h|--help)        usage; exit 0;;
             --) shift; break;;
@@ -293,6 +370,7 @@ NoOfReplicas=${replicas}
 DataDir=${data_dir}/data
 FileSystemPath=${data_dir}/data
 DataMemory=${data_memory}
+TotalMemoryConfig=${total_memory_config}
 SharedGlobalMemory=256M
 RedoBuffer=64M
 TransactionMemory=128M
@@ -448,6 +526,7 @@ main() {
         die "too many [api] slots (${total_api}); node ids would exceed ${MAX_NODE_ID}. Reduce --worker-threads or the MDS count."
 
     compute_replicas "${#DATA_IPS[@]}"
+    resolve_memory
     warn_overlap
 
     GENERATED_AT="$(date -u +%FT%TZ)"

@@ -259,8 +259,18 @@ connects to a host and never deploys anything.
 ```sh
 printf '10.0.0.50\n10.0.0.51\n10.0.0.55\n' > mds.txt   # one MDS IP per line
 printf '10.0.0.52\n10.0.0.53\n' > ds.txt               # one DS IP per line
-./scripts/lattice-genconfig --mds-file mds.txt --ds-file ds.txt --out ./cluster-config
+# --host-memory is the RAM of the SMALLEST data-node host; RonDB will be capped
+# to ~65% of it via TotalMemoryConfig so the colocated pnfs-mds + OS keep RAM.
+./scripts/lattice-genconfig --mds-file mds.txt --ds-file ds.txt \
+    --host-memory 64G --out ./cluster-config
 ```
+
+If `--host-memory` is omitted, the script prompts for it on a TTY and falls back
+to a conservative `TotalMemoryConfig=8G` in non-interactive mode. Without this
+cap, RonDB's `AutomaticMemoryConfig` consumes the entire host's RAM (the bulk
+of it landing in `DiskPageBufferMemory`), which on large boxes stalls data
+node startup long enough for the management server to drop them for missed
+heartbeats.
 
 This writes into `./cluster-config`:
 

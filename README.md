@@ -265,12 +265,12 @@ printf '10.0.0.52\n10.0.0.53\n' > ds.txt               # one DS IP per line
     --host-memory 64G --out ./cluster-config
 ```
 
-If `--host-memory` is omitted, the script prompts for it on a TTY and falls back
-to a conservative `TotalMemoryConfig=8G` in non-interactive mode. Without this
-cap, RonDB's `AutomaticMemoryConfig` consumes the entire host's RAM (the bulk
-of it landing in `DiskPageBufferMemory`), which on large boxes stalls data
-node startup long enough for the management server to drop them for missed
-heartbeats.
+If `--host-memory` is omitted, the script falls back to a conservative
+`TotalMemoryConfig=8G` (safe default; never prompts, so it works cleanly under
+ansible/CI). Without this cap, RonDB's `AutomaticMemoryConfig` consumes the
+entire host's RAM (the bulk of it landing in `DiskPageBufferMemory`), which on
+large boxes stalls data node startup long enough for the management server to
+drop them for missed heartbeats.
 
 This writes into `./cluster-config`:
 

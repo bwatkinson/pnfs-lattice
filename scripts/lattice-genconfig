@@ -110,9 +110,12 @@ Options (defaults in brackets):
   --data-dir DIR         RonDB data/mgm directory [${data_dir}].
   --data-memory SIZE     RonDB DataMemory [${data_memory}].
   --host-memory SIZE     RAM of the smallest data-node host (e.g. 64G, 192G).
-                         RonDB will be capped to ~65%% via TotalMemoryConfig.
-                         Prompted interactively if omitted on a TTY; defaults
-                         to 8G in non-interactive mode.
+                         RonDB will be capped to ~65%% via TotalMemoryConfig,
+                         leaving headroom for the colocated pnfs-mds + OS.
+                         When omitted, a conservative TotalMemoryConfig=8G is
+                         used (safe default; never prompts). For most labs
+                         you should pass this flag with the smallest data-node
+                         host's actual RAM.
   --conf-dir DIR         Target dir for mds.conf/rondb.conf [${conf_dir}].
   -h, --help             Show this help.
 
@@ -168,35 +171,18 @@ parse_size_to_gb() {
 # resolve_memory
 # Determines TotalMemoryConfig for RonDB data nodes.  Data nodes are
 # colocated with pnfs-mds on the MDS hosts, so RonDB must not consume
-# all host RAM.  Priority: --host-memory flag > interactive prompt >
-# conservative 8G default.
+# all host RAM.  Non-interactive: --host-memory flag when provided,
+# otherwise a conservative 8G default.  Never prompts (safe for
+# ansible / CI / any non-interactive invocation).
 resolve_memory() {
     local host_gb
 
     if [[ -n "${host_memory}" ]]; then
         host_gb="$(parse_size_to_gb "${host_memory}")" || \
             die "invalid --host-memory value: '${host_memory}' (use e.g. 64G, 128G, 1T)"
-    elif [[ -t 0 ]]; then
-        local answer
-        info "RonDB data nodes are colocated with pnfs-mds on the MDS hosts."
-        info "To prevent RonDB from consuming all host RAM, TotalMemoryConfig"
-        info "will be set to ~65%% of the smallest data-node host's RAM."
-        printf '%s: Smallest data-node host RAM in GB (e.g. 64, 128, 192) [8]: ' \
-            "${PROG}" >&2
-        IFS= read -r answer
-        answer="${answer#"${answer%%[![:space:]]*}"}"
-        answer="${answer%"${answer##*[![:space:]]}"}"
-        if [[ -z "${answer}" ]]; then
-            host_gb=8
-            warn "no host memory specified; using conservative TotalMemoryConfig=8G"
-        else
-            [[ "${answer}" =~ ^[0-9]+$ ]] && answer="${answer}G"
-            host_gb="$(parse_size_to_gb "${answer}")" || \
-                die "invalid host memory: '${answer}' (enter a number in GB, e.g. 64, 128, 192)"
-        fi
     else
         host_gb=8
-        warn "no --host-memory specified (non-interactive); using conservative default TotalMemoryConfig=8G"
+        warn "no --host-memory specified; using conservative default TotalMemoryConfig=8G (pass --host-memory <size> for a larger cap)"
     fi
 
     (( host_gb >= 8 )) || die "host memory must be at least 8G (got ${host_gb}G)"

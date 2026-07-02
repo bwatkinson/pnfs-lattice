@@ -55,10 +55,18 @@ static constexpr int NDB_CONN_POOL_MAX = 64;
 
 /** Maximum retry attempts for NDB transient errors (lock contention,
  *  temporary resource exhaustion, node recovery). */
-static constexpr int NDB_RETRY_MAX = 3;
+static constexpr int NDB_RETRY_MAX = 12;
 
 /** Backoff delay between retries (microseconds). */
-static constexpr int NDB_RETRY_DELAY_US = 500;
+static constexpr int NDB_RETRY_DELAY_US = 2000;
+
+/** Randomized jitter (0..NDB_RETRY_DELAY_US us) so txns that deadlocked do
+ *  not retry in lockstep and re-collide. Thread-safe (no shared RNG). */
+static inline long rondb_retry_jitter_us(void) {
+    struct timespec _j;
+    clock_gettime(CLOCK_MONOTONIC, &_j);
+    return (long)(_j.tv_nsec % (long)NDB_RETRY_DELAY_US);
+}
 
 /**
  * Check if an NDB error is transient and should be retried.
@@ -1406,6 +1414,17 @@ static int rondb_add_lock_holder_delete(NdbTransaction *tx,
  * @param nlink_delta    +1 (dir create), -1 (dir remove), 0 (file ops).
  * @return 0 on success, -1 on error.
  */
+/* Experimental scale knob (env PNFS_RELAX_DIR_CHANGE=1): skip the
+ * synchronous change-counter + mtime bump on the PARENT directory inode
+ * for FILE create/remove (parent_nlink_delta == 0).  That bump is an
+ * exclusive lock on one shared row that serialises every same-directory
+ * metadata op -- the dominant scale bottleneck for both shared-dir create
+ * and mass remove.  The directory's NFS changeid/mtime then lags, which
+ * is acceptable for scale/benchmark workloads.  Directory ops (nlink
+ * delta != 0) always update, preserving nlink correctness. */
+static const bool g_relax_dir_change =
+    (std::getenv("PNFS_RELAX_DIR_CHANGE") != nullptr);
+
 static int rondb_interpreted_parent_update(
     NdbTransaction *tx,
     const NdbDictionary::Table *ino_tbl,
@@ -6219,7 +6238,8 @@ int rondb_shim_ns_create(void *handle,
     rondb_set_inode_values(op_child, &child_ino, child_shard);
 
     /* 3. Interpreted parent inode update (atomic nlink + change). */
-    if (rondb_interpreted_parent_update(tx, ino_tbl, parent_fileid,
+    if (!(g_relax_dir_change && parent_nlink_delta == 0) &&
+        rondb_interpreted_parent_update(tx, ino_tbl, parent_fileid,
                                         parent_nlink_delta) != 0) {
         goto ns_create_err;
     }
@@ -6448,7 +6468,8 @@ int rondb_shim_ns_create_with_layout(
     track(op_child, "child_inode");
 
     /* 3. Atomic parent update. */
-    if (rondb_interpreted_parent_update(tx, ino_tbl, parent_fileid,
+    if (!(g_relax_dir_change && parent_nlink_delta == 0) &&
+        rondb_interpreted_parent_update(tx, ino_tbl, parent_fileid,
                                         parent_nlink_delta) != 0) {
         goto ns_create_wl_err;
     }
@@ -6770,7 +6791,8 @@ static int rondb_shim_ns_remove_once(void *handle,
     }
 
     /* 3. Interpreted parent inode update (atomic nlink + change). */
-    if (rondb_interpreted_parent_update(tx, ino_tbl, parent_fileid,
+    if (!(g_relax_dir_change && parent_nlink_delta == 0) &&
+        rondb_interpreted_parent_update(tx, ino_tbl, parent_fileid,
                                         parent_nlink_delta) != 0) {
         goto ns_remove_err;
     }
@@ -6788,6 +6810,16 @@ static int rondb_shim_ns_remove_once(void *handle,
         err = tx->getNdbError();
         rondb_get_ndb(state)->closeTransaction(tx);
         if (err.code == 266 || err.code == 274) { return err.code; }
+        /* 626 "Tuple did not exist": the dirent (and, atomically with
+         * it, the child inode / stripe / parent rows) was already
+         * removed by a prior committed ns_remove -- a duplicate or
+         * retransmitted REMOVE, seen on the referral path under a
+         * concurrent -N cross-client delete storm. The unlink post-
+         * condition (name absent) already holds, so this is an
+         * idempotent success, not an I/O error. Mirrors the idempotency
+         * ds_gc already relies on and stops the client-visible
+         * "unlink() failed" reports without leaving orphaned state. */
+        if (err.code == 626) { return 0; }
         return rondb_report_error(err, "ns_remove commit");
     }
 
@@ -6798,6 +6830,7 @@ ns_remove_err:
     err = tx->getNdbError();
     rondb_get_ndb(state)->closeTransaction(tx);
     if (err.code == 266 || err.code == 274) { return err.code; }
+    if (err.code == 626) { return 0; }  /* already gone: idempotent */
     return rondb_report_error(err, "ns_remove op");
 }
 
@@ -6818,7 +6851,8 @@ int rondb_shim_ns_remove(void *handle,
         if (rc != 266 && rc != 274) { return rc; }
         struct timespec _ts;
         _ts.tv_sec  = 0;
-        _ts.tv_nsec = (long)(NDB_RETRY_DELAY_US * (attempt + 1)) * 1000L;
+        _ts.tv_nsec = (long)(NDB_RETRY_DELAY_US * (attempt + 1)
+                             + rondb_retry_jitter_us()) * 1000L;
         nanosleep(&_ts, nullptr);
     }
     return -2;  /* exhausted retries — signal MDS_ERR_BUSY to caller */
@@ -9547,7 +9581,8 @@ int rondb_shim_layout_state_put(void *handle,
         {
             struct timespec _ts;
             _ts.tv_sec  = 0;
-            _ts.tv_nsec = (long)(NDB_RETRY_DELAY_US * (attempt + 1)) * 1000L;
+            _ts.tv_nsec = (long)(NDB_RETRY_DELAY_US * (attempt + 1)
+                             + rondb_retry_jitter_us()) * 1000L;
             nanosleep(&_ts, nullptr);
         }
     }
@@ -9565,7 +9600,7 @@ int rondb_shim_layout_state_put(void *handle,
 }
 
 
-int rondb_shim_layout_state_del(void *handle,
+static int rondb_shim_layout_state_del_once(void *handle,
                                 const uint8_t stateid_other[12],
                                 uint64_t clientid, uint64_t fileid,
                                 const uint32_t *ds_ids, uint32_t ds_count)
@@ -9624,25 +9659,35 @@ int rondb_shim_layout_state_del(void *handle,
     op->equal(RONDB_LBF_COL_STATEID,
               (const char *)sid_enc, sid_enc_len);
 
-    /* 3. Delete ds_layout_idx rows. */
+    /* 3. Delete ds_layout_idx rows. Sort ds_ids so concurrent layout
+     *    deletes take the shared ds_layout_idx locks in a consistent
+     *    global order -- removes the lock-ordering deadlocks (NDB 266)
+     *    when many removes contend on the same DS stripes. */
     (void)clientid;
-    for (uint32_t i = 0; i < ds_count; i++) {
-        op = tx->getNdbOperation(dli_tbl);
-        if (op == nullptr) { goto layout_del_err; }
-        op->deleteTuple();
-        op->equal(RONDB_DLI_COL_DS_ID, (Uint32)ds_ids[i]);
-        (void)rondb_equal_u64(op, RONDB_DLI_COL_CLIENTID, clientid);
-        (void)rondb_equal_u64(op, RONDB_DLI_COL_FILEID, fileid);
+    {
+        std::vector<uint32_t> sorted_ds(ds_ids, ds_ids + ds_count);
+        std::sort(sorted_ds.begin(), sorted_ds.end());
+        for (uint32_t i = 0; i < ds_count; i++) {
+            op = tx->getNdbOperation(dli_tbl);
+            if (op == nullptr) { goto layout_del_err; }
+            op->deleteTuple();
+            op->equal(RONDB_DLI_COL_DS_ID, (Uint32)sorted_ds[i]);
+            (void)rondb_equal_u64(op, RONDB_DLI_COL_CLIENTID, clientid);
+            (void)rondb_equal_u64(op, RONDB_DLI_COL_FILEID, fileid);
+        }
     }
 
     if (tx->execute(NdbTransaction::Commit) == -1) {
         err = tx->getNdbError();
         rondb_get_ndb(state)->closeTransaction(tx);
         /* Ignore 626 (some rows may not exist). */
-        if (err.code != 626 &&
-            err.classification != NdbError::NoDataFound) {
-            return rondb_report_error(err, "layout_del commit");
+        if (err.code == 626 ||
+            err.classification == NdbError::NoDataFound) {
+            return 0;
         }
+        /* 266/274 are retryable -- signal the wrapper to back off + retry. */
+        if (err.code == 266 || err.code == 274) { return err.code; }
+        return rondb_report_error(err, "layout_del commit");
     }
 
     rondb_get_ndb(state)->closeTransaction(tx);
@@ -9651,7 +9696,39 @@ int rondb_shim_layout_state_del(void *handle,
 layout_del_err:
     err = tx->getNdbError();
     rondb_get_ndb(state)->closeTransaction(tx);
+    if (err.code == 266 || err.code == 274) { return err.code; }
     return rondb_report_error(err, "layout_del op");
+}
+
+/* Retry wrapper for layout_state_del. The delete spans multiple partitions
+ * (layout_state / layout_by_file keyed by fileid; ds_layout_idx keyed by
+ * ds_id), so under a concurrent multi-shard remove storm the shared
+ * ds_layout_idx locks collide (NDB 266/274). Retry with jittered backoff so
+ * transient deadlocks resolve instead of surfacing as errors and stalling
+ * the remove phase. */
+int rondb_shim_layout_state_del(void *handle,
+                                const uint8_t stateid_other[12],
+                                uint64_t clientid, uint64_t fileid,
+                                const uint32_t *ds_ids, uint32_t ds_count)
+{
+    for (int attempt = 0; attempt < NDB_RETRY_MAX; attempt++) {
+        int rc = rondb_shim_layout_state_del_once(
+                handle, stateid_other, clientid, fileid, ds_ids, ds_count);
+        if (rc != 266 && rc != 274) { return rc; }
+        struct timespec _ts;
+        _ts.tv_sec  = 0;
+        _ts.tv_nsec = (long)(NDB_RETRY_DELAY_US * (attempt + 1)
+                             + rondb_retry_jitter_us()) * 1000L;
+        nanosleep(&_ts, nullptr);
+    }
+    {
+        NdbError synth_err = {};
+        synth_err.code = 266;
+        synth_err.classification = NdbError::TimeoutExpired;
+        synth_err.message = "layout_del retry-exhausted (266/274)";
+        (void)rondb_report_error(synth_err, "layout_del retry-exhausted");
+    }
+    return -1;
 }
 
 /*

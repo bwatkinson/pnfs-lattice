@@ -139,9 +139,21 @@ static bool process_one_entry(struct ds_gc *gc,
 				(unsigned long long)entry->fileid,
 				entry->ds_id, (int)block_st,
 				block_st == MDS_ERR_NOTFOUND ?
-					"ds_id not mounted here" : "unlink I/O");
+					"ds_id not mounted here (dropping)"
+					: "unlink I/O (retry)");
 		}
-		return false;
+		/* MDS_ERR_NOTFOUND: entry->ds_id is not resolvable to a DS mount
+		 * on this MDS (out-of-range / synthetic ds_id). This MDS can never
+		 * drain it, and returning false keeps it at the head of the
+		 * ordered GC queue forever -- the coordinator re-peeks the same
+		 * entries every pass, the whole drain wedges, and the RonDB gc
+		 * queue grows without bound (which also stalls removes and slows
+		 * MDS restart). Drop it so the drain makes progress: the DS bytes
+		 * may leak, but the namespace remove already committed. A genuine
+		 * transient unlink error (MDS_ERR_IO) is still retried. */
+		if (block_st != MDS_ERR_NOTFOUND) {
+			return false;
+		}
 	}
 	(void)had_any_existed;
 	/* Best-effort: drop catalogue stripe rows after DS bytes are gone.

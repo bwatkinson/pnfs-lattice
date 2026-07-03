@@ -634,6 +634,15 @@ int ds_prealloc_pop(struct ds_prealloc_ctx *ctx,
         pthread_mutex_unlock(&r->lock);
 
         if (got) {
+            if (slot.entry.ds_id >= 65536U) {
+                /* Corrupt cached slot: never persist a garbage ds_id
+                 * (wedges ds_gc + DS fencing). Drop it (and its pool row)
+                 * and keep looking; the ring-empty fallback recomputes a
+                 * valid DS via placement_select_ex. */
+                (void)mds_cat_prealloc_pool_delete(
+                    (struct mds_catalogue *)ctx->cat, slot.fileid);
+                continue;
+            }
             *entry = slot.entry;
             if (stripe_unit != NULL) { *stripe_unit = slot.stripe_unit; }
             if (fileid_out != NULL) { *fileid_out = slot.fileid; }

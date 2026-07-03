@@ -938,6 +938,16 @@ int main(int argc, char *argv[])
 		ds_prealloc_set_ds_cache(ds_pa, ds_cache);
 	}
 
+	/* v8: RFC 8435 S2.2 stored synthetic DS owner (ds_synth_owner). */
+	if (ds_pa != NULL) {
+		ds_prealloc_set_synth_owner(ds_pa, cfg.ds_synth_owner);
+		if (cfg.ds_synth_owner) {
+			MDS_LOG_INFO(LOG_COMP_MDS,
+				"ds_synth_owner=on (stored synthetic DS owner; "
+				"no per-LAYOUTGET chown)");
+		}
+	}
+
 	/*
 	 * Start the live DS capacity probe.  Uses statvfs() on the
 	 * mount path that proxy I/O set up above, so it only produces

@@ -255,6 +255,10 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
      * write-through to RonDB for cross-MDS correctness). */
     cfg->transient_state_cache = false;
 
+    /* Stored synthetic DS owner (RFC 8435 S2.2).  Default off -> legacy
+     * owner-aligned chown-on-LAYOUTGET path. */
+    cfg->ds_synth_owner = false;
+
     /* Live DS capacity probe interval (ms).  60s by default. */
     cfg->ds_capacity_poll_ms = 60000;
 
@@ -785,6 +789,9 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
         } else if (strcmp(key, "transient_state_cache") == 0) {
             cfg->transient_state_cache = (strcmp(val, "true") == 0 ||
                                           strcmp(val, "1") == 0);
+        } else if (strcmp(key, "ds_synth_owner") == 0) {
+            cfg->ds_synth_owner = (strcmp(val, "true") == 0 ||
+                                   strcmp(val, "1") == 0);
         /*
          * Phase C of docs/hpc-nto1-plan.md -- wide-stripe pre-warm.
          * Operators on >128-DS clusters bump hpc_max_stripe_count up

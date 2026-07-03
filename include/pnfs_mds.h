@@ -267,6 +267,16 @@ struct mds_ds_map_entry {
     uint32_t ds_id;
     uint32_t nfs_fh_len;
     uint8_t  nfs_fh[MDS_NFS_FH_MAX];
+    /*
+     * Stored synthetic DS-owner (RFC 8435 S2.2), carried prestage ->
+     * ring -> create.  Per-file, not per-stripe: the same pair is used
+     * for every stripe/mirror of the file and stored once on the inode.
+     * NOT serialised into the stripe map (mds_ds_map rows); it lives in
+     * the inode's synth_suid/synth_sgid columns.  0 = unset (legacy /
+     * ds_synth_owner disabled).
+     */
+    uint32_t synth_suid;
+    uint32_t synth_sgid;
 };
 
 /* -----------------------------------------------------------------------
@@ -323,6 +333,9 @@ struct mds_prealloc_pool_row {
 	uint32_t stripe_unit;
 	uint32_t nfs_fh_len;
 	uint8_t  nfs_fh[MDS_NFS_FH_MAX];
+	/* v8: synth owner the prestaged DS file was chowned to (0 if legacy). */
+	uint32_t synth_suid;
+	uint32_t synth_sgid;
 };
 
 /* -----------------------------------------------------------------------
@@ -357,6 +370,18 @@ struct mds_inode {
     uint32_t            flags;          /* MDS_IFLAG_* bitfield */
     uint64_t            create_verf;    /* EXCLUSIVE4 verifier (cleared on first SETATTR) */
     uint64_t            parent_fileid;  /* Parent directory (0 = unknown/unmigrated) */
+
+    /*
+     * Stored synthetic DS owner (RFC 8435 S2.2, ds_synth_owner mode).
+     * Random unguessable (suid, sgid) the file's DS backing files were
+     * chowned to at prestage/DS-create; LAYOUTGET advertises these in
+     * ffl_user/ffl_group instead of the owner uid/gid, and does no chown.
+     * 0 = unset (legacy inode / mode disabled -> owner-aligned chown).
+     * Persisted in the synth_suid/synth_sgid inode columns; length-
+     * tolerant so pre-feature rows read back as 0.
+     */
+    uint32_t            synth_suid;
+    uint32_t            synth_sgid;
 
     /* Stripe/mirror layout (regular files only) */
     uint32_t            stripe_count;
@@ -942,6 +967,23 @@ struct mds_config {
     char                ds_synth_secret_file[256];
     uint8_t             ds_synth_secret[32];
     uint32_t            ds_synth_secret_len; /**< 0 = unconfigured, 32 = active */
+
+    /*
+     * RFC 8435 §2.2: stored synthetic-owner DS decoupling.
+     *
+     * When true, each regular file gets a random, unguessable synthetic
+     * (suid, sgid) generated when its DS backing file is first created
+     * (prestage or the DS_PENDING fallback).  The DS file is chowned to
+     * that pair once, at creation time, off the RPC path; the pair is
+     * stored on the inode (synth_suid/synth_sgid columns).  LAYOUTGET
+     * then advertises the stored synthetic (suid, sgid) in
+     * ffl_user/ffl_group and performs NO chown -- DS access is fully
+     * decoupled from the file's owner uid/gid, which the MDS alone
+     * enforces for metadata.  This removes the per-LAYOUTGET DS chown
+     * (and the async-chown race where a client reaches the DS before the
+     * chown lands).  Default false -> legacy owner-aligned chown path.
+     */
+    bool                ds_synth_owner;
 
     /*
      * Logging (src/common/log.c).  log_file is the diagnostics output

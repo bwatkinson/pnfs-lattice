@@ -305,4 +305,11 @@ void ds_prealloc_batch_result_destroy(
 void ds_prealloc_test_enable_synthetic_fh(struct ds_prealloc_ctx *ctx,
                                           bool enabled);
 
+/*
+ * Enable RFC 8435 S2.2 stored synthetic DS owner (ds_synth_owner).  When
+ * on, prestage generates + chowns a random synthetic (suid, sgid) per file
+ * and carries it to the inode; LAYOUTGET advertises it with no chown.
+ */
+void ds_prealloc_set_synth_owner(struct ds_prealloc_ctx *ctx, bool enabled);
+
 #endif /* DS_PREALLOC_H */

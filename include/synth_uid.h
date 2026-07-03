@@ -21,7 +21,11 @@
 #define SYNTH_UID_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <string.h>
+#include <time.h>
+#include <sys/types.h>
+#include <sys/random.h>
 #include <openssl/hmac.h>
 
 /* Synthetic UID range: 0x40000000 .. 0x7FFFFFFF (1 Gi namespace). */
@@ -62,6 +66,34 @@ static inline uint32_t synth_uid_from_secret(
     /* First 4 bytes of digest → uid, clamped to synthetic range. */
     memcpy(&raw, digest, 4);
     return (raw & SYNTH_UID_MASK) | SYNTH_UID_BASE;
+}
+
+/*
+ * RFC 8435 §2.2 stored-synthetic-owner mode (ds_synth_owner).
+ *
+ * Generate a fresh, random, UNGUESSABLE synthetic (suid, sgid) for a file
+ * when its first DS backing file is created (prestage or DS_PENDING
+ * fallback).  Unlike synth_uid_from_secret() this is NOT a function of
+ * fileid -- the value is generated once and STORED on the inode, so a
+ * client cannot compute another file's synth id and reach its DS data
+ * directly (the metadata check on the MDS stays authoritative).  Both ids
+ * are clamped to [0x40000000, 0x7FFFFFFF] so they never collide with real
+ * local users on the DS host.  On CSPRNG failure we fall back to a
+ * high-entropy time/pointer mix -- degraded but still non-static.
+ */
+static inline void mds_ds_synth_gen(uint32_t *suid, uint32_t *sgid)
+{
+    uint32_t r[2] = { 0U, 0U };
+    if (getrandom(r, sizeof(r), 0) != (ssize_t)sizeof(r)) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        r[0] = (uint32_t)((uint64_t)ts.tv_nsec * 2654435761ULL)
+             ^ (uint32_t)(uintptr_t)suid;
+        r[1] = (uint32_t)((uint64_t)ts.tv_sec * 2246822519ULL)
+             ^ (uint32_t)(uintptr_t)sgid;
+    }
+    if (suid != NULL) { *suid = (r[0] & SYNTH_UID_MASK) | SYNTH_UID_BASE; }
+    if (sgid != NULL) { *sgid = (r[1] & SYNTH_UID_MASK) | SYNTH_UID_BASE; }
 }
 
 #endif /* SYNTH_UID_H */

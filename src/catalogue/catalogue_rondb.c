@@ -558,6 +558,9 @@ enum mds_status catalogue_rondb_ns_create(
 	uint8_t stripe_buf[256];
 	uint32_t stripe_buf_len = 0;
 	uint32_t stripe_count_for_create = 0;
+	/* v8: synth owner carried out of the pop block onto the child inode. */
+	uint32_t child_synth_suid = 0;
+	uint32_t child_synth_sgid = 0;
 
 	if (type == MDS_FTYPE_REG && prealloc != NULL) {
 		struct mds_ds_map_entry ds_entry;
@@ -577,6 +580,8 @@ enum mds_status catalogue_rondb_ns_create(
 			}
 			stripe_buf_len = 8 + ds_entry.nfs_fh_len;
 			stripe_count_for_create = 1;
+			child_synth_suid = ds_entry.synth_suid;
+			child_synth_sgid = ds_entry.synth_sgid;
 		}
 	}
 
@@ -596,6 +601,8 @@ enum mds_status catalogue_rondb_ns_create(
 	child.mode = mode;
 	child.uid = uid;
 	child.gid = gid;
+	child.synth_suid = child_synth_suid;  /* v8 stored synthetic DS owner */
+	child.synth_sgid = child_synth_sgid;
 	child.atime = now;
 	child.mtime = now;
 	child.ctime = now;
@@ -2389,6 +2396,9 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
 	uint8_t stripe_buf[256];
 	uint32_t stripe_buf_len = 0;
 	uint32_t stripe_count_for_create = 0;
+	/* v8: synth owner carried out of the pop block onto the child inode. */
+	uint32_t child_synth_suid = 0;
+	uint32_t child_synth_sgid = 0;
 
 	uint64_t child_fid = 0;
 	if (type == MDS_FTYPE_REG && prealloc != NULL) {
@@ -2413,6 +2423,8 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
 			}
 			stripe_buf_len = 8 + ds_entry.nfs_fh_len;
 			stripe_count_for_create = 1;
+			child_synth_suid = ds_entry.synth_suid;
+			child_synth_sgid = ds_entry.synth_sgid;
 
 			/*
 			 * Surface the popped entry to the caller so a
@@ -2445,6 +2457,8 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
 	child.mode = mode;
 	child.uid = uid;
 	child.gid = gid;
+	child.synth_suid = child_synth_suid;  /* v8 stored synthetic DS owner */
+	child.synth_sgid = child_synth_sgid;
 	child.atime = now;
 	child.mtime = now;
 	child.ctime = now;

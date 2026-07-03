@@ -503,6 +503,11 @@ static void fence_ds_file_for_fileid(
     for (uint32_t idx = 0; idx < total; idx++) {
         uint32_t stripe = idx / mc;
         uint32_t mirror = idx % mc;
+        if (entries[idx].ds_id >= 65536U) {
+            /* Skip corrupt/garbage ds_id (pre-fix persisted rows): the
+             * DS mount cannot resolve it, so avoid find_mount warn spam. */
+            continue;
+        }
         enum mds_status fst = mds_proxy_fence_ds_file(
             proxy, entries[idx].ds_id, fileid, stripe, mirror);
         if (fst != MDS_OK) {

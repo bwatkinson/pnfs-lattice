@@ -2196,15 +2196,30 @@ fill_layoutget_result:
 		 * synthetic uid inline.
 		 *
 		 * ffl_group stays tied to the inode gid in both modes. */
+		/*
+		 * v8 RFC 8435 S2.2 stored synthetic owner: when enabled and
+		 * the inode carries a stored synth pair (chowned onto the DS
+		 * files at prestage), advertise it directly and do NO chown
+		 * here -- DS access is decoupled from the owner uid/gid, and
+		 * there is no async-chown race because the DS file was already
+		 * chowned before the layout is handed out.  Legacy inodes
+		 * (synth==0) and disabled mode fall through to the prior path.
+		 */
+		const bool use_stored_synth =
+			(cd->cfg != NULL && cd->cfg->ds_synth_owner &&
+			 inode.synth_suid != 0U);
 		const bool use_synth_uid =
-			(cd->cfg != NULL &&
+			(!use_stored_synth && cd->cfg != NULL &&
 			 cd->cfg->ds_synth_secret_len > 0);
 		const uint32_t ffl_user_value =
+			use_stored_synth ? inode.synth_suid :
 			use_synth_uid ? 0U :
 			((a->iomode == LAYOUTIOMODE4_READ)
 				? cd->cred_uid
 				: 0U);
-		const uint32_t ffl_group_value = (uint32_t)inode.gid;
+		const uint32_t ffl_group_value =
+			use_stored_synth ? inode.synth_sgid
+					 : (uint32_t)inode.gid;
 
 		/*
 		 * Align DS backing-file ownership with the credentials
@@ -2217,7 +2232,7 @@ fill_layoutget_result:
 		 * client will simply observe NFS4ERR_ACCESS on the DS
 		 * READ/WRITE and retry, matching today's behaviour.
 		 */
-		if (cd->proxy != NULL && entries != NULL) {
+		if (!use_stored_synth && cd->proxy != NULL && entries != NULL) {
 			const uint32_t total =
 				stripe_count * mirror_count;
 			for (uint32_t idx = 0; idx < total; idx++) {

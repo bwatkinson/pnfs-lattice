@@ -51,6 +51,7 @@
 #include "proxy_io.h"
 #include "mds_metrics.h"
 #include "pnfs_mds.h"
+#include "synth_uid.h"    /* mds_ds_synth_gen */
 
 #define DS_PREALLOC_DEFAULT_STRIPE_UNIT  ((uint32_t)(64U * 1024U))
 #define DS_PREALLOC_DEFAULT_RING_COUNT   4U
@@ -125,6 +126,7 @@ struct ds_prealloc_ctx {
 
     _Atomic bool                stop;
     bool                        synthetic_fh;
+    bool                        synth_owner;   /* v8: ds_synth_owner mode */
 };
 
 /* -----------------------------------------------------------------------
@@ -258,12 +260,34 @@ static int produce_slot(struct ds_prealloc_ctx *ctx,
         synth_fh(&entry, fileid);
     }
 
+    /*
+     * v8: RFC 8435 S2.2 stored synthetic DS owner.  Generate a random
+     * unguessable (suid, sgid), chown the just-created DS backing file to
+     * it ONCE here in prestage (off the client RPC path), and carry the
+     * pair with the slot so it lands on the inode at create and is
+     * advertised by LAYOUTGET -- no per-LAYOUTGET chown, no async-chown
+     * race.  Best-effort: on chown failure the pair stays 0 and this file
+     * falls back to the legacy owner-aligned path.
+     */
+    entry.synth_suid = 0;
+    entry.synth_sgid = 0;
+    if (ctx->synth_owner && ctx->proxy != NULL) {
+        uint32_t suid = 0, sgid = 0;
+        mds_ds_synth_gen(&suid, &sgid);
+        if (mds_proxy_set_ds_owner_explicit(ctx->proxy, entry.ds_id, fileid,
+                0, 0, (uid_t)suid, (gid_t)sgid) == MDS_OK) {
+            entry.synth_suid = suid;
+            entry.synth_sgid = sgid;
+        }
+    }
+
     memset(slot, 0, sizeof(*slot));
     slot->fileid      = fileid;
     slot->stripe_unit = ctx->stripe_unit;
     slot->entry       = entry;
 
-    /* Best-effort persistence (ignored when the backend lacks pool ops). */
+    /* Best-effort persistence (ignored when the backend lacks pool ops).
+     * v8 synth is NOT persisted here (deferred) -- see rondb_shim note. */
     (void)mds_cat_prealloc_pool_insert(
         (struct mds_catalogue *)ctx->cat, fileid, entry.ds_id,
         entry.nfs_fh, entry.nfs_fh_len, ctx->self_mds_id,
@@ -949,4 +973,15 @@ void ds_prealloc_test_enable_synthetic_fh(struct ds_prealloc_ctx *ctx,
         return;
     }
     ctx->synthetic_fh = enabled;
+}
+
+/* v8: enable RFC 8435 S2.2 stored synthetic DS owner.  Called at daemon
+ * init from cfg->ds_synth_owner.  When on, prestage generates + chowns a
+ * random synth (suid, sgid) per file and carries it to the inode. */
+void ds_prealloc_set_synth_owner(struct ds_prealloc_ctx *ctx, bool enabled)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    ctx->synth_owner = enabled;
 }

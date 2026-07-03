@@ -1490,6 +1490,30 @@ static void rondb_set_inode_values(NdbOperation *op,
     (void)rondb_set_value_u64(op, RONDB_INO_COL_CREATE_VERF, ino->create_verf);
     (void)rondb_set_value_u64(op, RONDB_INO_COL_PARENT, ino->parent_fileid);
     op->setValue(RONDB_INO_COL_HOME_SHARD, shard);
+    /* NOTE: synth_suid/synth_sgid (v8 stored synthetic DS owner) are
+     * deliberately NOT written here.  This helper is shared by create
+     * (insertTuple) and read-modify-write (updateTuple).  An updateTuple
+     * that does not setValue the synth columns leaves them unchanged, so
+     * every RMW path (setattr, nlink adjust, ...) preserves the stored
+     * pair automatically.  The synth columns are stamped once, explicitly,
+     * at the create-insert sites (rondb_set_inode_synth). */
+}
+
+/* Stamp the v8 synthetic DS owner on a create-insert op.  Call right after
+ * rondb_set_inode_values() on an insertTuple.  GUARDED on getColumn so a
+ * cluster whose mds_inodes table predates v8 (columns not yet added) still
+ * accepts creates -- the file simply has no stored synth and falls back to
+ * the legacy owner-chown layout path. */
+static void rondb_set_inode_synth(NdbOperation *op,
+                                  const NdbDictionary::Table *tbl,
+                                  const struct mds_inode *ino)
+{
+    if (tbl == nullptr ||
+        tbl->getColumn(RONDB_INO_COL_SYNTH_SUID) == nullptr) {
+        return;
+    }
+    op->setValue(RONDB_INO_COL_SYNTH_SUID, ino->synth_suid);
+    op->setValue(RONDB_INO_COL_SYNTH_SGID, ino->synth_sgid);
 }
 
 static int rondb_compare_name_bytes(const char *lhs, size_t lhs_len,
@@ -1738,6 +1762,20 @@ static void rondb_add_unsigned(NdbDictionary::Table &tbl, const char *name)
     tbl.addColumn(col);
 }
 
+/* Nullable + DYNAMIC Unsigned column.  NDB only permits an ONLINE ADD
+ * COLUMN when the new column is nullable (or has a default) AND dynamically
+ * formatted, so the same definition is used both in a fresh table and in the
+ * v8 online ALTER that adds synth_suid/synth_sgid to existing tables. */
+static void rondb_add_unsigned_dyn(NdbDictionary::Table &tbl, const char *name)
+{
+    NdbDictionary::Column col;
+    col.setName(name);
+    col.setType(NdbDictionary::Column::Unsigned);
+    col.setNullable(true);
+    col.setDynamic(true);
+    tbl.addColumn(col);
+}
+
 static void rondb_add_tinyunsigned(NdbDictionary::Table &tbl, const char *name)
 {
     NdbDictionary::Column col;
@@ -1810,6 +1848,10 @@ static int rondb_define_inodes_table(NdbDictionary::Dictionary *dict)
     rondb_add_bigunsigned(tbl, RONDB_INO_COL_CREATE_VERF, false, false);
     rondb_add_bigunsigned(tbl, RONDB_INO_COL_PARENT, false, false);
     rondb_add_unsigned(tbl, RONDB_INO_COL_HOME_SHARD);
+    /* v8: stored synthetic DS owner (RFC 8435 S2.2).  Nullable/dynamic so
+     * the same columns can be added to pre-v8 tables via online ALTER. */
+    rondb_add_unsigned_dyn(tbl, RONDB_INO_COL_SYNTH_SUID);
+    rondb_add_unsigned_dyn(tbl, RONDB_INO_COL_SYNTH_SGID);
     return rondb_create_table_if_not_exists(dict, tbl);
 }
 
@@ -2389,7 +2431,46 @@ static int rondb_define_prealloc_pool_table(NdbDictionary::Dictionary *dict)
     rondb_add_unsigned(tbl, RONDB_PP_COL_NFS_FH_LEN);
     rondb_add_varbinary(tbl, RONDB_PP_COL_NFS_FH, MDS_NFS_FH_MAX,
                         false, false);
+    /* v8: synth owner the prestaged DS file was chowned to (carried so a
+     * recovered slot needs no re-chown).  Nullable/dynamic for online ALTER. */
+    rondb_add_unsigned_dyn(tbl, RONDB_PP_COL_SYNTH_SUID);
+    rondb_add_unsigned_dyn(tbl, RONDB_PP_COL_SYNTH_SGID);
     return rondb_create_table_if_not_exists(dict, tbl);
+}
+
+/* v8: online ADD COLUMN of two nullable + dynamic Unsigned columns to an
+ * existing PERSISTENT table, preserving all rows.  Idempotent: returns 0
+ * when col1 is already present, or when the table is absent (the DDL pass
+ * then creates it fresh with the columns already in its definition). */
+static int rondb_alter_add_synth_cols(NdbDictionary::Dictionary *dict,
+                                      const char *tblname,
+                                      const char *col1, const char *col2)
+{
+    const NdbDictionary::Table *old = dict->getTable(tblname);
+    if (old == nullptr) { return 0; }
+    if (old->getColumn(col1) != nullptr) { return 0; }
+
+    NdbDictionary::Table altered = *old;
+    rondb_add_unsigned_dyn(altered, col1);
+    rondb_add_unsigned_dyn(altered, col2);
+
+    /* Online schema changes in NDB must run inside a schema transaction. */
+    if (dict->beginSchemaTrans() != 0) {
+        return rondb_report_error(dict->getNdbError(),
+                                  "alter_add_synth beginSchemaTrans");
+    }
+    if (dict->alterTable(*old, altered) != 0) {
+        NdbError e = dict->getNdbError();
+        (void)dict->endSchemaTrans(
+            NdbDictionary::Dictionary::SchemaTransAbort);
+        return rondb_report_error(e, "alter_add_synth alterTable");
+    }
+    if (dict->endSchemaTrans() != 0) {
+        return rondb_report_error(dict->getNdbError(),
+                                  "alter_add_synth endSchemaTrans");
+    }
+    dict->invalidateTable(tblname);
+    return 0;
 }
 
 /*
@@ -2772,6 +2853,18 @@ int rondb_shim_bootstrap_metadata(void *handle, const char *schema)
                             &schema_version) != 0) {
         return -1;
     }
+    /*
+     * v8 stored synthetic DS owner columns -- added IDEMPOTENTLY and
+     * UNCONDITIONALLY (not gated on the schema-version bump) so a cluster
+     * whose version was advanced by an earlier attempt that failed to add
+     * the columns still self-heals on the next start.  No-op once present.
+     * Non-fatal: on ALTER failure the columns stay absent and the
+     * getColumn-guarded write path falls back to the legacy layout chown.
+     */
+    (void)rondb_alter_add_synth_cols(dict, RONDB_TBL_INODES,
+            RONDB_INO_COL_SYNTH_SUID, RONDB_INO_COL_SYNTH_SGID);
+    (void)rondb_alter_add_synth_cols(dict, RONDB_TBL_PREALLOC_POOL,
+            RONDB_PP_COL_SYNTH_SUID, RONDB_PP_COL_SYNTH_SGID);
     if (schema_version < RONDB_SCHEMA_VERSION) {
         /* Upgrade: bump schema version to current. */
         std::fprintf(stderr,
@@ -2800,6 +2893,21 @@ int rondb_shim_bootstrap_metadata(void *handle, const char *schema)
              * ALTER.  mds_prealloc_pool is created by the DDL pass above. */
             (void)rondb_drop_table_if_exists(dict, RONDB_TBL_GC_QUEUE);
             if (rondb_define_gc_queue_table(dict) != 0) {
+                return -1;
+            }
+        }
+        if (schema_version < 8) {
+            /* v7 -> v8: mds_inodes + mds_prealloc_pool gain synth_suid/
+             * synth_sgid (RFC 8435 S2.2 stored synthetic DS owner).  These
+             * tables are PERSISTENT (namespace + prestaged slots), so use an
+             * ONLINE ADD COLUMN (nullable + dynamic) rather than drop/recreate.
+             * Idempotent: skipped when the columns already exist. */
+            if (rondb_alter_add_synth_cols(dict, RONDB_TBL_INODES,
+                    RONDB_INO_COL_SYNTH_SUID, RONDB_INO_COL_SYNTH_SGID) != 0) {
+                return -1;
+            }
+            if (rondb_alter_add_synth_cols(dict, RONDB_TBL_PREALLOC_POOL,
+                    RONDB_PP_COL_SYNTH_SUID, RONDB_PP_COL_SYNTH_SGID) != 0) {
                 return -1;
             }
         }
@@ -3060,6 +3168,15 @@ int rondb_shim_inode_get(void *handle, uint64_t fileid,
     NdbRecAttr *a_verf     = op->getValue(RONDB_INO_COL_CREATE_VERF, nullptr);
     NdbRecAttr *a_parent   = op->getValue(RONDB_INO_COL_PARENT, nullptr);
     NdbRecAttr *a_shard    = op->getValue(RONDB_INO_COL_HOME_SHARD, nullptr);
+    /* v8 stored synthetic DS owner.  GUARDED: requesting a column the table
+     * doesn't have (cluster predating v8, ALTER unsupported) aborts the whole
+     * read transaction (NDB 4350).  Skip the getValue when absent -> packed 0. */
+    const bool have_synth =
+        (tbl->getColumn(RONDB_INO_COL_SYNTH_SUID) != nullptr);
+    NdbRecAttr *a_ssuid    = have_synth
+        ? op->getValue(RONDB_INO_COL_SYNTH_SUID, nullptr) : nullptr;
+    NdbRecAttr *a_ssgid    = have_synth
+        ? op->getValue(RONDB_INO_COL_SYNTH_SGID, nullptr) : nullptr;
 
     if (tx->execute(NdbTransaction::Commit) == -1) {
         err = tx->getNdbError();
@@ -3098,6 +3215,11 @@ int rondb_shim_inode_get(void *handle, uint64_t fileid,
         fdb_put_u64(p, a_verf->u_64_value());                p += 8;
         fdb_put_u64(p, a_parent->u_64_value());              p += 8;
         fdb_put_u32(p, a_shard->u_32_value());               p += 4;
+        /* v8 synth trailer (NULL-safe: pre-v8 rows -> 0). */
+        fdb_put_u32(p, (a_ssuid != nullptr && !a_ssuid->isNULL())
+                        ? a_ssuid->u_32_value() : 0U);       p += 4;
+        fdb_put_u32(p, (a_ssgid != nullptr && !a_ssgid->isNULL())
+                        ? a_ssgid->u_32_value() : 0U);       p += 4;
     }
 
     rondb_get_ndb(state)->closeTransaction(tx);
@@ -3560,6 +3682,12 @@ int rondb_shim_ns_lookup(void *handle, uint64_t parent_fileid,
     NdbRecAttr *a_verf   = ino_op->getValue(RONDB_INO_COL_CREATE_VERF, nullptr);
     NdbRecAttr *a_parent = ino_op->getValue(RONDB_INO_COL_PARENT, nullptr);
     NdbRecAttr *a_shard  = ino_op->getValue(RONDB_INO_COL_HOME_SHARD, nullptr);
+    const bool have_synth =
+        (ino_tbl->getColumn(RONDB_INO_COL_SYNTH_SUID) != nullptr);
+    NdbRecAttr *a_ssuid  = have_synth
+        ? ino_op->getValue(RONDB_INO_COL_SYNTH_SUID, nullptr) : nullptr;
+    NdbRecAttr *a_ssgid  = have_synth
+        ? ino_op->getValue(RONDB_INO_COL_SYNTH_SGID, nullptr) : nullptr;
 
     /* Commit -- both reads complete in this single round-trip. */
     if (tx->execute(NdbTransaction::Commit) == -1) {
@@ -3600,6 +3728,11 @@ int rondb_shim_ns_lookup(void *handle, uint64_t parent_fileid,
         fdb_put_u64(p, a_verf->u_64_value());                p += 8;
         fdb_put_u64(p, a_parent->u_64_value());              p += 8;
         fdb_put_u32(p, a_shard->u_32_value());               p += 4;
+        /* v8 synth trailer (NULL-safe: pre-v8 rows -> 0). */
+        fdb_put_u32(p, (a_ssuid != nullptr && !a_ssuid->isNULL())
+                        ? a_ssuid->u_32_value() : 0U);       p += 4;
+        fdb_put_u32(p, (a_ssgid != nullptr && !a_ssgid->isNULL())
+                        ? a_ssgid->u_32_value() : 0U);       p += 4;
     }
 
     rondb_get_ndb(state)->closeTransaction(tx);
@@ -4445,6 +4578,8 @@ int rondb_shim_ns_nlink_adjust(void *handle, uint64_t fileid, int32_t delta)
     NdbRecAttr *a_verf;
     NdbRecAttr *a_parent;
     NdbRecAttr *a_shard;
+    NdbRecAttr *a_ssuid;
+    NdbRecAttr *a_ssgid;
     NdbError err;
     struct mds_inode ino;
     uint32_t shard;
@@ -4495,6 +4630,13 @@ int rondb_shim_ns_nlink_adjust(void *handle, uint64_t fileid, int32_t delta)
     a_verf = op->getValue(RONDB_INO_COL_CREATE_VERF, nullptr);
     a_parent = op->getValue(RONDB_INO_COL_PARENT, nullptr);
     a_shard = op->getValue(RONDB_INO_COL_HOME_SHARD, nullptr);
+    if (tbl->getColumn(RONDB_INO_COL_SYNTH_SUID) != nullptr) {
+        a_ssuid = op->getValue(RONDB_INO_COL_SYNTH_SUID, nullptr);
+        a_ssgid = op->getValue(RONDB_INO_COL_SYNTH_SGID, nullptr);
+    } else {
+        a_ssuid = nullptr;
+        a_ssgid = nullptr;
+    }
 
     if (tx->execute(NdbTransaction::NoCommit) == -1) {
         err = tx->getNdbError();
@@ -4525,7 +4667,12 @@ int rondb_shim_ns_nlink_adjust(void *handle, uint64_t fileid, int32_t delta)
         fdb_put_u32(p, a_flags->u_32_value());       p += 4;
         fdb_put_u64(p, a_verf->u_64_value());        p += 8;
         fdb_put_u64(p, a_parent->u_64_value());      p += 8;
-        fdb_put_u32(p, a_shard->u_32_value());
+        fdb_put_u32(p, a_shard->u_32_value());       p += 4;
+        /* v8 synth trailer (NULL-safe: pre-v8 rows -> 0). */
+        fdb_put_u32(p, (a_ssuid != nullptr && !a_ssuid->isNULL())
+                        ? a_ssuid->u_32_value() : 0U);       p += 4;
+        fdb_put_u32(p, (a_ssgid != nullptr && !a_ssgid->isNULL())
+                        ? a_ssgid->u_32_value() : 0U);       p += 4;
     }
 
     if (rondb_inode_deserialize(buf, sizeof(buf), &ino, &shard) != 0) {
@@ -6236,6 +6383,7 @@ int rondb_shim_ns_create(void *handle,
     op_child->insertTuple();
     (void)rondb_equal_u64(op_child, RONDB_INO_COL_FILEID, child_ino.fileid);
     rondb_set_inode_values(op_child, &child_ino, child_shard);
+    rondb_set_inode_synth(op_child, ino_tbl, &child_ino);  /* v8: stamp synth */
 
     /* 3. Interpreted parent inode update (atomic nlink + change). */
     if (!(g_relax_dir_change && parent_nlink_delta == 0) &&
@@ -6465,6 +6613,7 @@ int rondb_shim_ns_create_with_layout(
     (void)rondb_equal_u64(op_child, RONDB_INO_COL_FILEID,
                           child_ino.fileid);
     rondb_set_inode_values(op_child, &child_ino, child_shard);
+    rondb_set_inode_synth(op_child, ino_tbl, &child_ino);  /* v8: stamp synth */
     track(op_child, "child_inode");
 
     /* 3. Atomic parent update. */
@@ -8880,6 +9029,11 @@ int rondb_shim_prealloc_pool_insert(void *handle, uint64_t fileid,
                                     uint32_t fh_len, uint32_t owner_mds_id,
                                     uint32_t stripe_unit)
 {
+    /* NOTE: v8 synth_suid/synth_sgid pool persistence is deferred; the
+     * columns exist (written as NULL) so a recovered slot's synth is 0 and
+     * that file falls back to the legacy owner-chown path.  In-ring slots
+     * created this run carry synth directly (produce_slot), so steady-state
+     * prestage is unaffected. */
     rondb_shim_handle *state = rondb_checked_handle(handle, nullptr);
     NdbDictionary::Dictionary *dict;
     const NdbDictionary::Table *tbl;
@@ -8988,6 +9142,7 @@ int rondb_shim_prealloc_pool_scan(void *handle, uint32_t owner_mds_id,
     NdbTransaction *tx;
     NdbScanOperation *scan;
     NdbRecAttr *a_fid, *a_dsid, *a_owner, *a_su, *a_fhlen, *a_fh;
+    NdbRecAttr *a_ssuid, *a_ssgid;
     NdbError err;
     int next_rc;
     std::vector<struct mds_prealloc_pool_row> rows;
@@ -9025,6 +9180,8 @@ int rondb_shim_prealloc_pool_scan(void *handle, uint32_t owner_mds_id,
     a_su    = scan->getValue(RONDB_PP_COL_STRIPE_UNIT, nullptr);
     a_fhlen = scan->getValue(RONDB_PP_COL_NFS_FH_LEN, nullptr);
     a_fh    = scan->getValue(RONDB_PP_COL_NFS_FH, nullptr);
+    a_ssuid = scan->getValue(RONDB_PP_COL_SYNTH_SUID, nullptr);
+    a_ssgid = scan->getValue(RONDB_PP_COL_SYNTH_SGID, nullptr);
 
     if (tx->execute(NdbTransaction::NoCommit) == -1) {
         err = tx->getNdbError();
@@ -9051,6 +9208,10 @@ int rondb_shim_prealloc_pool_scan(void *handle, uint32_t owner_mds_id,
             if (vb_len > MDS_NFS_FH_MAX) { vb_len = MDS_NFS_FH_MAX; }
             std::memcpy(r.nfs_fh, fh_ptr + 1, vb_len);
         }
+        r.synth_suid = (a_ssuid != nullptr && !a_ssuid->isNULL())
+                        ? a_ssuid->u_32_value() : 0U;
+        r.synth_sgid = (a_ssgid != nullptr && !a_ssgid->isNULL())
+                        ? a_ssgid->u_32_value() : 0U;
         rows.push_back(r);
     }
     if (next_rc != 1) {

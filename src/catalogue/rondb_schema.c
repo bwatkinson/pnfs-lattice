@@ -50,7 +50,10 @@ int rondb_inode_serialize(const struct mds_inode *inode,
     fdb_put_u32(p, inode->flags);             p += 4;
     fdb_put_u64(p, inode->create_verf);       p += 8;
     fdb_put_u64(p, inode->parent_fileid);     p += 8;
-    fdb_put_u32(p, home_shard_id);
+    fdb_put_u32(p, home_shard_id);            p += 4;
+    /* v8 trailer: stored synthetic DS owner (0 when ds_synth_owner off). */
+    fdb_put_u32(p, inode->synth_suid);        p += 4;
+    fdb_put_u32(p, inode->synth_sgid);        p += 4;
 
     return RONDB_INODE_FIXED_SIZE;
 }
@@ -62,7 +65,7 @@ int rondb_inode_deserialize(const uint8_t *buf, size_t len,
     const uint8_t *p;
 
     if (buf == NULL || inode == NULL ||
-        len < RONDB_INODE_FIXED_SIZE) {
+        len < RONDB_INODE_V1_SIZE) {
         return -1;
     }
 
@@ -88,8 +91,18 @@ int rondb_inode_deserialize(const uint8_t *buf, size_t len,
     inode->flags          = fdb_get_u32(p);                p += 4;
     inode->create_verf    = fdb_get_u64(p);                p += 8;
     inode->parent_fileid  = fdb_get_u64(p);                p += 8;
-    if (home_shard_id != NULL) {
-        *home_shard_id    = fdb_get_u32(p);
+    {
+        uint32_t hs = fdb_get_u32(p);                      p += 4;
+        if (home_shard_id != NULL) {
+            *home_shard_id = hs;
+        }
+    }
+    /* v8 trailer: stored synthetic DS owner.  Present only in buffers
+     * serialized by v8+; pre-v8 (137-byte) buffers leave these at the
+     * memset-0 default (= ds_synth_owner off / legacy). */
+    if (len >= RONDB_INODE_FIXED_SIZE) {
+        inode->synth_suid = fdb_get_u32(p);                p += 4;
+        inode->synth_sgid = fdb_get_u32(p);                p += 4;
     }
 
     return 0;

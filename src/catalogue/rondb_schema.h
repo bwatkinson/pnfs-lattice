@@ -47,8 +47,11 @@
  */
 /* v7: mds_gc_queue gains owner_mds_id (per-MDS lazy-delete drain) and the
  *     mds_prealloc_pool table is added (persisted DS pre-creation ring).
- *     The 6->7 upgrade drops + recreates the transient gc_queue. */
-#define RONDB_SCHEMA_VERSION  7
+ *     The 6->7 upgrade drops + recreates the transient gc_queue.
+ * v8: mds_inodes + mds_prealloc_pool gain synth_suid/synth_sgid (RFC 8435
+ *     S2.2 stored synthetic DS owner).  Added via ONLINE ALTER (nullable,
+ *     dynamic) so persistent namespace rows are preserved. */
+#define RONDB_SCHEMA_VERSION  8
 
 /* -----------------------------------------------------------------------
  * Table names
@@ -132,6 +135,10 @@
 #define RONDB_INO_COL_CREATE_VERF  "create_verf"
 #define RONDB_INO_COL_PARENT       "parent_fileid"
 #define RONDB_INO_COL_HOME_SHARD   "home_shard_id"
+/* RFC 8435 S2.2 stored synthetic DS owner (ds_synth_owner mode).  Added in
+ * schema v8 via online ALTER; nullable so pre-v8 rows read back as 0. */
+#define RONDB_INO_COL_SYNTH_SUID   "synth_suid"
+#define RONDB_INO_COL_SYNTH_SGID   "synth_sgid"
 
 /* -----------------------------------------------------------------------
  * Column names -- mds_dirents
@@ -349,6 +356,11 @@
 #define RONDB_PP_COL_STRIPE_UNIT  "stripe_unit"
 #define RONDB_PP_COL_NFS_FH_LEN   "nfs_fh_len"
 #define RONDB_PP_COL_NFS_FH       "nfs_fh"
+/* v8: stored synthetic DS owner carried with the prestaged slot so a
+ * recovered slot keeps the (suid, sgid) its DS file was already chowned
+ * to -- no re-chown flood on restart.  Nullable (added via online ALTER). */
+#define RONDB_PP_COL_SYNTH_SUID   "synth_suid"
+#define RONDB_PP_COL_SYNTH_SGID   "synth_sgid"
 
 /* -----------------------------------------------------------------------
  * Column names -- mds_layout_state
@@ -456,10 +468,15 @@
  *   change(8) generation(8)
  *   flags(4) create_verf(8) parent_fileid(8)
  *   home_shard_id(4)
- * Total: 137 bytes
+ *   [v8 trailer] synth_suid(4) synth_sgid(4)
+ * Total: 137 bytes (v1 base) / 145 bytes (v8, with synth trailer)
  * ----------------------------------------------------------------------- */
 
-#define RONDB_INODE_FIXED_SIZE  137
+/* Base (pre-v8) size -- the minimum a buffer must contain to deserialize.
+ * The v8 synth trailer is optional: deserialize reads it only when present,
+ * so pre-v8 snapshots/marshals (137 bytes) still decode (synth -> 0). */
+#define RONDB_INODE_V1_SIZE     137
+#define RONDB_INODE_FIXED_SIZE  145
 #define RONDB_INODE_MAX_SIZE    256
 
 /** Serialize an inode to buf. Returns bytes written, or -1 on error. */

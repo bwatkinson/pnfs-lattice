@@ -363,3 +363,11 @@ void ds_prealloc_test_enable_synthetic_fh(struct ds_prealloc_ctx *ctx,
     (void)ctx;
     (void)enabled;
 }
+
+/* v8: no-op in the stub build (no prestage ring here).  Real prestage +
+ * synth generation lives in ds_prealloc.c (ENABLE_DS_PREALLOC=ON). */
+void ds_prealloc_set_synth_owner(struct ds_prealloc_ctx *ctx, bool enabled)
+{
+    (void)ctx;
+    (void)enabled;
+}

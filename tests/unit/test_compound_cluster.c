@@ -225,10 +225,20 @@ static void test_lookup_junction_returns_moved(void)
                                  NULL, &smap);
     ASSERT_EQ(st, MDS_OK);
 
+    /* A junction is a sticky directory whose EXACT path is a
+     * registered split boundary owned by another MDS.  The sticky
+     * bit alone is only the in-band marker (plain 01777 dirs must
+     * keep resolving normally), so register /foreign explicitly --
+     * this mirrors what subtree_split_execute does in production. */
+    st = subtree_map_add(smap, "/foreign", 3, "mds3.example",
+                         SUBTREE_ACTIVE, 1);
+    ASSERT_EQ(st, MDS_OK);
+
     struct compound_data cd;
     compound_init(&cd);
     cd.cat = cat;
     cd.smap = smap;
+    cd.mds_id = 1;  /* self -- differs from /foreign's owner (3) */
 
     struct nfs4_op ops[2];
     struct nfs4_result results[2];

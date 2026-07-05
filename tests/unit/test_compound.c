@@ -4506,6 +4506,64 @@ static void test_dac_disabled_or_non_authsys_permissive(void)
 	close_test_db(db, path);
 }
 
+/** rmdir of a non-empty directory must fail with NFS4ERR_NOTEMPTY. */
+static void test_remove_nonempty_dir_notempty(void)
+{
+	struct mds_catalogue *db;
+	struct compound_data cd;
+	struct nfs4_op ops[4];
+	struct nfs4_result res[4];
+	uint32_t n;
+	char *path;
+
+	db = open_test_db(&path);
+
+	/* mkdir full_dir; create a child inside it. */
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_create("full_dir", MDS_FTYPE_DIR, 0755);
+	ops[3] = mk_create("child", MDS_FTYPE_REG, 0644);
+	n = compound_process(&cd, ops, res, 4);
+	VERIFY(n == 4 && res[2].status == NFS4_OK && res[3].status == NFS4_OK);
+
+	/* REMOVE(full_dir) while it still holds the child -> NOTEMPTY. */
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_remove("full_dir");
+	n = compound_process(&cd, ops, res, 3);
+	ASSERT_EQ(n, (uint32_t)3);
+	ASSERT_EQ(res[2].status, NFS4ERR_NOTEMPTY);
+
+	/* Empty it, then REMOVE succeeds. */
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_lookup("full_dir");
+	ops[3] = mk_remove("child");
+	n = compound_process(&cd, ops, res, 4);
+	VERIFY(n == 4 && res[3].status == NFS4_OK);
+
+	compound_init(&cd);
+	cd.cat = g_test_cat;
+	cd.prealloc = g_prealloc;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_remove("full_dir");
+	n = compound_process(&cd, ops, res, 3);
+	ASSERT_EQ(n, (uint32_t)3);
+	ASSERT_EQ(res[2].status, NFS4_OK);
+
+	close_test_db(db, path);
+}
+
 /** Decoder-flagged oversize names surface NFS4ERR_NAMETOOLONG. */
 static void test_nametoolong_flag_paths(void)
 {
@@ -4690,6 +4748,7 @@ int main(void)
 	RUN_TEST(test_dac_dir_write_and_sticky);
 	RUN_TEST(test_dac_truncate_requires_write);
 	RUN_TEST(test_dac_disabled_or_non_authsys_permissive);
+	RUN_TEST(test_remove_nonempty_dir_notempty);
 	RUN_TEST(test_nametoolong_flag_paths);
 
 	fprintf(stdout, "\n%d/%d tests passed.\n", tests_passed, tests_run);

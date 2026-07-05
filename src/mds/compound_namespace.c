@@ -496,15 +496,21 @@ enum nfs4_status op_lookup(struct compound_data *cd,
 	 *
 	 * The sticky bit is only the in-band junction MARKER; the
 	 * subtree map is the authority.  A sticky directory with no
-	 * subtree-map entry is an ordinary POSIX restricted-deletion
-	 * directory (a 01777 tmp dir, pjdfstest's sticky fixtures) and
-	 * MUST NOT return MOVED — the previous marker-only check made
-	 * every S_ISVTX directory unreachable.  Real junctions are
-	 * pre-registered in the subtree map by the split machinery, so
-	 * requiring (a) a subtree map, (b) a map entry for the path,
-	 * and (c) a DIFFERENT owning MDS preserves genuine referrals
-	 * (self-owned junctions must resolve normally or clients
-	 * referral-loop). */
+	 * EXACT subtree-map entry is an ordinary POSIX restricted-
+	 * deletion directory (a 01777 tmp dir, pjdfstest's sticky
+	 * fixtures) and MUST NOT return MOVED — the previous marker-
+	 * only check made every S_ISVTX directory unreachable.  The
+	 * match must be EXACT, not longest-prefix: a prefix match
+	 * merely reports which subtree REGION contains the path (every
+	 * path matches the root entry), which says nothing about this
+	 * directory being a registered split boundary — and a stale or
+	 * foreign-owned root row would otherwise turn every sticky
+	 * directory into a phantom referral.  Real junctions are
+	 * registered with their exact path by the split machinery, so
+	 * requiring (a) a subtree map, (b) an exact map entry for the
+	 * path, and (c) a DIFFERENT owning MDS preserves genuine
+	 * referrals (self-owned junctions must resolve normally or
+	 * clients referral-loop). */
 	if (cd->smap != NULL &&
 	    !compound_next_op_requests_fs_locations(cd)) {
 		int is_junction = referral_is_junction(
@@ -528,8 +534,8 @@ enum nfs4_status op_lookup(struct compound_data *cd,
 					op->arg.lookup.name);
 			}
 #pragma GCC diagnostic pop
-			if (subtree_map_lookup(cd->smap, jpath,
-					       &se) == MDS_OK &&
+			if (subtree_map_lookup_exact(cd->smap, jpath,
+						     &se) == MDS_OK &&
 			    se.owner_mds_id != cd->mds_id) {
 				return NFS4ERR_MOVED;
 			}
@@ -821,9 +827,15 @@ enum nfs4_status op_getattr(struct compound_data *cd,
 		 * EBUSY (the RMDIR RPC is rejected by vfs_rmdir before
 		 * it ever reaches the server).  Self-owned junctions
 		 * need no client-side redirect — we are already the
-		 * authoritative MDS for the subtree. */
+		 * authoritative MDS for the subtree.
+		 *
+		 * Exact-match only (mirrors op_lookup): a longest-
+		 * prefix hit on an enclosing subtree (ultimately the
+		 * root entry) does not make this sticky directory a
+		 * registered split boundary. */
 		if (rp_st == MDS_OK &&
-		    subtree_map_lookup(cd->smap, jpath, &jse) == MDS_OK &&
+		    subtree_map_lookup_exact(cd->smap, jpath,
+					     &jse) == MDS_OK &&
 		    jse.owner_mds_id != cd->mds_id &&
 		    referral_build(cd->smap, jpath, &loc) == MDS_OK) {
 			res->res.getattr.has_referral = true;
@@ -1639,6 +1651,25 @@ enum nfs4_status op_remove(struct compound_data *cd,
 		nst = compound_sticky_delete_check(cd, &rm_parent, &rm_inode);
 		if (nst != NFS4_OK) {
 			return nst;
+		}
+	}
+	/*
+	 * RFC 8881 S18.25.4 / POSIX rmdir(2): removing a non-empty
+	 * directory MUST fail with NFS4ERR_NOTEMPTY.  The catalogue
+	 * remove primitive drops the dirent unconditionally, which
+	 * silently orphaned every child (nfstest_posix rmdir,
+	 * pjdfstest rmdir/06).  Same emptiness probe the RENAME
+	 * dir-overwrite path already uses; checked BEFORE any
+	 * delegation-notify / layout-recall side effects.
+	 */
+	if (st == MDS_OK && rm_inode.type == MDS_FTYPE_DIR &&
+	    cd->cat != NULL) {
+		bool rm_dir_empty = true;
+
+		if (mds_cat_dir_is_empty(cd->cat, rm_inode.fileid,
+					 &rm_dir_empty) == MDS_OK &&
+		    !rm_dir_empty) {
+			return NFS4ERR_NOTEMPTY;
 		}
 	}
 	bool rm_quota = (st == MDS_OK && cd->quota != NULL);

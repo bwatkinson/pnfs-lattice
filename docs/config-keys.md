@@ -55,6 +55,7 @@ are logged as `WARN:` and the default is kept.
 - `ds_count` — number of configured DSes.
 - `ds[N]` — `host:/export` spec for DS index N.
 - `ds_mount_path_fmt` — printf format with exactly one `%u` for mount paths.  Default: `/mnt/ds%u`.
+- `ds_fh_format` — `opaque|knfsd`.  Default: **opaque**.  Validation of DS server file handles captured on the `name_to_handle_at()` fast path.  RFC 8435 treats DS filehandles as opaque (flex-files layouts hand them to clients verbatim), so `opaque` — structural checks only — is required for NetApp ONTAP and other non-Linux data servers.  `knfsd` restores the legacy extra check that the first FH byte is Linux knfsd's `0x01` version byte.
 - `ds_heartbeat_ms` — DS probe interval.  Default: 5000.
 - `ds_health_fail_threshold` — consecutive failures before OFFLINE (1..1024).  Default: 6.
 - `ds_weight.<id>` — per-DS WRR weight (any uint32).  Default: 0 (unset ⇒ free-bytes fallback).

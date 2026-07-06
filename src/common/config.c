@@ -241,6 +241,12 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
     cfg->ds_prepare_queue_depth = 0; /* 0 = default 4096 */
     cfg->ds_prepare_workers = 0;     /* 0 = 1 per DS */
 
+    /* DS FH capture: server FHs are opaque by default (RFC 8435 --
+     * required for NetApp ONTAP and other non-knfsd data servers).
+     * Operators can pin the legacy knfsd-only validation with
+     * ds_fh_format = knfsd. */
+    cfg->ds_fh_knfsd_strict = false;
+
     /* DS GC drainer parallelism (clamped by ds_gc_start_ex). */
     cfg->ds_gc_workers = 4;
     cfg->ds_gc_batch_size = 256;
@@ -1111,6 +1117,17 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
         } else if (strcmp(key, "posix_dac") == 0) {
             cfg->posix_dac = (strcmp(val, "true") == 0 ||
                               strcmp(val, "1") == 0);
+        } else if (strcmp(key, "ds_fh_format") == 0) {
+            if (strcmp(val, "opaque") == 0) {
+                cfg->ds_fh_knfsd_strict = false;
+            } else if (strcmp(val, "knfsd") == 0) {
+                cfg->ds_fh_knfsd_strict = true;
+            } else {
+                (void)fprintf(stderr,
+                    "WARN: ds_fh_format='%s' unknown "
+                    "(expected opaque|knfsd); keeping default "
+                    "opaque\n", val);
+            }
 
         /* Authority / image split */
         } else if (strcmp(key, "catalog_image_mode") == 0) {

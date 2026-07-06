@@ -333,6 +333,81 @@ static void test_proxy_mirror_write(void)
 }
 
 /* -----------------------------------------------------------------------
+ * test_extract_server_fh_formats -- the opaque default accepts knfsd
+ * AND NetApp ONTAP server FHs (RFC 8435: DS FHs are opaque); strict
+ * knfsd mode pins the legacy 0x01 first byte.
+ * ----------------------------------------------------------------------- */
+
+/** Build a synthetic VFS f_handle payload: 12-byte NFS wrapper,
+ *  uint16 LE server-FH size at offset 12, raw server FH from 14. */
+static uint32_t mk_vfs_fh(uint8_t *buf, uint32_t cap,
+                          const uint8_t *server_fh, uint16_t fh_size)
+{
+    ASSERT_TRUE((uint32_t)(14 + fh_size) <= cap);
+    memset(buf, 0xAA, 12);            /* opaque NFS wrapper bytes */
+    buf[12] = (uint8_t)(fh_size & 0xFF);
+    buf[13] = (uint8_t)(fh_size >> 8);
+    memcpy(buf + 14, server_fh, fh_size);
+    return (uint32_t)(14 + fh_size);
+}
+
+static void test_extract_server_fh_formats(void)
+{
+    uint8_t vfs[160];
+    uint8_t out[128];
+    uint8_t knfsd_fh[36];
+    uint8_t ontap_fh[60];
+    uint32_t vlen;
+    uint32_t olen = 0;
+
+    /* Linux knfsd FH: version byte 0x01 first. */
+    memset(knfsd_fh, 0x5C, sizeof(knfsd_fh));
+    knfsd_fh[0] = 0x01;
+
+    /* NetApp ONTAP NFSv3 FH (rev2, 60 bytes): n3_utility carries
+     * the FH version in bits[3:0] (0x02) plus flag bits on top
+     * (NFS3NG_FH_NFLEXCACHE 0x20 here) -- NOT knfsd's 0x01. */
+    memset(ontap_fh, 0x7E, sizeof(ontap_fh));
+    ontap_fh[0] = 0x22;
+
+    /* knfsd FH accepted in both modes, both VFS handle types. */
+    vlen = mk_vfs_fh(vfs, sizeof(vfs), knfsd_fh,
+                     (uint16_t)sizeof(knfsd_fh));
+    ASSERT_EQ(mds_proxy_extract_server_fh(vfs, vlen, 13, false,
+                                          out, sizeof(out), &olen), 0);
+    ASSERT_EQ(olen, (uint32_t)sizeof(knfsd_fh));
+    ASSERT_EQ(memcmp(out, knfsd_fh, sizeof(knfsd_fh)), 0);
+    ASSERT_EQ(mds_proxy_extract_server_fh(vfs, vlen, 12, true,
+                                          out, sizeof(out), &olen), 0);
+
+    /* NetApp FH: accepted by the opaque default... */
+    vlen = mk_vfs_fh(vfs, sizeof(vfs), ontap_fh,
+                     (uint16_t)sizeof(ontap_fh));
+    ASSERT_EQ(mds_proxy_extract_server_fh(vfs, vlen, 13, false,
+                                          out, sizeof(out), &olen), 0);
+    ASSERT_EQ(olen, (uint32_t)sizeof(ontap_fh));
+    ASSERT_EQ(memcmp(out, ontap_fh, sizeof(ontap_fh)), 0);
+
+    /* ...but rejected by the legacy strict-knfsd mode. */
+    ASSERT_EQ(mds_proxy_extract_server_fh(vfs, vlen, 13, true,
+                                          out, sizeof(out), &olen), -1);
+
+    /* Structural rejects apply in every mode: non-NFS handle type,
+     * zero size, size beyond the payload, size beyond capacity. */
+    ASSERT_EQ(mds_proxy_extract_server_fh(vfs, vlen, 1, false,
+                                          out, sizeof(out), &olen), -1);
+    vfs[12] = 0; vfs[13] = 0;                      /* size = 0 */
+    ASSERT_EQ(mds_proxy_extract_server_fh(vfs, vlen, 13, false,
+                                          out, sizeof(out), &olen), -1);
+    vfs[12] = (uint8_t)(sizeof(ontap_fh) + 1);     /* beyond payload */
+    ASSERT_EQ(mds_proxy_extract_server_fh(vfs, vlen, 13, false,
+                                          out, sizeof(out), &olen), -1);
+    vfs[12] = (uint8_t)sizeof(ontap_fh);           /* restore size */
+    ASSERT_EQ(mds_proxy_extract_server_fh(vfs, vlen, 13, false,
+                                          out, 32, &olen), -1);
+}
+
+/* -----------------------------------------------------------------------
  * main
  * ----------------------------------------------------------------------- */
 
@@ -340,13 +415,16 @@ int main(void)
 {
     fprintf(stdout, "Running proxy I/O tests:\n");
 
-    /* Proxy I/O tests require DS stripe maps created via
+    RUN_TEST(test_extract_server_fh_formats);
+
+    /* Proxy I/O read/write tests require DS stripe maps created via
      * patched-DS synthetic FH derivation, which was removed.
      * Generic-only DS mode needs live NFS proxy mounts for
      * FH capture.  Skip until integration test harness
      * provides actual DS mounts. */
-    fprintf(stdout, "  (all skipped -- requires DS proxy mounts)\n");
+    fprintf(stdout,
+            "  (read/write tests skipped -- require DS proxy mounts)\n");
 
-    fprintf(stdout, "\n%d/%d tests passed.\n", 0, 0);
-    return 0;
+    fprintf(stdout, "\n%d/%d tests passed.\n", tests_passed, tests_run);
+    return (tests_passed == tests_run) ? 0 : 1;
 }

@@ -82,6 +82,46 @@ void mds_proxy_mount_set_ds_info(struct mds_proxy_ctx *ctx,
                                  const char *export_path);
 
 /**
+ * Select DS file-handle validation for the FH-capture fast path.
+ *
+ * RFC 8435 §2.1 treats DS filehandles as opaque, so the default
+ * (knfsd_strict = false, set at context creation) accepts any
+ * server FH that passes the structural VFS-wrapper checks --
+ * required for NetApp ONTAP and other non-Linux data servers.
+ * Enabling knfsd_strict additionally requires the first FH byte to
+ * be the Linux-knfsd version byte (0x01): the historical behaviour,
+ * useful only as an extra guard on all-knfsd deployments.
+ *
+ * @param ctx           Proxy context.  NULL is tolerated (no-op).
+ * @param knfsd_strict  true = require the knfsd 0x01 version byte.
+ */
+void mds_proxy_set_fh_knfsd_strict(struct mds_proxy_ctx *ctx,
+                                   bool knfsd_strict);
+
+/**
+ * Parse a VFS file_handle payload from an NFS mount and extract the
+ * embedded opaque server FH.
+ *
+ * Exposed for unit testing; production callers go through
+ * mds_proxy_ensure_ds_file_fh().
+ *
+ * @param f_handle      Raw f_handle bytes from name_to_handle_at().
+ * @param handle_bytes  Length of @a f_handle.
+ * @param handle_type   VFS handle type from name_to_handle_at().
+ * @param knfsd_strict  Require the knfsd 0x01 first FH byte.
+ * @param fh_out        Receives the server FH bytes.
+ * @param fh_cap        Capacity of @a fh_out.
+ * @param fh_len        Receives the server FH length.
+ * @return 0 on success, -1 on validation failure.
+ */
+int mds_proxy_extract_server_fh(const uint8_t *f_handle,
+                                uint32_t handle_bytes,
+                                int handle_type,
+                                bool knfsd_strict,
+                                uint8_t *fh_out, uint32_t fh_cap,
+                                uint32_t *fh_len);
+
+/**
  * @brief Clear (unregister) the mount entry for a given DS.
  *
  * After this call, proxy I/O will no longer route to ds_id.

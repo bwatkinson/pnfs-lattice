@@ -376,6 +376,21 @@ printf format with exactly one
 .B %u
 for DS mount paths.
 .TP
+.B ds_fh_format
+.I opaque|knfsd
+(default
+.BR opaque ).
+Validation of DS server file handles captured on the
+.BR name_to_handle_at ()
+fast path.  RFC 8435 treats DS filehandles as opaque (flex-files
+layouts hand them to clients verbatim), so
+.B opaque
+\(em structural checks only \(em is required for NetApp ONTAP and
+other non-Linux data servers.
+.B knfsd
+restores the legacy extra check that the first FH byte is the Linux
+knfsd version byte (0x01).
+.TP
 .B ds_heartbeat_ms
 .I uint
 (default

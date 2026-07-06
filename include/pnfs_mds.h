@@ -807,6 +807,26 @@ struct mds_config {
     uint8_t             ds_getdev_transport;
     uint16_t            ds_rdma_port;
 
+    /*
+     * DS file-handle format for the name_to_handle_at() FH-capture
+     * fast path (flex-files layouts / proxy I/O).
+     *
+     * RFC 8435 §2.1: DS filehandles are opaque to both the MDS and
+     * the client, so the default ("opaque") accepts any server FH
+     * that passes the structural checks on the VFS wrapper (NFS
+     * handle type + embedded size bounds).  This is required for
+     * non-Linux data servers -- e.g. NetApp ONTAP NFSv3 FHs are
+     * 48/56/60 bytes and lead with a version/flags byte
+     * (n3_utility), not knfsd's 0x01 version byte.
+     *
+     * "knfsd" additionally requires the first FH byte to be the
+     * Linux-knfsd version byte (0x01) -- the historical behaviour,
+     * useful only as an extra guard on all-knfsd deployments.
+     *
+     * INI key: ds_fh_format = opaque|knfsd.  Default: opaque.
+     */
+    bool                ds_fh_knfsd_strict;
+
     /* Sharding (Tier 3 Phase 3) */
     bool                shard_enabled;         /* Master switch. Default false. */
 

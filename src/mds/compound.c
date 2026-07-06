@@ -1319,6 +1319,7 @@ static enum nfs4_status dispatch_op(struct compound_data *cd,
 			cd->clientid,
 			a->lock_owner, a->lock_owner_len,
 			&open_sid_resolved,
+			a->new_lock_owner,
 			&res->res.lock.stateid, &conf);
 		/*
 		 * RFC 8881 §8.4.3 courtesy-client support: if the lock
@@ -1330,12 +1331,14 @@ static enum nfs4_status dispatch_op(struct compound_data *cd,
 				cd->lt, cd->st,
 				cd->current_fh.fileid) > 0) {
 				memset(&conf, 0, sizeof(conf));
+				res->res.lock.stateid = lock_sid_resolved;
 				rc = lock_acquire(cd->lt,
 					cd->current_fh.fileid,
 					a->lock_type, a->offset, a->length,
 					cd->clientid,
 					a->lock_owner, a->lock_owner_len,
 					&open_sid_resolved,
+					a->new_lock_owner,
 					&res->res.lock.stateid, &conf);
 			}
 		}
@@ -1347,6 +1350,11 @@ static enum nfs4_status dispatch_op(struct compound_data *cd,
 			res->res.lock.denied.owner_len = conf.owner_len;
 			memcpy(res->res.lock.denied.owner, conf.owner, conf.owner_len);
 			return NFS4ERR_DENIED;
+		}
+		if (rc > 0) {
+			/* BAD_STATEID / OLD_STATEID / INVAL from the lock
+			 * manager map straight onto the wire. */
+			return (enum nfs4_status)rc;
 		}
 		return (rc == 0) ? NFS4_OK : NFS4ERR_SERVERFAULT;
 	}
@@ -1383,7 +1391,10 @@ static enum nfs4_status dispatch_op(struct compound_data *cd,
 		res->res.locku.stateid = lock_sid_resolved;
 		rc = lock_release(cd->lt, &res->res.locku.stateid,
 			a->lock_type, a->offset, a->length);
-		if (rc == NFS4ERR_BAD_STATEID) { return NFS4ERR_BAD_STATEID; }
+		if (rc > 0) {
+			/* BAD_STATEID / OLD_STATEID / INVAL. */
+			return (enum nfs4_status)rc;
+		}
 		return (rc == 0) ? NFS4_OK : NFS4ERR_SERVERFAULT;
 	}
 	case OP_OPEN_DOWNGRADE:  return op_open_downgrade(cd, op, res);
@@ -1609,10 +1620,17 @@ static enum nfs4_status dispatch_op(struct compound_data *cd,
 			}
 		}
 		if (cd->lt != NULL) {
-			struct nfs4_stateid fs_sid = fs_resolved;
-			if (lock_release(cd->lt, &fs_sid, 0, 0, 0) == 0) {
+			int fs_rc = lock_free_stateid(cd->lt,
+						      fs_resolved.other);
+			if (fs_rc == 0) {
 				return NFS4_OK;
 			}
+			if (fs_rc == NFS4ERR_LOCKS_HELD) {
+				/* RFC 8881 S18.38.3: ranges still held. */
+				return NFS4ERR_LOCKS_HELD;
+			}
+			/* BAD_STATEID: not a lock stateid -- fall through
+			 * to the delegation / layout probes below. */
 		}
 		/* RFC 8881 §10.2.1: free a revoked delegation stateid. */
 		if (cd->dt != NULL) {

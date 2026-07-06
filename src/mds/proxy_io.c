@@ -365,6 +365,10 @@ static void fd_cache_invalidate_one(struct fd_cache *c, uint64_t fileid,
 struct mds_proxy_ctx {
     struct ds_mount mounts[MDS_PROXY_MAX_DS];
     struct fd_cache fdc;
+    /* FH-capture validation: false (default, from calloc) = opaque
+     * server FHs per RFC 8435 §2.1; true = legacy knfsd-only
+     * validation (require the 0x01 version byte). */
+    bool fh_knfsd_strict;
 };
 
 /* -----------------------------------------------------------------------
@@ -394,6 +398,15 @@ void mds_proxy_ctx_destroy(struct mds_proxy_ctx *ctx)
     if (ctx == NULL) { return; }
     fd_cache_destroy(&ctx->fdc);
     free(ctx);
+}
+
+void mds_proxy_set_fh_knfsd_strict(struct mds_proxy_ctx *ctx,
+                                   bool knfsd_strict)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    ctx->fh_knfsd_strict = knfsd_strict;
 }
 
 /* -----------------------------------------------------------------------
@@ -873,13 +886,13 @@ enum mds_status mds_proxy_ensure_ds_file(const struct mds_proxy_ctx *ctx,
 /* -----------------------------------------------------------------------
  * name_to_handle_at() FH extraction (primary, ~0.01ms syscall)
  *
- * On NFS v3 mounts, the VFS file_handle contains the DS's knfsd
+ * On NFS v3 mounts, the VFS file_handle contains the DS's opaque
  * server FH at a fixed offset.  This avoids the ~2-5ms NFS3 RPC.
  *
  * VFS handle layout (kernel 6.8+, NFSv3, handle_type=13):
  *   f_handle[0..11]  : VFS NFS wrapper (fs identity, opaque)
  *   f_handle[12..13] : uint16_t LE -- server FH size (e.g. 36)
- *   f_handle[14..]   : raw knfsd server FH (byte 0 = 0x01 version)
+ *   f_handle[14..]   : raw server FH bytes (opaque)
  * ----------------------------------------------------------------------- */
 
 /** NFS VFS handle types for an opaque server FH.
@@ -889,10 +902,9 @@ enum mds_status mds_proxy_ensure_ds_file(const struct mds_proxy_ctx *ctx,
  * observed on 6.8-era kernels) and 0x0c (12, observed on newer
  * kernels; also the historical parent-less encoding).  Both carry
  * the identical f_handle payload this extractor parses -- wrapper
- * bytes 0..11, uint16 LE server-FH size at offset 12, raw knfsd
- * server FH (0x01 version byte first) from offset 14 -- so accept
- * either and let the structural checks below (size bounds + knfsd
- * version byte) do the real validation. */
+ * bytes 0..11, uint16 LE server-FH size at offset 12, raw server
+ * FH bytes from offset 14 -- so accept either and let the
+ * structural checks below (size bounds) do the real validation. */
 #define NFS_FH_HANDLE_TYPE          13
 #define NFS_FH_HANDLE_TYPE_NOPARENT 12
 
@@ -902,16 +914,70 @@ enum mds_status mds_proxy_ensure_ds_file(const struct mds_proxy_ctx *ctx,
 /** Byte offset of the server FH data within f_handle. */
 #define NFS_VFS_FH_DATA_OFFSET 14
 
+int mds_proxy_extract_server_fh(const uint8_t *f_handle,
+                                uint32_t handle_bytes,
+                                int handle_type,
+                                bool knfsd_strict,
+                                uint8_t *fh_out, uint32_t fh_cap,
+                                uint32_t *fh_len)
+{
+    uint16_t server_fh_size;
+
+    if (f_handle == NULL || fh_out == NULL || fh_len == NULL) {
+        return -1;
+    }
+
+    /* Validate handle type -- must be an NFS opaque FH (either
+     * encoding; see the NFS_FH_HANDLE_TYPE* comment above). */
+    if (handle_type != NFS_FH_HANDLE_TYPE &&
+        handle_type != NFS_FH_HANDLE_TYPE_NOPARENT) {
+        return -1;
+    }
+
+    /* Extract server FH size (uint16 LE at offset 12 in f_handle). */
+    if (handle_bytes < NFS_VFS_FH_DATA_OFFSET + 1) {
+        return -1;
+    }
+    server_fh_size = (uint16_t)f_handle[NFS_VFS_FH_SIZE_OFFSET]
+                   | ((uint16_t)f_handle[NFS_VFS_FH_SIZE_OFFSET + 1] << 8);
+
+    if (server_fh_size == 0 || server_fh_size > fh_cap ||
+        (uint32_t)(NFS_VFS_FH_DATA_OFFSET + server_fh_size) >
+            handle_bytes) {
+        return -1;
+    }
+
+    /*
+     * The server FH is OPAQUE (RFC 8435 §2.1): flex-files layouts
+     * hand these bytes to the client verbatim, so the MDS must not
+     * interpret them.  knfsd (0x01 version byte first), NetApp
+     * ONTAP (48/56/60-byte v3 FHs leading with the n3_utility
+     * version/flags byte), and any other server all pass the
+     * default path.  The optional strict mode pins the legacy
+     * Linux-knfsd version byte for all-knfsd deployments
+     * (ds_fh_format = knfsd).
+     */
+    if (knfsd_strict &&
+        f_handle[NFS_VFS_FH_DATA_OFFSET] != 0x01) {
+        return -1;
+    }
+
+    memcpy(fh_out, &f_handle[NFS_VFS_FH_DATA_OFFSET], server_fh_size);
+    *fh_len = (uint32_t)server_fh_size;
+    return 0;
+}
+
 /**
  * Extract the DS server FH via name_to_handle_at().
  *
- * @param path     Local filesystem path to the DS data file.
- * @param fh_out   Receives raw server FH bytes.
- * @param fh_cap   Capacity of fh_out.
- * @param fh_len   Receives actual FH length.
+ * @param path          Local filesystem path to the DS data file.
+ * @param knfsd_strict  Require the legacy knfsd 0x01 first FH byte.
+ * @param fh_out        Receives raw server FH bytes.
+ * @param fh_cap        Capacity of fh_out.
+ * @param fh_len        Receives actual FH length.
  * @return 0 on success, -1 on failure (caller should fall back to RPC).
  */
-static int proxy_name_to_handle(const char *path,
+static int proxy_name_to_handle(const char *path, bool knfsd_strict,
                                 uint8_t *fh_out, uint32_t fh_cap,
                                 uint32_t *fh_len)
 {
@@ -919,7 +985,6 @@ static int proxy_name_to_handle(const char *path,
     uint8_t buf[sizeof(struct file_handle) + 128];
     struct file_handle *fh = (struct file_handle *)buf;
     int mount_id = 0;
-    uint16_t server_fh_size;
 
     fh->handle_bytes = 128;
 
@@ -927,34 +992,10 @@ static int proxy_name_to_handle(const char *path,
         return -1;
     }
 
-    /* Validate handle type -- must be an NFS opaque FH (either
-     * encoding; see the NFS_FH_HANDLE_TYPE* comment above). */
-    if (fh->handle_type != NFS_FH_HANDLE_TYPE &&
-        fh->handle_type != NFS_FH_HANDLE_TYPE_NOPARENT) {
-        return -1;
-    }
-
-    /* Extract server FH size (uint16 LE at offset 12 in f_handle). */
-    if (fh->handle_bytes < NFS_VFS_FH_DATA_OFFSET + 1) {
-        return -1;
-    }
-    server_fh_size = (uint16_t)fh->f_handle[NFS_VFS_FH_SIZE_OFFSET]
-                   | ((uint16_t)fh->f_handle[NFS_VFS_FH_SIZE_OFFSET + 1] << 8);
-
-    if (server_fh_size == 0 || server_fh_size > fh_cap ||
-        (uint32_t)(NFS_VFS_FH_DATA_OFFSET + server_fh_size) >
-            (uint32_t)fh->handle_bytes) {
-        return -1;
-    }
-
-    /* Validate knfsd version byte. */
-    if (fh->f_handle[NFS_VFS_FH_DATA_OFFSET] != 0x01) {
-        return -1;
-    }
-
-    memcpy(fh_out, &fh->f_handle[NFS_VFS_FH_DATA_OFFSET], server_fh_size);
-    *fh_len = (uint32_t)server_fh_size;
-    return 0;
+    return mds_proxy_extract_server_fh(fh->f_handle,
+                                       (uint32_t)fh->handle_bytes,
+                                       fh->handle_type, knfsd_strict,
+                                       fh_out, fh_cap, fh_len);
 }
 
 /**
@@ -1027,7 +1068,8 @@ enum mds_status mds_proxy_ensure_ds_file_fh(
 
         /* Extract server FH via syscall. */
         errno = 0;
-        if (proxy_name_to_handle(file_path, fh_out, *fh_len, fh_len) == 0) {
+        if (proxy_name_to_handle(file_path, ctx->fh_knfsd_strict,
+                                 fh_out, *fh_len, fh_len) == 0) {
             clock_gettime(CLOCK_MONOTONIC, &t2);
             {
                 int64_t open_us = (t1.tv_sec - t0.tv_sec) * 1000000LL

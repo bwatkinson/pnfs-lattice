@@ -792,6 +792,13 @@ int main(int argc, char *argv[])
 		} else {
 			struct mds_ds_info *ds_list = NULL;
 			uint32_t ds_cnt = 0;
+
+			/* DS FH validation policy for the FH-capture fast
+			 * path: opaque by default (RFC 8435), knfsd-only
+			 * when the operator pins ds_fh_format = knfsd. */
+			mds_proxy_set_fh_knfsd_strict(
+				proxy, cfg.ds_fh_knfsd_strict);
+
 			pst = mds_cat_ds_list(cat, &ds_list, &ds_cnt);
 			if (pst == MDS_OK) {
 				for (uint32_t di = 0; di < ds_cnt; di++) {

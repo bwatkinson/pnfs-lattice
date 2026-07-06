@@ -900,9 +900,11 @@ open_existing:
 	/*
 	 * POSIX permission check: verify the caller has the requested
 	 * access (read / write) to the target file based on AUTH_SYS
-	 * credentials and the inode mode bits.  Routed through the
-	 * shared DAC helper so supplementary GIDs and the posix_dac
-	 * config gate apply consistently with the namespace ops.
+	 * credentials and the inode mode bits.  This check predates
+	 * the posix_dac work and is enforced UNCONDITIONALLY (see
+	 * compound_open_mode_check): `posix_dac = false` restores the
+	 * historical behaviour, and the historical behaviour includes
+	 * rejecting opens the file mode does not grant.
 	 *
 	 * Skip for just-created files: the creator always has access
 	 * (RFC 8881 S18.16.3).  EXCLUSIVE4 creates defer mode to a
@@ -918,8 +920,8 @@ open_existing:
 			open_may |= COMPOUND_MAY_WRITE;
 		}
 		if (open_may != 0) {
-			nst = compound_access_mode_check(cd, &inode,
-							 open_may);
+			nst = compound_open_mode_check(cd, &inode,
+						       open_may);
 			if (nst != NFS4_OK) {
 				return nst;
 			}

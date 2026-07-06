@@ -81,14 +81,18 @@ enum nfs4_status op_access(struct compound_data *cd,
 }
 
 	/*
-	 * Check inode exists and is accessible.  Actual POSIX
-	 * permission enforcement requires caller uid/gid from
-	 * AUTH_SYS credentials (not yet extracted from RPC layer).
-	 * For now: validate filehandle, grant requested bits.
+	 * ACCESS reports the caller's rights computed from AUTH_SYS
+	 * credentials and the inode mode bits.  Deliberately NOT
+	 * gated by posix_dac: the reply is advisory (RFC 8881
+	 * §18.1.3) and Linux clients enforce POSIX locally from these
+	 * bits, so the mapping must stay accurate even when
+	 * server-side enforcement is off.
 	 */
 	{
 		struct mds_inode acc_inode;
 		enum mds_status acc_st;
+		bool acc_is_dir;
+		uint32_t type_mask;
 
 		acc_st = compound_inode_get(cd, cd->current_fh.fileid,
 					    &acc_inode);
@@ -96,10 +100,25 @@ enum nfs4_status op_access(struct compound_data *cd,
 			return mds_status_to_nfs4(acc_st);
 		}
 
-		r->supported = a->access & ACCESS4_ALL;
+		acc_is_dir = (acc_inode.type == MDS_FTYPE_DIR);
 
 		/*
-		 * POSIX permission check against caller credentials.
+		 * Per-type bit sets (matches Linux knfsd): directories
+		 * never report EXECUTE, and non-directories never
+		 * report LOOKUP or DELETE (deleting an entry is a
+		 * right on the PARENT directory, not on the object).
+		 */
+		if (acc_is_dir) {
+			type_mask = ACCESS4_ALL & ~ACCESS4_EXECUTE;
+		} else {
+			type_mask = ACCESS4_ALL &
+				~(ACCESS4_LOOKUP | ACCESS4_DELETE);
+		}
+
+		r->supported = a->access & type_mask;
+
+		/*
+		 * POSIX permission mapping against caller credentials.
 		 *
 		 * RFC 8881 §18.1.3: the server SHOULD return all
 		 * access rights that the caller has, not only the
@@ -111,50 +130,79 @@ enum nfs4_status op_access(struct compound_data *cd,
 			uint32_t allowed = 0;
 			uint32_t perm;
 
-			/* Select owner/group/other permission bits. */
 			if (cd->cred_uid == 0) {
-				/* root: grant all. */
-				allowed = ACCESS4_ALL;
-			} else if (cd->cred_uid == (uint32_t)acc_inode.uid) {
-				perm = (mode >> 6) & 7;
-				if (perm & 4) { allowed |= ACCESS4_READ | ACCESS4_LOOKUP; }
-				if (perm & 2) { allowed |= ACCESS4_MODIFY | ACCESS4_EXTEND | ACCESS4_DELETE; }
-				if (perm & 1) { allowed |= ACCESS4_EXECUTE | ACCESS4_LOOKUP; }
-			} else if (compound_cred_in_group(cd, (uint32_t)acc_inode.gid)) {
-				perm = (mode >> 3) & 7;
-				if (perm & 4) { allowed |= ACCESS4_READ | ACCESS4_LOOKUP; }
-				if (perm & 2) { allowed |= ACCESS4_MODIFY | ACCESS4_EXTEND | ACCESS4_DELETE; }
-				if (perm & 1) { allowed |= ACCESS4_EXECUTE | ACCESS4_LOOKUP; }
+				/*
+				 * root: DAC override.  Like Linux
+				 * CAP_DAC_OVERRIDE, EXECUTE on a regular
+				 * file still requires at least one x bit.
+				 */
+				allowed = type_mask;
+				if (!acc_is_dir && (mode & 0111) == 0) {
+					allowed &= ~ACCESS4_EXECUTE;
+				}
 			} else {
-				perm = mode & 7;
-				if (perm & 4) { allowed |= ACCESS4_READ | ACCESS4_LOOKUP; }
-				if (perm & 2) { allowed |= ACCESS4_MODIFY | ACCESS4_EXTEND | ACCESS4_DELETE; }
-				if (perm & 1) { allowed |= ACCESS4_EXECUTE | ACCESS4_LOOKUP; }
+				/* Owner / group / other class. */
+				if (cd->cred_uid == (uint32_t)acc_inode.uid) {
+					perm = (mode >> 6) & 7;
+				} else if (compound_cred_in_group(cd,
+						(uint32_t)acc_inode.gid)) {
+					perm = (mode >> 3) & 7;
+				} else {
+					perm = mode & 7;
+				}
+
+				/*
+				 * RFC 8276 §8.5: XAREAD/XALIST follow the
+				 * read bit; XAWRITE follows the write bit.
+				 */
+				if (perm & 4) {
+					allowed |= ACCESS4_READ |
+						   ACCESS4_XAREAD |
+						   ACCESS4_XALIST;
+				}
+				if (perm & 2) {
+					allowed |= ACCESS4_XAWRITE;
+				}
+
+				if (acc_is_dir) {
+					/*
+					 * Directory search (LOOKUP) is
+					 * granted by the x bit ONLY —
+					 * never by the read bit.  The
+					 * read bit grants listing (READ),
+					 * not traversal.  Granting LOOKUP
+					 * from r let clients bypass the
+					 * search check on no-x dirs
+					 * (pjdfstest ftruncate/05 et al.
+					 * with posix_dac off).  Mutating
+					 * entries needs w+x, matching
+					 * knfsd's directory access map.
+					 */
+					if (perm & 1) {
+						allowed |= ACCESS4_LOOKUP;
+					}
+					if ((perm & 3) == 3) {
+						allowed |= ACCESS4_MODIFY |
+							   ACCESS4_EXTEND |
+							   ACCESS4_DELETE;
+					}
+				} else {
+					if (perm & 2) {
+						allowed |= ACCESS4_MODIFY |
+							   ACCESS4_EXTEND;
+					}
+					if (perm & 1) {
+						allowed |= ACCESS4_EXECUTE;
+					}
+				}
 			}
 
 			/*
-			 * RFC 8276 §8.5: map POSIX perms to xattr access.
-			 * XAREAD/XALIST follow READ; XAWRITE follows WRITE.
+			 * Return all rights the caller actually has
+			 * (possibly beyond the requested subset) —
+			 * this tells the client everything it can do.
 			 */
-			if (allowed & ACCESS4_READ) {
-				allowed |= ACCESS4_XAREAD | ACCESS4_XALIST;
-			}
-			if (allowed & ACCESS4_MODIFY) {
-				allowed |= ACCESS4_XAWRITE;
-			}
-
-			/* Directories always grant LOOKUP if any r/x bit. */
-			if (acc_inode.type == MDS_FTYPE_DIR && (allowed & (ACCESS4_READ | ACCESS4_EXECUTE))) {
-				allowed |= ACCESS4_LOOKUP;
-			}
-
-			/*
-			 * Return the intersection of requested AND
-			 * all rights the caller actually has — this
-			 * tells the client everything it can do.
-			 */
-			r->access = allowed & ACCESS4_ALL;
-
+			r->access = allowed & type_mask;
 		}
 	}
 	return NFS4_OK;

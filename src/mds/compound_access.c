@@ -77,20 +77,14 @@ bool compound_cred_in_group(const struct compound_data *cd, uint32_t gid)
 	return false;
 }
 
-/**
- * Evaluate POSIX mode bits for the caller against @a inode.
- *
- * @param may  Bitwise OR of COMPOUND_MAY_READ / _WRITE / _EXEC.
- * @return NFS4_OK when every requested permission is granted (or DAC
- *         is inactive / caller is root); NFS4ERR_ACCESS otherwise.
- */
-enum nfs4_status compound_access_mode_check(const struct compound_data *cd,
-					    const struct mds_inode *inode,
-					    uint32_t may)
+/** Core mode-bit evaluation (no posix_dac gate; root bypasses). */
+static enum nfs4_status access_mode_eval(const struct compound_data *cd,
+					 const struct mds_inode *inode,
+					 uint32_t may)
 {
 	uint32_t perm;
 
-	if (!compound_dac_active(cd) || cd->cred_uid == 0) {
+	if (cd->cred_uid == 0) {
 		return NFS4_OK;
 	}
 	if (cd->cred_uid == (uint32_t)inode->uid) {
@@ -104,6 +98,47 @@ enum nfs4_status compound_access_mode_check(const struct compound_data *cd,
 		return NFS4ERR_ACCESS;
 	}
 	return NFS4_OK;
+}
+
+/**
+ * Evaluate POSIX mode bits for the caller against @a inode.
+ *
+ * @param may  Bitwise OR of COMPOUND_MAY_READ / _WRITE / _EXEC.
+ * @return NFS4_OK when every requested permission is granted (or DAC
+ *         is inactive / caller is root); NFS4ERR_ACCESS otherwise.
+ */
+enum nfs4_status compound_access_mode_check(const struct compound_data *cd,
+					    const struct mds_inode *inode,
+					    uint32_t may)
+{
+	if (!compound_dac_active(cd)) {
+		return NFS4_OK;
+	}
+	return access_mode_eval(cd, inode, may);
+}
+
+/**
+ * OPEN-time file-mode check -- ALWAYS on for AUTH_SYS requests,
+ * independent of the posix_dac knob.
+ *
+ * The server has enforced share_access-vs-mode on OPEN since long
+ * before the posix_dac work; routing it through the knob made
+ * `posix_dac = false` MORE permissive than every previous release
+ * (pjdfstest open/06 and the ftruncate open-for-write paths
+ * regressed against the historical baseline).  "posix_dac = false"
+ * restores the historical behaviour -- and the historical behaviour
+ * includes this check -- so it lives outside the gate.
+ * Supplementary GIDs are honoured (a strict grant-only improvement
+ * over the original primary-gid-only version).
+ */
+enum nfs4_status compound_open_mode_check(const struct compound_data *cd,
+					  const struct mds_inode *inode,
+					  uint32_t may)
+{
+	if (cd == NULL || cd->auth_flavor != COMPOUND_AUTH_SYS) {
+		return NFS4_OK;
+	}
+	return access_mode_eval(cd, inode, may);
 }
 
 enum nfs4_status compound_dir_mutate_check(const struct compound_data *cd,

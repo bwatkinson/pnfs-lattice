@@ -4564,6 +4564,213 @@ static void test_remove_nonempty_dir_notempty(void)
 	close_test_db(db, path);
 }
 
+/* compound_open_mode_check lives in compound_internal.h (private);
+ * re-declare locally like compound_validate_name above. */
+enum nfs4_status compound_open_mode_check(const struct compound_data *cd,
+					  const struct mds_inode *inode,
+					  uint32_t may);
+
+/** The OPEN file-mode check must fire even with posix_dac OFF --
+ *  it predates the knob and "off" means the HISTORICAL behaviour,
+ *  which always enforced share_access vs mode on OPEN. */
+static void test_open_mode_check_ungated(void)
+{
+	struct compound_data cd;
+	struct mds_inode ino;
+
+	compound_init(&cd);
+	cd.auth_flavor = 1;       /* AUTH_SYS */
+	cd.cred_uid = 1000;
+	cd.cred_gid = 1000;
+	cd.cfg_posix_dac = false; /* knob OFF -- check still fires */
+
+	memset(&ino, 0, sizeof(ino));
+	ino.type = MDS_FTYPE_REG;
+	ino.uid = 0;
+	ino.gid = 0;
+	ino.mode = 0600;
+
+	/* 0x4 = read, 0x2 = write (COMPOUND_MAY_*). */
+	ASSERT_EQ(compound_open_mode_check(&cd, &ino, 0x4u),
+		  NFS4ERR_ACCESS);
+	ASSERT_EQ(compound_open_mode_check(&cd, &ino, 0x2u),
+		  NFS4ERR_ACCESS);
+
+	ino.mode = 0644;
+	ASSERT_EQ(compound_open_mode_check(&cd, &ino, 0x4u), NFS4_OK);
+	ASSERT_EQ(compound_open_mode_check(&cd, &ino, 0x2u),
+		  NFS4ERR_ACCESS);
+
+	/* Supplementary GID grants group bits. */
+	ino.gid = 4242;
+	ino.mode = 0060;
+	cd.aux_gids[0] = 4242;
+	cd.aux_gid_count = 1;
+	ASSERT_EQ(compound_open_mode_check(&cd, &ino, 0x6u), NFS4_OK);
+
+	/* Root bypasses. */
+	cd.cred_uid = 0;
+	ino.mode = 0;
+	ASSERT_EQ(compound_open_mode_check(&cd, &ino, 0x6u), NFS4_OK);
+
+	/* Non-AUTH_SYS flavors are not subject to the check. */
+	cd.cred_uid = 1000;
+	cd.auth_flavor = 6; /* RPCSEC_GSS */
+	ASSERT_EQ(compound_open_mode_check(&cd, &ino, 0x6u), NFS4_OK);
+}
+
+/* ACCESS4 bit values (RFC 8881 §18.1 / RFC 8276 §8.5). */
+#define TA_READ    0x0001u
+#define TA_LOOKUP  0x0002u
+#define TA_MODIFY  0x0004u
+#define TA_EXTEND  0x0008u
+#define TA_DELETE  0x0010u
+#define TA_EXECUTE 0x0020u
+#define TA_ALL     0x01FFu
+
+static struct nfs4_op mk_access(uint32_t bits)
+{
+	struct nfs4_op op;
+
+	memset(&op, 0, sizeof(op));
+	op.opnum = OP_ACCESS;
+	op.arg.access.access = bits;
+	return op;
+}
+
+/** op_access POSIX mapping.  Directory search (LOOKUP) must come
+ *  from the x bit ONLY -- the old code granted it from the read bit,
+ *  letting clients traverse no-search dirs (pjdfstest ftruncate/05
+ *  and other path-search cases regressed with posix_dac off, where
+ *  the client's own checks are the only enforcement).  Also: dir
+ *  mutation needs w+x, files never report LOOKUP/DELETE, dirs never
+ *  report EXECUTE.  ACCESS is ungated -- run everything with the
+ *  knob OFF. */
+static void test_access_posix_bit_mapping(void)
+{
+	struct mds_catalogue *db;
+	struct compound_data cd;
+	struct nfs4_op ops[5];
+	struct nfs4_result res[5];
+	uint32_t n, acc;
+	char *path;
+
+	db = open_test_db(&path);
+
+	/* Seed as root: dir 0644 (rw-, no search) + dir 0710 (owner
+	 * rwx, group --x), both owned by 1000:1000. */
+	dac_cd_init(&cd, 0, 0);
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_create("acc_dr", MDS_FTYPE_DIR, 0644);
+	ops[3] = mk_setattr_attrs(MDS_ATTR_UID | MDS_ATTR_GID,
+				  0, 1000, 1000, 0);
+	n = compound_process(&cd, ops, res, 4);
+	VERIFY(n == 4 && res[2].status == NFS4_OK &&
+	       res[3].status == NFS4_OK);
+
+	dac_cd_init(&cd, 0, 0);
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_create("acc_dx", MDS_FTYPE_DIR, 0710);
+	ops[3] = mk_setattr_attrs(MDS_ATTR_UID | MDS_ATTR_GID,
+				  0, 1000, 1000, 0);
+	n = compound_process(&cd, ops, res, 4);
+	VERIFY(n == 4 && res[2].status == NFS4_OK &&
+	       res[3].status == NFS4_OK);
+
+	dac_seed_file("acc_f", 0640, 1000, 1000);
+
+	/* Owner on dir 0644 (rw-): READ but NO LOOKUP (the bug), and
+	 * no MODIFY/EXTEND/DELETE without the x bit. */
+	dac_cd_init(&cd, 1000, 1000);
+	cd.cfg_posix_dac = false;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_lookup("acc_dr");
+	ops[3] = mk_access(TA_ALL);
+	n = compound_process(&cd, ops, res, 4);
+	ASSERT_EQ(n, (uint32_t)4);
+	ASSERT_EQ(res[3].status, NFS4_OK);
+	acc = res[3].res.access.access;
+	ASSERT_EQ(acc & TA_READ, TA_READ);
+	ASSERT_EQ(acc & (TA_LOOKUP | TA_MODIFY | TA_EXTEND |
+			 TA_DELETE | TA_EXECUTE), 0u);
+	/* Dirs never advertise EXECUTE. */
+	ASSERT_EQ(res[3].res.access.supported,
+		  (uint32_t)(TA_ALL & ~TA_EXECUTE));
+
+	/* Owner on dir 0710 (rwx): LOOKUP + w+x mutation rights;
+	 * still no EXECUTE on a directory. */
+	dac_cd_init(&cd, 1000, 1000);
+	cd.cfg_posix_dac = false;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_lookup("acc_dx");
+	ops[3] = mk_access(TA_ALL);
+	n = compound_process(&cd, ops, res, 4);
+	ASSERT_EQ(n, (uint32_t)4);
+	ASSERT_EQ(res[3].status, NFS4_OK);
+	acc = res[3].res.access.access;
+	ASSERT_EQ(acc & (TA_READ | TA_LOOKUP | TA_MODIFY |
+			 TA_EXTEND | TA_DELETE),
+		  (uint32_t)(TA_READ | TA_LOOKUP | TA_MODIFY |
+			     TA_EXTEND | TA_DELETE));
+	ASSERT_EQ(acc & TA_EXECUTE, 0u);
+
+	/* Group member on dir 0710 (--x): LOOKUP without READ --
+	 * search-only traversal must keep working. */
+	dac_cd_init(&cd, 2000, 1000);
+	cd.cfg_posix_dac = false;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_lookup("acc_dx");
+	ops[3] = mk_access(TA_ALL);
+	n = compound_process(&cd, ops, res, 4);
+	ASSERT_EQ(n, (uint32_t)4);
+	ASSERT_EQ(res[3].status, NFS4_OK);
+	acc = res[3].res.access.access;
+	ASSERT_EQ(acc & TA_LOOKUP, TA_LOOKUP);
+	ASSERT_EQ(acc & (TA_READ | TA_MODIFY | TA_EXTEND |
+			 TA_DELETE), 0u);
+
+	/* Owner on file 0640 (rw-): READ|MODIFY|EXTEND; files never
+	 * report LOOKUP or DELETE (parent-dir rights). */
+	dac_cd_init(&cd, 1000, 1000);
+	cd.cfg_posix_dac = false;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_lookup("acc_f");
+	ops[3] = mk_access(TA_ALL);
+	n = compound_process(&cd, ops, res, 4);
+	ASSERT_EQ(n, (uint32_t)4);
+	ASSERT_EQ(res[3].status, NFS4_OK);
+	acc = res[3].res.access.access;
+	ASSERT_EQ(acc & (TA_READ | TA_MODIFY | TA_EXTEND),
+		  (uint32_t)(TA_READ | TA_MODIFY | TA_EXTEND));
+	ASSERT_EQ(acc & (TA_LOOKUP | TA_DELETE | TA_EXECUTE), 0u);
+	ASSERT_EQ(res[3].res.access.supported,
+		  (uint32_t)(TA_ALL & ~(TA_LOOKUP | TA_DELETE)));
+
+	/* Root on file 0640: DAC override, but EXECUTE still needs
+	 * at least one x bit (CAP_DAC_OVERRIDE semantics). */
+	dac_cd_init(&cd, 0, 0);
+	cd.cfg_posix_dac = false;
+	ops[0] = mk_sequence();
+	ops[1] = mk_putrootfh();
+	ops[2] = mk_lookup("acc_f");
+	ops[3] = mk_access(TA_ALL);
+	n = compound_process(&cd, ops, res, 4);
+	ASSERT_EQ(n, (uint32_t)4);
+	ASSERT_EQ(res[3].status, NFS4_OK);
+	acc = res[3].res.access.access;
+	ASSERT_EQ(acc & (TA_READ | TA_MODIFY | TA_EXTEND),
+		  (uint32_t)(TA_READ | TA_MODIFY | TA_EXTEND));
+	ASSERT_EQ(acc & TA_EXECUTE, 0u);
+
+	close_test_db(db, path);
+}
+
 /** Decoder-flagged oversize names surface NFS4ERR_NAMETOOLONG. */
 static void test_nametoolong_flag_paths(void)
 {
@@ -4749,6 +4956,8 @@ int main(void)
 	RUN_TEST(test_dac_truncate_requires_write);
 	RUN_TEST(test_dac_disabled_or_non_authsys_permissive);
 	RUN_TEST(test_remove_nonempty_dir_notempty);
+	RUN_TEST(test_open_mode_check_ungated);
+	RUN_TEST(test_access_posix_bit_mapping);
 	RUN_TEST(test_nametoolong_flag_paths);
 
 	fprintf(stdout, "\n%d/%d tests passed.\n", tests_passed, tests_run);

@@ -199,6 +199,13 @@ enum nfs4_status compound_access_mode_check(const struct compound_data *cd,
 					    const struct mds_inode *inode,
 					    uint32_t may);
 
+/** OPEN-time file-mode check: always enforced for AUTH_SYS callers
+ *  regardless of posix_dac (the historical pre-DAC behaviour).
+ *  Returns NFS4_OK or NFS4ERR_ACCESS. */
+enum nfs4_status compound_open_mode_check(const struct compound_data *cd,
+					  const struct mds_inode *inode,
+					  uint32_t may);
+
 /** Write+search on a directory (namespace mutations).  ACCESS on deny. */
 enum nfs4_status compound_dir_mutate_check(const struct compound_data *cd,
 					   const struct mds_inode *dir);

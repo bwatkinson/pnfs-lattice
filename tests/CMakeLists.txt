@@ -24,6 +24,7 @@ add_executable(test_cluster_transport unit/test_cluster_transport.c)
 add_executable(test_compound_cluster  unit/test_compound_cluster.c)
 add_executable(test_session      unit/test_session.c)
 add_executable(test_open_state   unit/test_open_state.c)
+add_executable(test_lock_state   unit/test_lock_state.c)
 add_executable(test_migration    unit/test_migration.c)
 if(ENABLE_REPLICATION)
     add_executable(test_repl_health unit/test_repl_health.c)
@@ -105,6 +106,7 @@ foreach(test_target
     test_compound_cluster
     test_session
     test_open_state
+    test_lock_state
     test_migration
     test_repl_health
     test_inline_data

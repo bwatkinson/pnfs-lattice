@@ -978,11 +978,15 @@ enum mds_status referral_build(const struct subtree_map *map,
     if (st != MDS_OK) { return st;
 }
 
-    /* rootpath is "/" -- each target MDS exports its subtree
-     * at its own root.  The client mounts MDS_N:/ and sees
-     * the subtree as the top-level namespace (RFC 8881 S11.11). */
+    /* rootpath is the subtree path itself: every MDS exports the
+     * full shared namespace at "/", so the fs_location must direct
+     * the client to <owner>:<subtree-path> (RFC 8881 S11.11).  The
+     * previous hard-coded "/" pointed clients at the owner's global
+     * root, silently aliasing every referral submount to the root
+     * directory: all subtrees shared one server directory (cross-
+     * subtree collisions) and the real subtree dirs stayed empty. */
     (void)snprintf(loc->rootpath, sizeof(loc->rootpath),
-                   "/");
+                   "%s", entry.path);
     return MDS_OK;
 }
 

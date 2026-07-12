@@ -66,48 +66,6 @@ static bool compound_next_op_requests_fs_locations(const struct compound_data *c
            nfs4_bitmap_test(next->arg.getattr.requested, FATTR4_FS_LOCATIONS);
 }
 
-/*
- * Resolve the subtree owner of an FH by ancestry.
- *
- * Walks parent_fileid links from @a fileid toward the root; if the
- * chain passes through a registered junction root (subtree map entry
- * with a resolved root_fileid), the junction's owner is returned.
- * Returns 0 when the FH is not under any registered junction, on any
- * walk failure, and on single-namespace maps -- fail-open: the caller
- * treats 0 as "served locally", preserving single-namespace semantics
- * for everything outside the /shardN partitions.
- *
- * Cost: registry probes are in-memory; inode reads come from the
- * request snapshot / inode cache on the hot path.  Depth is capped
- * defensively against parent-link cycles.
- */
-static uint32_t compound_fh_subtree_owner(struct compound_data *cd,
-                                          uint64_t fileid)
-{
-    uint64_t fid = fileid & ~XATTR_FH_FLAG;
-    uint32_t owner = 0;
-    int depth;
-
-    if (cd->smap == NULL || subtree_map_count(cd->smap) <= 1) {
-        return 0;
-    }
-    for (depth = 0; depth < 64 && fid != 0 && fid != MDS_FILEID_ROOT;
-         depth++) {
-        struct mds_inode ino;
-
-        if (subtree_map_owner_for_root_fileid(cd->smap, fid, &owner)) {
-            return owner;
-        }
-        if (compound_inode_get(cd, fid, &ino) != MDS_OK) {
-            return 0;
-        }
-        if (ino.parent_fileid == 0 || ino.parent_fileid == fid) {
-            return 0;
-        }
-        fid = ino.parent_fileid;
-    }
-    return 0;
-}
 
 /* NOLINTNEXTLINE(readability-function-cognitive-complexity) */
 enum nfs4_status op_access(struct compound_data *cd,
@@ -378,19 +336,15 @@ enum nfs4_status op_putfh(struct compound_data *cd,
 		}
 	}
 
-	/* Server-authoritative subtree ownership: never trust the owner
-	 * field of a client-supplied wire FH.  Resolve by ancestry so a
-	 * cached FH deep inside a foreign shard gates correctly (the
-	 * compound.c MOVED dispatch) even though PUTFH carries no path. */
-	cd->current_fh.owner_mds_id = cd->mds_id;
-	if (cd->cfg_referral_strict) {
-		uint32_t sub_owner = compound_fh_subtree_owner(
-			cd, cd->current_fh.fileid);
-
-		if (sub_owner != 0) {
-			cd->current_fh.owner_mds_id = sub_owner;
-		}
-	}
+	/* Subtree ownership comes from the wire FH itself: v1 FHs
+	 * round-trip the owner_mds_id stamped at LOOKUP/GETFH time, so a
+	 * cached FH deep inside a foreign shard still gates correctly
+	 * (compound.c MOVED dispatch) with no catalogue I/O here.  An
+	 * ancestry walk was tried instead and abandoned: it put an NDB
+	 * read on the PUTFH hot path, and a single wedged read left the
+	 * worker stuck mid-compound (client OPEN never answered).
+	 * Legacy v0 FHs decode owner 0 and are never gated (fail-open,
+	 * single-namespace semantics). */
 
 	return NFS4_OK;
 }
@@ -662,14 +616,6 @@ enum nfs4_status op_lookup(struct compound_data *cd,
 	 * dirent path (NOT ext_dirent synthetic inodes). */
 	cd->current_inode = child;
 	cd->current_inode_valid = true;
-	if (cd->cfg_referral_strict) {
-		uint32_t sub_owner = compound_fh_subtree_owner(
-			cd, child.fileid);
-
-		if (sub_owner != 0) {
-			cd->current_fh.owner_mds_id = sub_owner;
-		}
-	}
 	/* Update path tracking — check for truncation. */
 	{
 		size_t plen = strlen(cd->current_path);
@@ -689,6 +635,18 @@ enum nfs4_status op_lookup(struct compound_data *cd,
 		if (n < 0 || (size_t)n >= sizeof(cd->current_path) - plen) {
 			return NFS4ERR_NAMETOOLONG;
 }
+	}
+	/* FH-encoded subtree ownership: longest-prefix owner of the
+	 * resolved path (in-memory map lookup, no catalogue I/O).  The
+	 * root entry means unsharded namespace -- keep the local stamp. */
+	if (cd->cfg_referral_strict && cd->smap != NULL) {
+		struct subtree_entry sub_se;
+
+		if (subtree_map_lookup(cd->smap, cd->current_path,
+				       &sub_se) == MDS_OK &&
+		    !(sub_se.path[0] == '/' && sub_se.path[1] == '\0')) {
+			cd->current_fh.owner_mds_id = sub_se.owner_mds_id;
+		}
 	}
 	resolve_and_apply_shard(cd, cd->current_path);
 	return NFS4_OK;
@@ -3071,14 +3029,6 @@ enum nfs4_status op_lookupp(struct compound_data *cd,
 	 * junction root, which is foreign); generation is filled in
 	 * below once we have re-read the parent inode. */
 	cd->current_fh.owner_mds_id = cd->mds_id;
-	if (cd->cfg_referral_strict) {
-		uint32_t sub_owner = compound_fh_subtree_owner(
-			cd, inode.parent_fileid);
-
-		if (sub_owner != 0) {
-			cd->current_fh.owner_mds_id = sub_owner;
-		}
-	}
 	cd->current_fh.generation = 0;
 	/* Update current_path when known. */
 	if (cd->current_path[0] != '\0') {

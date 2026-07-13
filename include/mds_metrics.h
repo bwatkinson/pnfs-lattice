@@ -116,6 +116,8 @@ struct mds_branch_metrics {
     _Atomic uint64_t nfs_op_rename;
     _Atomic uint64_t nfs_moved;        /**< Ops rejected with NFS4ERR_MOVED
                                           *  by referral_strict routing. */
+    _Atomic uint64_t rpc_parks;        /**< Records parked (pool full)
+                                          *  instead of dropped. */
 
     /*
      * Per-phase latency instrumentation for OP_OPEN on the

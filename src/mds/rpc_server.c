@@ -2271,6 +2271,23 @@ static void handle_epoll_conn(struct rpc_server *srv,
             emod.data.fd = c->fd;
             epoll_ctl(srv->epoll_fd, EPOLL_CTL_MOD,
                       c->fd, &emod);
+            /* Lost-wakeup guard, send-side mirror of the in-flight
+             * gate fix: a worker may have queued a new reply and armed
+             * EPOLLOUT in the window between our drain-to-empty (lock
+             * dropped above) and this EPOLLIN-only disarm, which just
+             * clobbered its EPOLLOUT.  Re-check under the lock; if
+             * bytes reappeared, re-arm EPOLLOUT.  Without this the
+             * reply sits unsent forever -- the client blocks on the
+             * missing response and its NFSv4.1 session stalls into the
+             * delayq (looks like an idle MDS + a wedged client). */
+            pthread_mutex_lock(&c->send_lock);
+            int again = (c->send_len > 0);
+            pthread_mutex_unlock(&c->send_lock);
+            if (again) {
+                emod.events = EPOLLIN | EPOLLOUT;
+                epoll_ctl(srv->epoll_fd, EPOLL_CTL_MOD,
+                          c->fd, &emod);
+            }
         }
     }
 

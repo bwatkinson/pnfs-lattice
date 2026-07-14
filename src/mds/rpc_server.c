@@ -1806,6 +1806,25 @@ static int conn_read(struct rpc_server *srv, struct rpc_conn *c)
                     ev.events = 0;
                     ev.data.fd = c->fd;
                     epoll_ctl(srv->epoll_fd, EPOLL_CTL_MOD, c->fd, &ev);
+                    /* Lost-wakeup guard: every worker that finished
+                     * between the inflight load above and the disarm
+                     * has already done its re-arm MOD, which our
+                     * stale disarm just overwrote.  Their decrements
+                     * are visible by now (fetch_sub is acq_rel), so
+                     * re-check: if the connection drained below the
+                     * cap, re-arm EPOLLIN ourselves.  Workers that
+                     * complete after this load re-arm on their own
+                     * and their MOD lands after ours.  Without this,
+                     * the connection goes dark -- queued requests and
+                     * the client's retransmissions on it are never
+                     * read again (multi-second to permanent stalls). */
+                    if (atomic_load_explicit(&c->inflight,
+                                memory_order_acquire) <
+                            srv->max_inflight_per_conn) {
+                        ev.events = EPOLLIN;
+                        epoll_ctl(srv->epoll_fd, EPOLL_CTL_MOD,
+                                  c->fd, &ev);
+                    }
                     return 0;
                 }
                 continue;

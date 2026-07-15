@@ -2579,30 +2579,19 @@ enum nfs4_status op_layoutreturn(struct compound_data *cd,
 				NULL, 0);
 		}
 
-		/* RFC 8435 §14: fence DS backing files so the client's
-		 * stale credentials fail at the DS POSIX layer.  Best-
-		 * effort: a chown failure does not fail LAYOUTRETURN. */
-		if (cd->proxy != NULL && cd->cat != NULL) {
-			struct mds_ds_map_entry *lr_entries = NULL;
-			uint32_t lr_sc = 0, lr_su = 0, lr_mc = 0;
-
-			if (mds_cat_stripe_map_get(cd->cat,
-					cd->current_fh.fileid,
-					&lr_sc, &lr_su, &lr_mc,
-					&lr_entries) == MDS_OK &&
-			    lr_entries != NULL) {
-				uint32_t lr_total = lr_sc * lr_mc;
-				for (uint32_t li = 0; li < lr_total; li++) {
-					(void)mds_proxy_fence_ds_file(
-						cd->proxy,
-						lr_entries[li].ds_id,
-						cd->current_fh.fileid,
-						li / lr_mc,
-						li % lr_mc);
-				}
-				free(lr_entries);
-			}
-		}
+		/* Do NOT fence the DS backing file on a voluntary
+		 * LAYOUTRETURN.  Multiple clients may hold overlapping
+		 * RW layouts on the same file (N-to-1 shared-file
+		 * writes); fencing here revokes the shared synthetic
+		 * owner, so every OTHER holder's in-flight DS I/O
+		 * starts failing EACCES, which those clients report
+		 * via error-triggered LAYOUTRETURNs -- a self-feeding
+		 * cascade that permanently wedges the file (there is
+		 * no unfence on the grant path).  RFC 8435 S2.2 makes
+		 * fencing optional; it remains in force where it is
+		 * actually needed: layout revocation (layout_recall.c,
+		 * unresponsive client) and file removal
+		 * (compound_namespace.c, end of life). */
 
 		/* Drop the in-memory seqid record so a subsequent
 		 * LAYOUTGET/RETURN on the same `other` is treated as
@@ -2620,7 +2609,23 @@ enum nfs4_status op_layoutreturn(struct compound_data *cd,
 				cd->clientid);
 		}
 	}
-	r->stateid_present = true;
+	/* RFC 8881 S18.44.3: lrs_present must be FALSE when the
+	 * client holds no remaining layout segments on the file.
+	 * This server always drops the WHOLE layout state on a FILE
+	 * return (mds_coord_layout_return + layout_seqid_remove
+	 * above), so there is never residual state to name here --
+	 * and FSID/ALL returns carry no stateid by definition.
+	 *
+	 * The previous behaviour (lrs_present = TRUE with an all-
+	 * zero stateid) made the Linux client ADOPT the zero
+	 * stateid as its live layout stateid instead of tearing the
+	 * layout header down.  Every subsequent LAYOUTGET then
+	 * presented seqid 0, this server minted a fresh other value
+	 * per call, the client discarded each reply as a stateid
+	 * mismatch (its dirty pages pin the old segments) and
+	 * immediately retried: an unbounded LAYOUTGET livelock that
+	 * starves all I/O on the file until writeback is abandoned. */
+	r->stateid_present = false;
 	memset(&r->stateid, 0, sizeof(r->stateid));
 	return NFS4_OK;
 }

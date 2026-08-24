@@ -74,6 +74,11 @@ add_executable(test_open_exclusive  unit/test_open_exclusive.c)
 add_executable(test_mds_shard unit/test_mds_shard.c)
 add_executable(test_mds_admin       unit/test_mds_admin.c
                                     ${PROJECT_SOURCE_DIR}/src/tools/admin_util.c)
+add_executable(test_find_query      unit/test_find_query.c
+                                    ${PROJECT_SOURCE_DIR}/src/tools/find_query.c)
+add_executable(test_apid_http       unit/test_apid_http.c
+                                    ${PROJECT_SOURCE_DIR}/src/tools/apid_http.c
+                                    ${PROJECT_SOURCE_DIR}/src/tools/find_query.c)
 add_executable(test_catalogue       unit/test_catalogue.c)
 add_executable(test_catalog_delta   unit/test_catalog_delta.c)
 add_executable(test_catalog_image   unit/test_catalog_image.c)
@@ -136,6 +141,8 @@ foreach(test_target
     test_backup
     test_rolling_upgrade
     test_mds_admin
+    test_find_query
+    test_apid_http
     test_mds_metrics
     test_placement_policy
     test_mds_tls

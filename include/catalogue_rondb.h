@@ -1152,4 +1152,127 @@ int rondb_shim_drc_slot_get(void *handle, const uint8_t session_id[16],
                             uint32_t slot_id,
                             struct mds_coord_drc_slot_row *row);
 
+/* -----------------------------------------------------------------------
+ * Metadata search scans (mds-find / mds-apid)
+ *
+ * Read-only building blocks behind the find-style query surface.  Each
+ * issues a single LM_CommittedRead table scan across all fragments in
+ * parallel and never mutates the catalogue or touches the dictionary.
+ *
+ * Cost is O(rows scanned), not O(tree depth x fan-out): one scan replaces
+ * the LOOKUP/READDIR/GETATTR walk a client would otherwise perform.
+ * Callers are expected to bound broad queries with their own result limit
+ * and stop the scan early by returning non-zero from the callback.
+ * ----------------------------------------------------------------------- */
+
+/** One row produced by rondb_shim_inode_scan. */
+struct rondb_inode_scan_row {
+    uint64_t fileid;
+    uint64_t uid;
+    uint64_t gid;
+    uint64_t size;
+    uint64_t parent_fileid;
+    int64_t  mtime_sec;         /**< epoch seconds. */
+    int64_t  ctime_sec;         /**< epoch seconds. */
+    uint32_t mode;
+    uint32_t nlink;
+    uint32_t flags;
+    uint8_t  type;              /**< MDS_FTYPE_*. */
+};
+
+/** Per-row callback for rondb_shim_inode_scan.
+ *  Return 0 to continue the scan, non-zero to stop it early. */
+typedef int (*rondb_inode_scan_cb)(const struct rondb_inode_scan_row *row,
+                                   void *ctx);
+
+/**
+ * Server-side predicate filter for rondb_shim_inode_scan.
+ *
+ * A zero/false field means "no predicate for that column".  Active
+ * predicates are pushed into an NdbScanFilter AND-block so non-matching
+ * rows are discarded on the data nodes and never cross the wire.
+ *
+ * Field order is deliberate and must not be reordered to shrink padding:
+ * the struct crosses the C/C++ boundary into catalogue_rondb_shim.cpp.
+ */
+struct rondb_inode_scan_filter {
+    uint64_t size_min;
+    uint64_t size_max;
+    uint64_t uid;
+    uint64_t gid;
+    int64_t  mtime_min;         /**< epoch seconds. */
+    int64_t  mtime_max;
+    int64_t  ctime_min;
+    int64_t  ctime_max;
+    uint8_t  type;              /**< MDS_FTYPE_*, or 0 for any type. */
+    bool     has_size_min;
+    bool     has_size_max;
+    bool     has_uid;
+    bool     has_gid;
+    bool     has_mtime_min;
+    bool     has_mtime_max;
+    bool     has_ctime_min;
+    bool     has_ctime_max;
+};
+
+/**
+ * Full table scan over mds_inodes with optional server-side predicates.
+ *
+ * @param handle  Shim handle.
+ * @param filter  Predicates to push down; NULL returns every row.
+ * @param cb      Per-row callback (required).
+ * @param ctx     Opaque context passed to @p cb.
+ * @return 0 on success (including an early stop requested by @p cb);
+ *         -1 on a caller/API error.
+ */
+int rondb_shim_inode_scan(void *handle,
+                          const struct rondb_inode_scan_filter *filter,
+                          rondb_inode_scan_cb cb, void *ctx);
+
+/**
+ * Per-match callback for rondb_shim_dirent_scan_name.
+ *
+ * @p name points into the NDB result buffer and is NOT NUL-terminated;
+ * it is valid only for the duration of the call and must be copied by
+ * callers that need to retain it.  @p name_len is its exact length.
+ *
+ * Return 0 to continue the scan, non-zero to stop it early.
+ */
+typedef int (*rondb_dirent_scan_cb)(uint64_t parent_fileid,
+                                    uint64_t child_fileid,
+                                    uint8_t child_type,
+                                    const char *name,
+                                    uint32_t name_len,
+                                    void *ctx);
+
+/**
+ * Full table scan over mds_dirents, optionally narrowed by entry name.
+ *
+ * @p like_pattern is an optional SQL LIKE pattern used purely as a
+ * data-node-side pre-filter to cut wire traffic.  It MUST be a superset
+ * of the caller's intended match set: the pattern is advisory, and the
+ * caller remains responsible for exact name matching on the rows it
+ * receives.  Pass NULL to stream every dirent.
+ *
+ * @return 0 on success (including an early stop requested by @p cb);
+ *         -1 on a caller/API error.
+ */
+int rondb_shim_dirent_scan_name(void *handle,
+                                const char *like_pattern,
+                                rondb_dirent_scan_cb cb, void *ctx);
+
+/** Catalogue-handle wrapper around rondb_shim_inode_scan.
+ *  Returns MDS_ERR_NOSUPPORT when @p cat is not RonDB-backed. */
+enum mds_status catalogue_rondb_inode_scan(
+    struct mds_catalogue *cat,
+    const struct rondb_inode_scan_filter *filter,
+    rondb_inode_scan_cb cb, void *ctx);
+
+/** Catalogue-handle wrapper around rondb_shim_dirent_scan_name.
+ *  Returns MDS_ERR_NOSUPPORT when @p cat is not RonDB-backed. */
+enum mds_status catalogue_rondb_dirent_scan_name(
+    struct mds_catalogue *cat,
+    const char *like_pattern,
+    rondb_dirent_scan_cb cb, void *ctx);
+
 #endif /* CATALOGUE_RONDB_H */

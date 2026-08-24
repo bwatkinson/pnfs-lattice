@@ -4,6 +4,14 @@
 **Owner:** pnfs-mds team
 **Collaborators:** LANL GUFI team
 **Last updated:** 2026-05-03
+> **Implementation note.** A direct-scan query surface (`mds-find`,
+> `mds-apid`, `lattice-find`) has since shipped — essentially Option B
+> below, chosen for its far lower cost and complexity. It answers
+> `find`-class queries today with no mirror, no extra storage, and no
+> sync lag, at the price of a full fragment scan per query. It does not
+> supersede this design: the mirror remains the route to sub-second
+> analytics on billion-file namespaces and to the joint upstream work.
+> See [`find-api.md`](find-api.md).
 
 ## 1. Summary
 

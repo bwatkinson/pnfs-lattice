@@ -94,7 +94,7 @@ src/
 ├── cluster/     # Cross-MDS coordination (transport, membership, 2PC)
 ├── common/      # Shared utilities: config, fh codec, endian helpers
 ├── fsal_obj/    # FSAL-style object abstractions used by the MDS
-├── tools/       # CLI tools (admin, dump, replay, etc.)
+├── tools/       # CLI tools (admin, probe, metadata search, query API)
 └── bpf/         # Optional eBPF tracepoints for observability
 include/         # Public-facing headers; one per logical subsystem
 proto/           # gRPC service definitions for cluster transport
@@ -435,7 +435,41 @@ All keys have safe defaults; a minimal config can be a half-dozen lines.
 - **A new pNFS layout type.**  Extend `layout_types.h`, teach
   `compound_layout.c` to mint and return the new layout, and provide a
   device-info encoder in `xdr_codec.c`.
-## 15. HPC-Shared file mode (N-to-1 wide stripe)
+## 15. Metadata search (find-style queries)
+NFSv4 has no query verb, so "every file over 1 GiB changed in the last
+day" would otherwise be a `LOOKUP`/`READDIR`/`GETATTR` walk costing
+millions of RPCs.  Because the catalogue is a single transactional store,
+the same question is answerable with one backend table scan.
+Three layers, each read-only:
+- **Scan primitives.**  `rondb_shim_inode_scan` and
+  `rondb_shim_dirent_scan_name` in `catalogue_rondb_shim.cpp` issue a
+  single `LM_CommittedRead` scan across all fragments in parallel.
+  Attribute predicates (type, size, uid, gid, mtime, ctime) are pushed
+  into an `NdbScanFilter`, so non-matching rows are discarded on the data
+  nodes.  No locks are taken, so a search cannot block a mutation.
+  `catalogue_rondb_inode_scan` / `catalogue_rondb_dirent_scan_name` are
+  the catalogue-handle wrappers, returning `MDS_ERR_NOSUPPORT` for
+  backends that cannot scan.
+- **Query core.**  `src/tools/find_query.c` owns predicate parsing and
+  strategy selection: an exact fileid becomes one keyed read; a name-only
+  search scans dirents (where the name already lives) and fills
+  attributes with one keyed read per match; anything with attribute
+  predicates scans inodes and resolves names afterwards.  Name matching
+  is always finished locally with `fnmatch(3)`; the backend LIKE filter is
+  built as a deliberate superset and is a bandwidth optimisation only, so
+  it can never change which entries match.
+- **Interfaces.**  `mds-find` (CLI, backend-local), `mds-apid` (read-only
+  HTTP/JSON service with bearer auth and optional TLS/mTLS), and
+  `scripts/lattice-find` (client-side wrapper for hosts with no backend
+  access and no NFS mount).
+Two properties operators must understand.  First, the `mds-apid` token is
+an **administrative** credential: it enumerates the whole namespace
+regardless of POSIX traversal permissions, so it is not equivalent to what
+`find` would show a given user.  Second, predicate pushdown reduces wire
+traffic but not rows scanned, so every query costs a full fragment scan
+and competes with the NFS hot path for backend CPU.  Operator-facing
+detail is in `find-api.md`.
+## 16. HPC-Shared file mode (N-to-1 wide stripe)
 Lattice ships an opt-in per-inode mode for the N-to-1 HPC workload
 pattern (many compute clients writing into the same file at
 distinct byte ranges).  When the `MDS_IFLAG_HPC_SHARED` bit is set,

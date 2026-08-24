@@ -4698,4 +4698,46 @@ enum mds_status catalogue_rondb_mds_list(
            ? MDS_OK : MDS_ERR_IO;
 }
 
+/* -----------------------------------------------------------------------
+ * Metadata search scan C wrappers
+ *
+ * Read-only.  A NULL shim handle means the catalogue is not RonDB-backed,
+ * which is reported as NOSUPPORT so callers can degrade cleanly rather
+ * than treat it as a malformed request.
+ * ----------------------------------------------------------------------- */
+
+enum mds_status catalogue_rondb_inode_scan(
+    struct mds_catalogue *cat,
+    const struct rondb_inode_scan_filter *filter,
+    rondb_inode_scan_cb cb, void *ctx)
+{
+    void *h = rondb_handle(cat);
+
+    if (cb == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (h == NULL) {
+        return MDS_ERR_NOSUPPORT;
+    }
+    return rondb_shim_inode_scan(h, filter, cb, ctx) == 0
+           ? MDS_OK : MDS_ERR_IO;
+}
+
+enum mds_status catalogue_rondb_dirent_scan_name(
+    struct mds_catalogue *cat,
+    const char *like_pattern,
+    rondb_dirent_scan_cb cb, void *ctx)
+{
+    void *h = rondb_handle(cat);
+
+    if (cb == NULL) {
+        return MDS_ERR_INVAL;
+    }
+    if (h == NULL) {
+        return MDS_ERR_NOSUPPORT;
+    }
+    return rondb_shim_dirent_scan_name(h, like_pattern, cb, ctx) == 0
+           ? MDS_OK : MDS_ERR_IO;
+}
+
 #endif /* HAVE_RONDB */

@@ -175,7 +175,7 @@ READ · WRITE · COMMIT forwarding for non-pNFS clients.
 | `src/fsal_obj/`  | FSAL plugin — layouts, DS file ops, placement              |
 | `src/cluster/`   | Inter-MDS — TCP transport, 2PC rename, migration, replication |
 | `src/common/`    | Shared — config, logging, threadpool, heartbeat, TLS       |
-| `src/tools/`     | `mds-admin` CLI + `mds-backend-probe` diagnostic           |
+| `src/tools/`     | `mds-admin` CLI, `mds-backend-probe` diagnostic, `mds-find` search CLI, `mds-apid` read-only query API |
 | `src/bpf/`       | Optional eBPF monitoring hooks (build-time flag)           |
 | `include/`       | Public C headers                                           |
 | `docs/`          | Architecture reference, lab setup, deployment guide        |
@@ -484,6 +484,7 @@ Key optimisations:
 ## Documentation
 
 - `docs/architecture.md` — Single source of truth (23 sections)
+- `docs/find-api.md` — Metadata search: `mds-find`, the read-only HTTP query API, and the client wrapper
 - `docs/QUICKSTART.md` — Quick start: build from source (single node or lab cluster)
 - `docs/MANUAL_INSTALL.md` — Step-by-step manual lab install
 - `docs/INSTALL_ROCKY.md` — Rocky Linux 9 / 10 community edition install

@@ -5,6 +5,35 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Find-style metadata search: `mds-find`, `mds-apid`, and
+  `lattice-find`** — NFSv4 has no query verb, so answering "every file
+  over 1 GiB changed in the last day" meant a `LOOKUP`/`READDIR`/
+  `GETATTR` walk costing millions of RPCs and saturating the metadata
+  server.  The catalogue is a single transactional store, so the same
+  question is now answered by one backend table scan.  Two read-only scan
+  primitives (`rondb_shim_inode_scan`, `rondb_shim_dirent_scan_name`)
+  push type/size/uid/gid/mtime/ctime predicates into an `NdbScanFilter`,
+  so non-matching rows are discarded on the data nodes and never cross
+  the wire; both use committed-read semantics and take no row locks, so a
+  search cannot block a mutation.  On top of them: `mds-find`, a CLI with
+  find(1) predicate syntax; `mds-apid`, a read-only HTTP/JSON service
+  exposing `GET /api/v1/find` behind a constant-time-compared bearer
+  token with optional native TLS and mTLS; and `scripts/lattice-find`, a
+  client-side wrapper giving the same syntax to hosts that can reach
+  neither the metadata backend nor an NFS mount.  No schema change and no
+  new tables.
+  Two behaviours operators must know: the `mds-apid` token is an
+  **administrative** credential that enumerates the whole namespace
+  regardless of POSIX traversal permissions (per-token UID scoping is
+  deferred), and predicate pushdown cuts wire traffic but not rows
+  scanned, so every query is a full fragment scan competing with the NFS
+  hot path for backend CPU.  `mds-apid` refuses a non-loopback cleartext
+  bind and a token file readable beyond its owner.  Name matching is
+  exact `fnmatch(3)`; the backend LIKE filter is a deliberately
+  constructed superset used only to cut bandwidth, so it can never change
+  which entries match.  See `docs/find-api.md`.
+
 ### Changed
 - **LAYOUTGET skips per-stripe DS round-trips for wide files created
   in the same compound** — the fused OPEN(CREATE)+LAYOUTGET path paid

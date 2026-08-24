@@ -401,5 +401,7 @@ install(DIRECTORY include/ DESTINATION include/pnfs-mds)
 # after `make install` (followed by mandb on Debian/Ubuntu).
 install(FILES docs/man/mds-admin.8
         DESTINATION ${CMAKE_INSTALL_MANDIR}/man8)
+install(FILES docs/man/mds-find.8
+        DESTINATION ${CMAKE_INSTALL_MANDIR}/man8)
 install(FILES docs/man/mds.conf.5
         DESTINATION ${CMAKE_INSTALL_MANDIR}/man5)

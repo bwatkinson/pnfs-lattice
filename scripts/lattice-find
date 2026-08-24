@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 PeakAIO
+# SPDX-License-Identifier: MIT
+#
+# lattice-find -- search the Lattice namespace from an NFS client.
+#
+# A thin, read-only client for the mds-apid /api/v1/find endpoint.  It
+# gives the familiar find(1) flag syntax (-type, -size, -name, -mtime,
+# ...) but talks to the cluster over HTTP(S) instead of the metadata
+# backend, so a client can search the namespace without an NFS mount and
+# without any backend access.
+#
+# The bearer token is handed to curl through a config file on stdin, so
+# it never appears in the process list or in a temporary file.
+#
+# Requires: bash, curl.  Optional: jq, for a human-readable table.
+
+set -euo pipefail
+
+readonly PROGNAME="${0##*/}"
+
+# Resolution order for connection settings: flag > environment > default.
+API_URL="${LATTICE_API_URL:-http://127.0.0.1:9810}"
+TOKEN_FILE="${LATTICE_API_TOKEN_FILE:-}"
+INSECURE="${LATTICE_API_INSECURE:-0}"
+
+JSON_OUT=0
+DRY_RUN=0
+
+# Accumulated query parameters, one "key=value" per element.
+declare -a PARAMS=()
+
+die() {
+    printf '%s: error: %s\n' "$PROGNAME" "$1" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+$PROGNAME - search the Lattice namespace over HTTP.
+
+Usage:
+  $PROGNAME [predicates] [--limit N] [--json]
+  $PROGNAME --url URL --token-file FILE [predicates]
+
+Predicates (all optional, AND-combined):
+  -type f|d|l|b|c|p|s  file type
+  -size +N|-N          larger (+) / smaller (-) than N bytes;
+                       N accepts a K/M/G/T suffix (binary)
+  -mtime +N|-N         modified more than (+) / within (-) N days
+  -ctime +N|-N         changed more than (+) / within (-) N days
+  -uid N               owner uid
+  -gid N               owner gid
+  -name GLOB           entry-name glob (* and ? wildcards)
+  -inum N[-M]          exact fileid, or an inclusive fileid range
+  --limit N            max results (server default 10000)
+
+Connection and output:
+  --url URL            mds-apid base URL (\$LATTICE_API_URL)
+  --token-file FILE    bearer-token file (\$LATTICE_API_TOKEN_FILE)
+  -k, --insecure       skip TLS certificate verification
+  --json               print the raw JSON response
+  --dry-run            print the request that would be sent, and stop
+                       (never prints the token)
+  -h, --help           this help
+
+Examples:
+  $PROGNAME -type f -size +1G -name '*.parquet'
+  $PROGNAME -type f -mtime -7
+  $PROGNAME -uid 1000 -mtime +90 --limit 500
+EOF
+}
+
+# Percent-encode a string so it is safe in a query-string value.
+urlencode() {
+    local s="$1" out="" i c
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *)               out+="$(printf '%%%02X' "'$c")" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# Expand an optional binary suffix (K/M/G/T) to a plain byte count.
+parse_size() {
+    local v="$1" mult=1 num
+    case "$v" in
+        *[kK]) mult=1024;                num="${v%?}" ;;
+        *[mM]) mult=$((1024**2));        num="${v%?}" ;;
+        *[gG]) mult=$((1024**3));        num="${v%?}" ;;
+        *[tT]) mult=$((1024**4));        num="${v%?}" ;;
+        *)     num="$v" ;;
+    esac
+    [[ "$num" =~ ^[0-9]+$ ]] || die "invalid size: $v"
+    printf '%s' "$(( num * mult ))"
+}
+
+# Convert a relative day count to an absolute epoch cutoff.
+days_ago() {
+    local days="$1"
+    [[ "$days" =~ ^[0-9]+$ ]] || die "expected a number of days, got: $days"
+    date -d "$days days ago" +%s 2>/dev/null \
+        || die "GNU date is required for -mtime/-ctime"
+}
+
+# Require that a flag was given a value.
+need_value() {
+    [[ $# -ge 2 ]] || die "$1 requires a value"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --json)    JSON_OUT=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        -k|--insecure) INSECURE=1; shift ;;
+        --url)        need_value "$@"; API_URL="$2"; shift 2 ;;
+        --token-file) need_value "$@"; TOKEN_FILE="$2"; shift 2 ;;
+        --limit)      need_value "$@"; PARAMS+=("limit=$2"); shift 2 ;;
+        -type)        need_value "$@"; PARAMS+=("type=$(urlencode "$2")"); shift 2 ;;
+        -uid)         need_value "$@"; PARAMS+=("uid=$2"); shift 2 ;;
+        -gid)         need_value "$@"; PARAMS+=("gid=$2"); shift 2 ;;
+        -name)        need_value "$@"; PARAMS+=("name=$(urlencode "$2")"); shift 2 ;;
+        -size)
+            need_value "$@"
+            case "$2" in
+                +*) PARAMS+=("size_gt=$(parse_size "${2#+}")") ;;
+                -*) PARAMS+=("size_lt=$(parse_size "${2#-}")") ;;
+                *)  die "-size requires +N or -N" ;;
+            esac
+            shift 2
+            ;;
+        -mtime)
+            need_value "$@"
+            case "$2" in
+                # "+N days" means older than the cutoff, so it is an
+                # upper bound on mtime; "-N days" is a lower bound.
+                +*) PARAMS+=("mtime_before=$(days_ago "${2#+}")") ;;
+                -*) PARAMS+=("mtime_after=$(days_ago "${2#-}")") ;;
+                *)  die "-mtime requires +N or -N" ;;
+            esac
+            shift 2
+            ;;
+        -ctime)
+            need_value "$@"
+            case "$2" in
+                +*) PARAMS+=("ctime_before=$(days_ago "${2#+}")") ;;
+                -*) PARAMS+=("ctime_after=$(days_ago "${2#-}")") ;;
+                *)  die "-ctime requires +N or -N" ;;
+            esac
+            shift 2
+            ;;
+        -inum)
+            need_value "$@"
+            if [[ "$2" == *-* ]]; then
+                PARAMS+=("inum=${2%%-*}" "inum_max=${2#*-}")
+            else
+                PARAMS+=("inum=$2")
+            fi
+            shift 2
+            ;;
+        *) die "unknown option: $1 (try --help)" ;;
+    esac
+done
+
+# Assemble the query string.
+QUERY=""
+for p in ${PARAMS+"${PARAMS[@]}"}; do
+    if [[ -z "$QUERY" ]]; then QUERY="$p"; else QUERY="${QUERY}&${p}"; fi
+done
+
+URL="${API_URL%/}/api/v1/find"
+[[ -n "$QUERY" ]] && URL="${URL}?${QUERY}"
+
+if (( DRY_RUN )); then
+    printf 'GET %s\n' "$URL"
+    if [[ -n "$TOKEN_FILE" ]]; then
+        printf 'Authorization: Bearer <from %s>\n' "$TOKEN_FILE"
+    fi
+    exit 0
+fi
+
+declare -a CURL_ARGS=(--fail-with-body --silent --show-error)
+(( INSECURE )) && CURL_ARGS+=(--insecure)
+
+# Feed the token via a curl config file on stdin.  Passing it as an
+# argument would expose the credential to every user on this host via
+# the process list, and writing it to a temp file would leave it on disk.
+if [[ -n "$TOKEN_FILE" ]]; then
+    [[ -r "$TOKEN_FILE" ]] || die "cannot read token file: $TOKEN_FILE"
+    RESPONSE="$(
+        printf 'header = "Authorization: Bearer %s"\n' \
+            "$(tr -d '\r\n' < "$TOKEN_FILE")" \
+        | curl "${CURL_ARGS[@]}" --config - "$URL"
+    )" || die "request failed: $URL"
+else
+    RESPONSE="$(curl "${CURL_ARGS[@]}" "$URL")" \
+        || die "request failed: $URL"
+fi
+
+if (( JSON_OUT )) || ! command -v jq >/dev/null 2>&1; then
+    printf '%s\n' "$RESPONSE"
+    exit 0
+fi
+
+printf '%s' "$RESPONSE" | jq -r '
+    .results[]?
+    | [ .type + .mode,
+        (.nlink|tostring),
+        (.uid|tostring),
+        (.gid|tostring),
+        (.size|tostring),
+        (.mtime_sec | strftime("%Y-%m-%d %H:%M")),
+        (.fileid|tostring),
+        (if .name == "" then "?" else .name end)
+      ]
+    | @tsv'
+
+COUNT="$(printf '%s' "$RESPONSE" | jq -r '.count // 0')"
+TRUNC="$(printf '%s' "$RESPONSE" | jq -r '.truncated // false')"
+NOTE=""
+if [[ "$TRUNC" == "true" ]]; then
+    NOTE=" (truncated: the server hit its response cap)"
+fi
+printf '%s: %s match(es)%s\n' "$PROGNAME" "$COUNT" "$NOTE" >&2

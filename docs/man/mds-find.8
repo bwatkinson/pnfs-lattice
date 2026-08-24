@@ -1,0 +1,124 @@
+.TH MDS-FIND 8 "2026" "Lattice" "System Administration"
+.SH NAME
+mds\-find \- search the Lattice metadata catalogue
+.SH SYNOPSIS
+.B mds\-find
+.RI [ options ]
+.RI [ predicates ]
+.SH DESCRIPTION
+.B mds\-find
+searches the pnfs\-mds catalogue for entries matching attribute
+predicates, querying the metadata backend directly rather than walking
+the namespace over NFS.  A search costs one backend table scan instead of
+the millions of NFSv4 round trips a client\-side walk would need.
+.PP
+Attribute predicates are pushed to the backend data nodes, so
+non\-matching rows are discarded before they cross the wire.  Name
+matching is completed locally with
+.BR fnmatch (3),
+so
+.B \-name
+behaves exactly as it does in
+.BR find (1).
+.PP
+The tool is strictly read\-only; it never mutates the catalogue.
+.SH PREDICATES
+All predicates are optional and are combined with logical AND.
+.TP
+.BI \-type " f|d|l|b|c|p|s"
+File type: regular, directory, symlink, block device, character device,
+FIFO, or socket.
+.TP
+.BI \-size " +N|-N"
+Size larger than
+.RI ( + )
+or smaller than
+.RI ( \- )
+N bytes.  N accepts a
+.BR K ,
+.BR M ,
+.BR G ,
+.BR T ,
+or
+.B P
+suffix (binary multiples).
+.TP
+.BI \-mtime " +N|-N"
+Modified more than N days ago
+.RI ( + ),
+or within the last N days
+.RI ( \- ).
+.TP
+.BI \-ctime " +N|-N"
+Changed more than N days ago, or within the last N days.
+.TP
+.BI \-uid " N"
+Owner uid.
+.TP
+.BI \-gid " N"
+Owner gid.
+.TP
+.BI \-name " GLOB"
+Entry\-name glob.  Supports
+.BR * ,
+.BR ? ,
+and
+.B [...]
+character classes.
+.TP
+.BI \-inum " N[-M]"
+Exact fileid, or an inclusive fileid range.  An exact fileid is served by
+a single keyed read rather than a scan.
+.SH OPTIONS
+.TP
+.BI \-\-config " PATH"
+Path to mds.conf (default
+.IR /etc/pnfs\-mds/mds.conf ).
+.TP
+.BI \-\-limit " N"
+Maximum number of results, 1..10000000 (default 10000).  The scan stops
+as soon as the limit is reached.
+.TP
+.B \-\-json
+Emit one JSON object per match instead of the table format.
+.TP
+.B \-h ", " \-\-help
+Show usage and exit.
+.SH OUTPUT
+One line per match:
+.IP
+type+mode nlink uid gid size mtime fileid name
+.PP
+Results are reported in backend scan order, which is not stable between
+runs.  Each result carries the entry name, not a full path; an entry
+whose name cannot be resolved is shown as
+.BR ? .
+.SH EXAMPLES
+Regular files larger than 1 GiB named *.parquet:
+.IP
+.B mds\-find \-type f \-size +1G \-name '*.parquet'
+.PP
+Files modified in the last seven days:
+.IP
+.B mds\-find \-type f \-mtime \-7
+.PP
+Stale files owned by uid 1000, capped at 500 results:
+.IP
+.B mds\-find \-uid 1000 \-mtime +90 \-\-limit 500
+.SH EXIT STATUS
+Returns 0 on success (including a search with no matches), and 1 on
+invalid arguments, configuration failure, or a backend error.
+.SH PERFORMANCE
+Each query scans every fragment of the inode table, so the work competes
+with the NFS hot path for backend CPU.  Keep broad queries bounded with
+.BR \-\-limit ,
+and prefer running large searches from an admin node.
+.SH SEE ALSO
+.BR mds\-admin (8),
+.BR mds.conf (5),
+.BR find (1),
+.BR fnmatch (3)
+.PP
+For the HTTP query service and the client\-side wrapper, see
+.I docs/find\-api.md
+in the Lattice distribution.

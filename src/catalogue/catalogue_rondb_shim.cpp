@@ -15625,6 +15625,358 @@ static int rondb_define_drc_slots_table(NdbDictionary::Dictionary *dict)
     return rondb_create_table_if_not_exists(dict, tbl);
 }
 
+/* -----------------------------------------------------------------------
+ * Metadata search scans (mds-find / mds-apid)
+ *
+ * Both entry points are strictly read-only: one LM_CommittedRead table
+ * scan, no row locks, no mutation, no DDL.  readTuples(..., 0, 0) asks
+ * for maximum parallelism so every fragment is scanned concurrently.
+ *
+ * Rows are drained with the two-level nextResult() idiom used elsewhere
+ * in this file: nextResult(true) fetches a batch from the data nodes,
+ * then nextResult(false) walks the rows already cached locally.  That
+ * costs one round trip per batch instead of one per row.
+ * ----------------------------------------------------------------------- */
+
+/** Resolve a column number by name.  Returns -1 when absent. */
+static int rondb_scan_col_no(const NdbDictionary::Table *tbl,
+                             const char *name, int *out)
+{
+    const NdbDictionary::Column *col = tbl->getColumn(name);
+
+    if (col == nullptr) { return -1; }
+    *out = col->getColumnNo();
+    return 0;
+}
+
+/**
+ * Push the caller's inode predicates into an NdbScanFilter AND-block.
+ *
+ * Operand width matters.  NdbScanFilter::eq/ge/le are inline wrappers
+ * that hardcode a 4- or 8-byte operand, so they are only correct for
+ * Unsigned and Bigunsigned columns.  inode_type is Tinyunsigned, so it
+ * uses the explicit cmp() form with a genuine 1-byte operand rather than
+ * relying on a truncated Uint32 read, which would be endian-dependent.
+ *
+ * Comparison direction: NdbScanFilter deliberately inverts the operand
+ * order of the underlying interpreter instructions (see the table3[]
+ * comment in NdbScanFilter.cpp), so ge(col, v) does mean "col >= v".
+ *
+ * @return 0 on success, -1 if any predicate could not be encoded.
+ */
+static int rondb_inode_scan_push_filter(
+    NdbScanFilter &sf,
+    const NdbDictionary::Table *tbl,
+    const struct rondb_inode_scan_filter *f)
+{
+    int colno;
+
+    if (sf.begin(NdbScanFilter::AND) != 0) { return -1; }
+
+    if (f->type != 0) {
+        Uint8 tv = (Uint8)f->type;
+
+        if (rondb_scan_col_no(tbl, RONDB_INO_COL_TYPE, &colno) != 0) {
+            return -1;
+        }
+        if (sf.cmp(NdbScanFilter::COND_EQ, colno,
+                   &tv, (Uint32)sizeof(tv)) != 0) {
+            return -1;
+        }
+    }
+    if (f->has_size_min) {
+        if (rondb_scan_col_no(tbl, RONDB_INO_COL_FILE_SIZE, &colno) != 0 ||
+            sf.ge(colno, (Uint64)f->size_min) != 0) { return -1; }
+    }
+    if (f->has_size_max) {
+        if (rondb_scan_col_no(tbl, RONDB_INO_COL_FILE_SIZE, &colno) != 0 ||
+            sf.le(colno, (Uint64)f->size_max) != 0) { return -1; }
+    }
+    if (f->has_uid) {
+        if (rondb_scan_col_no(tbl, RONDB_INO_COL_UID, &colno) != 0 ||
+            sf.eq(colno, (Uint64)f->uid) != 0) { return -1; }
+    }
+    if (f->has_gid) {
+        if (rondb_scan_col_no(tbl, RONDB_INO_COL_GID, &colno) != 0 ||
+            sf.eq(colno, (Uint64)f->gid) != 0) { return -1; }
+    }
+    if (f->has_mtime_min) {
+        if (rondb_scan_col_no(tbl, RONDB_INO_COL_MTIME_SEC, &colno) != 0 ||
+            sf.ge(colno, (Uint64)f->mtime_min) != 0) { return -1; }
+    }
+    if (f->has_mtime_max) {
+        if (rondb_scan_col_no(tbl, RONDB_INO_COL_MTIME_SEC, &colno) != 0 ||
+            sf.le(colno, (Uint64)f->mtime_max) != 0) { return -1; }
+    }
+    if (f->has_ctime_min) {
+        if (rondb_scan_col_no(tbl, RONDB_INO_COL_CTIME_SEC, &colno) != 0 ||
+            sf.ge(colno, (Uint64)f->ctime_min) != 0) { return -1; }
+    }
+    if (f->has_ctime_max) {
+        if (rondb_scan_col_no(tbl, RONDB_INO_COL_CTIME_SEC, &colno) != 0 ||
+            sf.le(colno, (Uint64)f->ctime_max) != 0) { return -1; }
+    }
+
+    return (sf.end() == 0) ? 0 : -1;
+}
+
+/** True when at least one predicate in @p f is active. */
+static bool rondb_inode_scan_filter_active(
+    const struct rondb_inode_scan_filter *f)
+{
+    return f != nullptr &&
+           (f->type != 0 || f->has_size_min || f->has_size_max ||
+            f->has_uid || f->has_gid ||
+            f->has_mtime_min || f->has_mtime_max ||
+            f->has_ctime_min || f->has_ctime_max);
+}
+
+int rondb_shim_inode_scan(void *handle,
+                          const struct rondb_inode_scan_filter *filter,
+                          rondb_inode_scan_cb cb, void *ctx)
+{
+    rondb_shim_handle *state = rondb_checked_handle(handle, nullptr);
+    NdbDictionary::Dictionary *dict;
+    const NdbDictionary::Table *tbl;
+    NdbTransaction *tx;
+    NdbScanOperation *scan;
+    NdbRecAttr *a_fid, *a_type, *a_mode, *a_nlink, *a_uid, *a_gid;
+    NdbRecAttr *a_size, *a_mtime, *a_ctime, *a_flags, *a_parent;
+    NdbError err;
+    int rc;
+
+    if (state == nullptr || cb == nullptr) { return -1; }
+
+    dict = rondb_get_dictionary(state);
+    if (dict == nullptr) { return -1; }
+    tbl = dict->getTable(RONDB_TBL_INODES);
+    if (tbl == nullptr) { return -1; }
+
+    tx = rondb_get_ndb(state)->startTransaction();
+    if (tx == nullptr) {
+        return rondb_report_error(rondb_get_ndb(state)->getNdbError(),
+                                 "inode_scan startTx");
+    }
+    scan = tx->getNdbScanOperation(tbl);
+    if (scan == nullptr) {
+        err = tx->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "inode_scan getScanOp");
+    }
+    /* parallel = 0 => scan all fragments concurrently. */
+    if (scan->readTuples(NdbOperation::LM_CommittedRead, 0, 0) != 0) {
+        err = scan->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "inode_scan readTuples");
+    }
+
+    /* Only define a filter when at least one predicate is active: an
+     * empty AND-group is pointless interpreted code on every row. */
+    if (rondb_inode_scan_filter_active(filter)) {
+        NdbScanFilter sf(scan);
+
+        if (rondb_inode_scan_push_filter(sf, tbl, filter) != 0) {
+            err = sf.getNdbError();
+            rondb_get_ndb(state)->closeTransaction(tx);
+            return rondb_report_error(err, "inode_scan filter");
+        }
+    }
+
+    a_fid    = scan->getValue(RONDB_INO_COL_FILEID, nullptr);
+    a_type   = scan->getValue(RONDB_INO_COL_TYPE, nullptr);
+    a_mode   = scan->getValue(RONDB_INO_COL_MODE, nullptr);
+    a_nlink  = scan->getValue(RONDB_INO_COL_NLINK, nullptr);
+    a_uid    = scan->getValue(RONDB_INO_COL_UID, nullptr);
+    a_gid    = scan->getValue(RONDB_INO_COL_GID, nullptr);
+    a_size   = scan->getValue(RONDB_INO_COL_FILE_SIZE, nullptr);
+    a_mtime  = scan->getValue(RONDB_INO_COL_MTIME_SEC, nullptr);
+    a_ctime  = scan->getValue(RONDB_INO_COL_CTIME_SEC, nullptr);
+    a_flags  = scan->getValue(RONDB_INO_COL_FLAGS, nullptr);
+    a_parent = scan->getValue(RONDB_INO_COL_PARENT, nullptr);
+    if (a_fid == nullptr || a_type == nullptr || a_mode == nullptr ||
+        a_nlink == nullptr || a_uid == nullptr || a_gid == nullptr ||
+        a_size == nullptr || a_mtime == nullptr || a_ctime == nullptr ||
+        a_flags == nullptr || a_parent == nullptr) {
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return -1;
+    }
+
+    if (tx->execute(NdbTransaction::NoCommit) == -1) {
+        err = tx->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "inode_scan exec");
+    }
+
+    while ((rc = scan->nextResult(true)) == 0) {
+        do {
+            struct rondb_inode_scan_row row;
+
+            row.fileid        = a_fid->u_64_value();
+            row.uid           = a_uid->u_64_value();
+            row.gid           = a_gid->u_64_value();
+            row.size          = a_size->u_64_value();
+            row.parent_fileid = a_parent->u_64_value();
+            row.mtime_sec     = (int64_t)a_mtime->u_64_value();
+            row.ctime_sec     = (int64_t)a_ctime->u_64_value();
+            row.mode          = a_mode->u_32_value();
+            row.nlink         = a_nlink->u_32_value();
+            row.flags         = a_flags->u_32_value();
+            row.type          = (uint8_t)a_type->u_8_value();
+
+            if (cb(&row, ctx) != 0) {
+                scan->close();
+                rondb_get_ndb(state)->closeTransaction(tx);
+                return 0;   /* caller asked to stop -- not an error */
+            }
+            rc = scan->nextResult(false);
+        } while (rc == 0);
+
+        if (rc == -1) {
+            err = scan->getNdbError();
+            scan->close();
+            rondb_get_ndb(state)->closeTransaction(tx);
+            return rondb_report_error(err, "inode_scan next");
+        }
+    }
+    if (rc == -1) {
+        err = scan->getNdbError();
+        scan->close();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "inode_scan nextBatch");
+    }
+
+    scan->close();
+    rondb_get_ndb(state)->closeTransaction(tx);
+    return 0;
+}
+
+int rondb_shim_dirent_scan_name(void *handle,
+                                const char *like_pattern,
+                                rondb_dirent_scan_cb cb, void *ctx)
+{
+    rondb_shim_handle *state = rondb_checked_handle(handle, nullptr);
+    NdbDictionary::Dictionary *dict;
+    const NdbDictionary::Table *tbl;
+    NdbTransaction *tx;
+    NdbScanOperation *scan;
+    NdbRecAttr *a_parent, *a_name, *a_cfid, *a_ctype;
+    NdbError err;
+    int rc;
+
+    if (state == nullptr || cb == nullptr) { return -1; }
+
+    dict = rondb_get_dictionary(state);
+    if (dict == nullptr) { return -1; }
+    tbl = dict->getTable(RONDB_TBL_DIRENTS);
+    if (tbl == nullptr) { return -1; }
+
+    tx = rondb_get_ndb(state)->startTransaction();
+    if (tx == nullptr) {
+        return rondb_report_error(rondb_get_ndb(state)->getNdbError(),
+                                 "dirent_scan startTx");
+    }
+    scan = tx->getNdbScanOperation(tbl);
+    if (scan == nullptr) {
+        err = tx->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "dirent_scan getScanOp");
+    }
+    /* parallel = 0 => scan all fragments concurrently. */
+    if (scan->readTuples(NdbOperation::LM_CommittedRead, 0, 0) != 0) {
+        err = scan->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "dirent_scan readTuples");
+    }
+
+    /* Optional LIKE pre-filter on entry_name.  This is a wire-traffic
+     * optimisation only -- the caller still matches names exactly on
+     * whatever it receives -- so the pattern is required to be a
+     * superset of the intended match set and a miss here can never
+     * produce a wrong answer.
+     *
+     * Unlike every other comparison, branch_col_like takes the pattern
+     * WITHOUT the column's length prefix (see NdbScanFilter.hpp), so the
+     * raw bytes are passed straight through. */
+    if (like_pattern != nullptr && like_pattern[0] != '\0') {
+        const NdbDictionary::Column *col =
+            tbl->getColumn(RONDB_DIR_COL_NAME);
+        size_t pat_len = std::strlen(like_pattern);
+        NdbScanFilter sf(scan);
+
+        if (col == nullptr || pat_len > 255U) {
+            rondb_get_ndb(state)->closeTransaction(tx);
+            return -1;
+        }
+        if (sf.begin(NdbScanFilter::AND) != 0 ||
+            sf.cmp(NdbScanFilter::COND_LIKE, col->getColumnNo(),
+                   like_pattern, (Uint32)pat_len) != 0 ||
+            sf.end() != 0) {
+            err = sf.getNdbError();
+            rondb_get_ndb(state)->closeTransaction(tx);
+            return rondb_report_error(err, "dirent_scan filter");
+        }
+    }
+
+    a_parent = scan->getValue(RONDB_DIR_COL_PARENT, nullptr);
+    a_name   = scan->getValue(RONDB_DIR_COL_NAME, nullptr);
+    a_cfid   = scan->getValue(RONDB_DIR_COL_CHILD_FID, nullptr);
+    a_ctype  = scan->getValue(RONDB_DIR_COL_CHILD_TYPE, nullptr);
+    if (a_parent == nullptr || a_name == nullptr ||
+        a_cfid == nullptr || a_ctype == nullptr) {
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return -1;
+    }
+
+    if (tx->execute(NdbTransaction::NoCommit) == -1) {
+        err = tx->getNdbError();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "dirent_scan exec");
+    }
+
+    while ((rc = scan->nextResult(true)) == 0) {
+        do {
+            uint64_t parent_fid = a_parent->u_64_value();
+            uint64_t child_fid  = a_cfid->u_64_value();
+            uint8_t  child_type = (uint8_t)a_ctype->u_8_value();
+            const char *name_ptr = a_name->aRef();
+            uint32_t name_len;
+
+            /* entry_name is Varbinary(255): one length byte, then the
+             * bytes themselves.  The name is not NUL-terminated. */
+            if (name_ptr == nullptr) {
+                rc = scan->nextResult(false);
+                continue;
+            }
+            name_len = (uint32_t)(uint8_t)name_ptr[0];
+
+            if (cb(parent_fid, child_fid, child_type,
+                   name_ptr + 1, name_len, ctx) != 0) {
+                scan->close();
+                rondb_get_ndb(state)->closeTransaction(tx);
+                return 0;   /* caller asked to stop -- not an error */
+            }
+            rc = scan->nextResult(false);
+        } while (rc == 0);
+
+        if (rc == -1) {
+            err = scan->getNdbError();
+            scan->close();
+            rondb_get_ndb(state)->closeTransaction(tx);
+            return rondb_report_error(err, "dirent_scan next");
+        }
+    }
+    if (rc == -1) {
+        err = scan->getNdbError();
+        scan->close();
+        rondb_get_ndb(state)->closeTransaction(tx);
+        return rondb_report_error(err, "dirent_scan nextBatch");
+    }
+
+    scan->close();
+    rondb_get_ndb(state)->closeTransaction(tx);
+    return 0;
+}
+
 }  /* extern "C" */
 
 #endif /* HAVE_RONDB */
